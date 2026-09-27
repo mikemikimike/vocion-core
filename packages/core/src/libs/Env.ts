@@ -45,6 +45,17 @@ export const Env = createEnv({
      */
     VOCION_ALLOW_QUEUE_RESET: z.string().optional(),
     /**
+     * `1` makes workspace access real: a person reaches only the workspaces a
+     * group or a direct grant gives them, at the role it names. Unset, every
+     * member of the account reaches every workspace, which is how the platform
+     * behaved before `services/WorkspaceAccessService.ts` existed.
+     *
+     * Off by default deliberately. Turning it on can lock a live deployment's
+     * people out of workspaces they use daily, so it is switched on per
+     * deployment after the backfill has been checked against real rows.
+     */
+    VOCION_ENFORCE_WORKSPACE_ACCESS: z.string().optional(),
+    /**
      * Outbound email (`libs/mail`). Ships dark: nothing is sent unless
      * VOCION_MAIL_ENABLED is exactly '1'. The transport is Resend; the
      * sender must be on a domain verified in Resend. Read through
@@ -62,6 +73,12 @@ export const Env = createEnv({
     VOCION_EMAIL_SURFACE: z.string().optional(),
     VOCION_MAIL_DOMAIN: z.string().optional(),
     RESEND_WEBHOOK_SECRET: z.string().optional(),
+    /**
+     * Signs deliveries to `/api/webhooks/github` (`X-Hub-Signature-256`). The
+     * same secret is typed into the webhook on GitHub; unset, the route answers
+     * 501 and the `github` source relies on polling alone.
+     */
+    GITHUB_WEBHOOK_SECRET: z.string().optional(),
   },
   client: {
     NEXT_PUBLIC_APP_URL: z.string().optional(),
@@ -97,12 +114,14 @@ export const Env = createEnv({
     LANGFUSE_SECRET_KEY: process.env.LANGFUSE_SECRET_KEY,
     VOCION_THINKING_BUDGET: process.env.VOCION_THINKING_BUDGET,
     VOCION_ALLOW_QUEUE_RESET: process.env.VOCION_ALLOW_QUEUE_RESET,
+    VOCION_ENFORCE_WORKSPACE_ACCESS: process.env.VOCION_ENFORCE_WORKSPACE_ACCESS,
     VOCION_MAIL_ENABLED: process.env.VOCION_MAIL_ENABLED,
     RESEND_API_KEY: process.env.RESEND_API_KEY,
     VOCION_MAIL_FROM: process.env.VOCION_MAIL_FROM,
     VOCION_EMAIL_SURFACE: process.env.VOCION_EMAIL_SURFACE,
     VOCION_MAIL_DOMAIN: process.env.VOCION_MAIL_DOMAIN,
     RESEND_WEBHOOK_SECRET: process.env.RESEND_WEBHOOK_SECRET,
+    GITHUB_WEBHOOK_SECRET: process.env.GITHUB_WEBHOOK_SECRET,
     NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:
       process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,

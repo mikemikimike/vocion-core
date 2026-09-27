@@ -1,17 +1,18 @@
 'use client';
 
 import type { PaletteConversation, PaletteEntity, PaletteRow } from '@/features/dashboard/palette/paletteGroups';
-import { BookOpen, Bot, Compass, Loader, LogOut, MessageSquare, Moon, Network, PanelLeft, PanelRight, Plus, Search, Sparkles, Sun } from 'lucide-react';
+import { BookOpen, Bot, Compass, Loader, LogOut, MessageSquare, MessagesSquare, Moon, Network, PanelLeft, PanelRight, Plus, Search, Sparkles, Sun } from 'lucide-react';
 import { signOut } from 'next-auth/react';
 import { useTheme } from 'next-themes';
-import { usePathname, useRouter } from 'next/navigation';
+
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator, CommandShortcut } from '@/components/ui/command';
 import { useSidebar } from '@/components/ui/useSidebar';
 import { focusAgentComposer, requestAgentSurface } from '@/features/dashboard/chat/agentSurface';
 import { COMMAND_PALETTE_EVENT } from '@/features/dashboard/commandPaletteEvent';
-import { buildPaletteGroups } from '@/features/dashboard/palette/paletteGroups';
+import { buildPaletteGroups, paletteFilter } from '@/features/dashboard/palette/paletteGroups';
 import { DASHBOARD_ROUTES } from '@/features/navigation/dashboardNav';
+import { usePathname, useRouter } from '@/libs/I18nNavigation';
 import { client } from '@/libs/Orpc';
 
 /**
@@ -26,9 +27,10 @@ import { client } from '@/libs/Orpc';
  * are fetched lazily the first time the palette opens.
  * @param props
  * @param props.isAdmin - Whether admin-only routes are offered.
+ * @param props.enabledPlugins
  * @param props.agents - The workspace's chat agents (slug, name, description).
  */
-export function CommandPalette({ isAdmin = false, agents = [] }: { isAdmin?: boolean; agents?: PaletteEntity[] }) {
+export function CommandPalette({ isAdmin = false, enabledPlugins, agents = [] }: { isAdmin?: boolean; enabledPlugins?: readonly string[]; agents?: PaletteEntity[] }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [teams, setTeams] = useState<PaletteEntity[]>();
@@ -92,12 +94,13 @@ export function CommandPalette({ isAdmin = false, agents = [] }: { isAdmin?: boo
     query,
     routes: DASHBOARD_ROUTES,
     isAdmin,
+    enabledPlugins,
     agents,
     teams,
     missions,
     conversations,
     themeIsDark: resolvedTheme === 'dark',
-  }), [query, isAdmin, agents, teams, missions, conversations, resolvedTheme]);
+  }), [query, isAdmin, enabledPlugins, agents, teams, missions, conversations, resolvedTheme]);
 
   const close = () => {
     setOpen(false);
@@ -141,9 +144,12 @@ export function CommandPalette({ isAdmin = false, agents = [] }: { isAdmin?: boo
         ask(query.trim());
         return;
       case 'new-conversation':
-        // `?new=1` asks the chat surface for a fresh thread instead of the
-        // last-viewed one (the rail honours it; older cores ignore it).
-        go('/dashboard/chat?new=1');
+        // The ONE entry function (§6): a mounted surface starts over in place;
+        // none mounted, the chat page opens asking for a fresh thread.
+        close();
+        if (!requestAgentSurface({ newChat: true })) {
+          router.push('/dashboard/chat?new=1');
+        }
         return;
       case 'open-rail':
         close();
@@ -169,7 +175,7 @@ export function CommandPalette({ isAdmin = false, agents = [] }: { isAdmin?: boo
   };
 
   return (
-    <CommandDialog open={open} onOpenChange={o => (o ? setOpen(true) : close())} title="Search and commands" description="Jump to a page, an agent or a conversation, or ask Vocion.">
+    <CommandDialog open={open} onOpenChange={o => (o ? setOpen(true) : close())} title="Search and commands" description="Jump to a page, an agent or a conversation, or ask Vocion." commandProps={{ filter: paletteFilter }}>
       <CommandInput placeholder="Search, or ask Vocion anything…" value={query} onValueChange={setQuery} />
       <CommandList>
         <CommandEmpty>Nothing matches. Press Enter to ask Vocion instead.</CommandEmpty>
@@ -220,6 +226,7 @@ function RowIcon({ row }: { row: PaletteRow }) {
   switch (row.action) {
     case 'ask': return <Sparkles />;
     case 'new-conversation': return <Plus />;
+    case 'all-conversations': return <MessagesSquare />;
     case 'open-rail': return <PanelRight />;
     case 'toggle-sidebar': return <PanelLeft />;
     case 'toggle-theme': return row.label.includes('light') ? <Sun /> : <Moon />;

@@ -2,7 +2,7 @@ import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import type { BriefingV2 } from '@/services/briefings/document';
 import type { StoredClassification } from '@/services/discovery/classification';
 import { relations, sql } from 'drizzle-orm';
-import { bigint, boolean, check, customType, index, integer, jsonb, pgTable, real, serial, text, timestamp, uniqueIndex, vector } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, customType, doublePrecision, index, integer, jsonb, pgTable, primaryKey, real, serial, text, timestamp, uniqueIndex, vector } from 'drizzle-orm/pg-core';
 
 /**
  * Postgres `tsvector` column type. Drizzle doesn't ship one out of the
@@ -51,6 +51,15 @@ const tsvector = customType<{ data: string; driverData: string }>({
 /*   - `project` replaces today's `orgId` scope on business content.     */
 /*     Columns are added in a follow-up migration after callers migrate. */
 /* ==================================================================== */
+
+/**
+ * The role a person holds IN ONE WORKSPACE. Mirrors `WorkspaceRole` in
+ * `services/authz.ts`, which owns the grant model these map to; the DDL pins
+ * the same two with a CHECK. Declared here rather than imported so the schema
+ * stays free of service imports — `workspaceAccessRole.test.ts` fails if the
+ * two ever drift.
+ */
+type WorkspaceAccessRole = 'admin' | 'member';
 
 /** A person. Drizzle adapter shape for auth.js v5. */
 export const userSchema = pgTable('user', {
@@ -177,12 +186,34 @@ export const projectSchema = pgTable(
      */
     accountableUserId: text('accountable_user_id').references(() => userSchema.id, { onDelete: 'set null' }),
     /**
+     * `shared` — a workspace the team works in, the only kind before 0142.
+     * `personal` — one person's own workspace, holding their exec assistant.
+     *
+     * The distinction is load-bearing in two places that have nothing to do
+     * with the UI: a personal workspace is never a target of a group grant,
+     * and the deploy's stale-row sweep keys on this rather than on a list of
+     * known slugs (a slug list swept every personal workspace's agents,
+     * missions and ingested mail on every deploy).
+     */
+    kind: text('kind').$type<'shared' | 'personal'>().default('shared').notNull(),
+    /** Set iff `kind = 'personal'`: the person the workspace belongs to. */
+    ownerUserId: text('owner_user_id').references(() => userSchema.id, { onDelete: 'set null' }),
+    /**
      * Optional dashboard surfaces this workspace switched on, by registry id
      * (`features/navigation/surfaces.ts`). Authored as top-level `surfaces:`
      * in workspace.yaml and replaced wholesale at apply. Empty = the default
      * sidebar only.
      */
     enabledSurfaces: jsonb('enabled_surfaces').$type<string[]>().default([]).notNull(),
+    /**
+     * Plugins this workspace turned on (migration 0124), by slug, dependency-
+     * closed and in load order — `workspace.yaml` `plugins:` as the loader
+     * resolved it (`libs/workspace/plugins.ts`). Replaced wholesale at apply.
+     * Read by the shell (plugin-owned nav rows), the agent runtime
+     * (plugin-owned tools, the capabilities note) and the collectors that
+     * only run for a workspace that asked for them. Empty = no plugins.
+     */
+    enabledPlugins: jsonb('enabled_plugins').$type<string[]>().default([]).notNull(),
     /**
      * Which vendor and model produce this workspace's embeddings. Authored as
      * `defaults.embeddingProvider` / `defaults.embeddingModel` in
@@ -215,6 +246,34 @@ export const projectSchema = pgTable(
      */
     regenerateSkills: jsonb('regenerate_skills').$type<Record<string, string>>(),
     /**
+     * Which document playbooks are client-facing (migration 0125), and so
+     * cannot be printed to a PDF until the document has been read as the
+     * sceptical buyer on its current version. Authored as
+     * `defaults.clientFacingPlaybooks` in workspace.yaml; read by the export
+     * gate (`services/documents/exportGate.ts`).
+     *
+     * NULL means the workspace authored none and core's defaults apply
+     * (`proposal`, `scope`, `partnership-update`). An empty ARRAY is a
+     * workspace that deliberately gates nothing — the distinction is the
+     * whole reason this is nullable rather than defaulting to `[]`.
+     */
+    clientFacingPlaybooks: jsonb('client_facing_playbooks').$type<string[]>(),
+    /**
+     * How eager this workspace is to improve itself, 0–10 (migration 0127).
+     *
+     * Moves the confidence bar for the class of actions that change what the
+     * system knows about how to work — adopting a rule from a correction
+     * today, more nouns later (`libs/actions/eagerness.ts`; an action opts in
+     * with `selfImproving`). 0 always asks; 10 runs on anything it is plainly
+     * confident about. It never moves the confidence itself, so an inferred
+     * rule still asks at 10.
+     *
+     * Authored as `defaults.learningEagerness` in workspace.yaml. NULL means
+     * the workspace authored nothing and the shipped default (7) applies — a
+     * column default would make "unset" and "deliberately 7" the same fact.
+     */
+    learningEagerness: integer('learning_eagerness'),
+    /**
      * The workspace's voice rules (migration 0108) — the banned constructions
      * outbound copy is linted against before it can reach a review queue.
      * Authored as `workspace/<org>/voice.yaml`; shape is
@@ -245,12 +304,59 @@ export const projectSchema = pgTable(
      */
     goal: text('goal'),
     /**
+     * The workspace's operating intent (migration 0135): what a person wants
+     * the factory doing now: outcomes, priorities, constraints, budget,
+     * autonomy policy and product judgment. Authored as workspace-as-code in
+     * `operating-intent.yaml`, shape in `libs/workspace/schemas.ts`
+     * `OperatingIntentManifestSchema`, composed into the prompts of the agents
+     * that choose and prioritise work.
+     *
+     * NULL = the factory has been told nothing. That is deliberately not the
+     * same fact as an authored intent with empty lists, which is a person
+     * saying there are no constraints; the agents report the two differently.
+     */
+    operatingIntent: jsonb('operating_intent').$type<{
+      outcomes?: Array<{ statement: string; because?: string; by?: string }>;
+      priorities?: Array<{ statement: string; over?: string }>;
+      constraints?: Array<{ statement: string; because?: string }>;
+      budget?: { limitCents: number; window: 'day' | 'week' | 'month'; note?: string };
+      autonomy?: Array<{ actionClass: string; policy: 'unattended' | 'ask' | 'never'; because?: string }>;
+      productJudgment?: string[];
+      reviewedAt?: string;
+    }>(),
+    /**
      * The workspace's mailbox (migration 0097): the address people write to,
      * answered by the workspace lead. Authored as `mailbox:` in workspace.yaml;
      * default address `<slug>@<VOCION_MAIL_DOMAIN>`. Null/false = no mailbox.
      */
     mailboxAddress: text('mailbox_address'),
     mailboxEnabled: boolean('mailbox_enabled').default(false).notNull(),
+    /**
+     * IANA zone the workspace lives in (`defaults.timezone` in workspace.yaml).
+     * The day boundary for everything no browser is behind — missions,
+     * briefings, mail — and the fallback when a turn arrives without one.
+     */
+    timeZone: text('time_zone'),
+    /**
+     * The workspace's off switch (migration 0132) — a person's hold on
+     * everything the factory does by itself: automation fires, mission runs,
+     * worker runs, and gated actions that are not a hand-off. Chat with an
+     * agent stays open; a turn that tries one of those is refused with this
+     * note. `services/workspacePause.ts` is the one guard every caller uses.
+     *
+     * A DIFFERENT fact from `automation.paused_at`, and that is the point: a
+     * workspace pause writes no automation row, so resuming the workspace
+     * restores exactly the per-automation state that was there before. An
+     * automation someone paused last Tuesday is still paused afterwards,
+     * because nothing touched it.
+     *
+     * NULL = running. `pausedBy` is the `user.id`, or `token:<id>` when an
+     * API token placed the hold; the name is resolved when shown. Never
+     * written by `workspace:apply` — a deploy does not lift a person's stop.
+     */
+    pausedAt: timestamp('paused_at', { mode: 'date' }),
+    pausedBy: text('paused_by'),
+    pausedNote: text('paused_note'),
     updatedAt: timestamp('updated_at', { mode: 'date' })
       .defaultNow()
       .$onUpdate(() => new Date())
@@ -298,6 +404,101 @@ export const inviteSchema = pgTable(
   },
   table => [
     index('invite_account_email_idx').on(table.accountId, table.email),
+  ],
+);
+
+/* ==================================================================== */
+/* Workspace access (0142)                                               */
+/*                                                                       */
+/* Account membership says a person is in the deployment. These say      */
+/* WHICH workspaces they reach and at what role:                         */
+/*                                                                       */
+/*   user_group ──< user_group_member >── user                           */
+/*        │                                                              */
+/*        └──< group_project_grant >── project     (role per workspace)   */
+/*                                                                       */
+/*   project_member                                 (a direct grant)     */
+/*                                                                       */
+/* `user_group`, never `team`: `team` above is an org chart of AGENTS.    */
+/* A group grant is resolved at READ time rather than expanded into      */
+/* project_member rows, so removing someone from a group takes effect on */
+/* their next request instead of waiting for a re-expansion.             */
+/* ==================================================================== */
+
+/** A named group of people, e.g. the sales team or the delivery team. */
+export const userGroupSchema = pgTable(
+  'user_group',
+  {
+    id: text('id').primaryKey(),
+    accountId: text('account_id').notNull().references(() => tenantAccountSchema.id, { onDelete: 'cascade' }),
+    slug: text('slug').notNull(),
+    name: text('name').notNull(),
+    description: text('description'),
+    /**
+     * 'yaml' | 'ui'. Provenance for display only. It never gates a write:
+     * `people:apply` is create-if-absent and never updates a row that exists,
+     * whichever door made it.
+     */
+    managedFrom: text('managed_from').$type<'yaml' | 'ui'>().default('ui').notNull(),
+    createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  },
+  table => [
+    uniqueIndex('user_group_account_slug_idx').on(table.accountId, table.slug),
+  ],
+);
+
+/** Who is in a group. */
+export const userGroupMemberSchema = pgTable(
+  'user_group_member',
+  {
+    groupId: text('group_id').notNull().references(() => userGroupSchema.id, { onDelete: 'cascade' }),
+    userId: text('user_id').notNull().references(() => userSchema.id, { onDelete: 'cascade' }),
+    addedAt: timestamp('added_at', { mode: 'date' }).defaultNow().notNull(),
+    /** A user id, or 'yaml' when the seed applier put the row there. */
+    addedBy: text('added_by'),
+  },
+  table => [
+    primaryKey({ columns: [table.groupId, table.userId] }),
+    // The resolver asks what a PERSON may reach, and `user_id` trails the key.
+    index('user_group_member_user_idx').on(table.userId),
+  ],
+);
+
+/** What a group grants: one workspace, at one role. */
+export const groupProjectGrantSchema = pgTable(
+  'group_project_grant',
+  {
+    groupId: text('group_id').notNull().references(() => userGroupSchema.id, { onDelete: 'cascade' }),
+    projectId: text('project_id').notNull().references(() => projectSchema.id, { onDelete: 'cascade' }),
+    /** A `WorkspaceRole` (`services/authz.ts`), constrained in the DDL. */
+    role: text('role').$type<WorkspaceAccessRole>().notNull(),
+    grantedAt: timestamp('granted_at', { mode: 'date' }).defaultNow().notNull(),
+    grantedBy: text('granted_by'),
+  },
+  table => [
+    primaryKey({ columns: [table.groupId, table.projectId] }),
+    index('group_project_grant_project_idx').on(table.projectId),
+  ],
+);
+
+/** A person granted one workspace directly, outside any group. */
+export const projectMemberSchema = pgTable(
+  'project_member',
+  {
+    projectId: text('project_id').notNull().references(() => projectSchema.id, { onDelete: 'cascade' }),
+    userId: text('user_id').notNull().references(() => userSchema.id, { onDelete: 'cascade' }),
+    role: text('role').$type<WorkspaceAccessRole>().notNull(),
+    /**
+     * Why the row exists: 'direct' (someone granted it) or 'owner' (the person
+     * a personal workspace belongs to). Group grants never appear here.
+     */
+    source: text('source').$type<'direct' | 'owner'>().default('direct').notNull(),
+    addedAt: timestamp('added_at', { mode: 'date' }).defaultNow().notNull(),
+    addedBy: text('added_by'),
+  },
+  table => [
+    primaryKey({ columns: [table.projectId, table.userId] }),
+    index('project_member_user_idx').on(table.userId),
   ],
 );
 
@@ -635,6 +836,8 @@ export const agentSchema = pgTable(
       provider?: 'local' | 'agentcore' | 'runtime';
       interrupts?: string[];
       maxTokens?: number;
+      /** Graph steps one turn may take; unset keeps each provider's own backstop. See `services/agents/stepLimit.ts`. */
+      maxSteps?: number;
       /** Built-in tool names to withhold from this agent (e.g. propose_action for agents with no CRM writes). */
       excludeTools?: string[];
       /** Granted-only tool names to hand this agent (e.g. classify_call). Gated tools are absent unless named here. */
@@ -654,6 +857,13 @@ export const agentSchema = pgTable(
        * agent at one vendor without moving the whole deployment.
        */
       modelProvider?: 'anthropic' | 'openai' | 'bedrock';
+      /**
+       * Cache this agent's prompt prefix at the vendor. Unset means the
+       * process default (on), so this exists to turn caching OFF for one
+       * agent — a prompt that changes on every turn pays the 1.25x write
+       * rate for a cache nothing ever reads back. See `libs/llm/promptCache.ts`.
+       */
+      promptCache?: boolean;
     }>().default({}).notNull(),
     /**
      * agentcore provider only: ARN of the provisioned AgentCore harness.
@@ -712,6 +922,22 @@ export const agentSchema = pgTable(
     accent: text('accent'),
     /** Short tagline shown above the chat title (v0.2). */
     eyebrow: text('eyebrow'),
+    /**
+     * What this agent answers for — short topics, intents or example asks
+     * (`handles: [wiki, standing rules, research]`). The router matches a
+     * message against these first, then the description and suggestions
+     * (`services/agents/router.ts`). Empty means the agent is reached only by
+     * name, by delegation, or as the workspace lead's default.
+     */
+    handles: jsonb('handles').$type<string[]>().default([]).notNull(),
+    /**
+     * How much the agent volunteers: `low` | `normal` | `high`. Breaks routing
+     * ties, decides whether a turn ends with an offer to carry the work
+     * forward, and whether the agent takes part in debriefs — the automations
+     * that turn completed work into updates. NULL reads as `normal`, so a row
+     * applied before the column exists behaves exactly as it did.
+     */
+    initiative: text('initiative').$type<'low' | 'normal' | 'high'>(),
     /** Langfuse project ID for observability */
     langfuseProjectId: text('langfuse_project_id'),
     /** Icon name (lucide) */
@@ -792,7 +1018,7 @@ export type TeamKpi = {
 export type TeamMeasureSource
   = | { kind: 'verified'; connector: 'hubspot'; query: { object: 'deals' | 'contacts' | 'companies'; filter: { dealStages?: string[]; pipelines?: string[]; dealStatus?: 'open' | 'closed'; lifecycleStages?: string[]; industries?: string[]; ownerIds?: string[] }; aggregate: string } }
     | { kind: 'verified'; connector: 'web-analytics'; query: { metric: 'sessions' | 'users' | 'conversions' | 'signups'; filter: { pathPrefix?: string; channel?: string; event?: string } } }
-    | { kind: 'observed'; actions?: string[]; counts?: string; rows?: 'workspace-members' }
+    | { kind: 'observed'; actions?: string[]; counts?: string; rows?: 'workspace-members' | 'artifacts' | 'data-rooms' | 'data-room-sources'; where?: { kind?: string; folder?: string; playbook?: string; verified?: boolean } }
     | { kind: 'human-confirmed'; actions?: string[]; askKinds?: string[] }
     | { kind: 'agent-reported'; counts: string };
 
@@ -896,12 +1122,26 @@ export const automationSchema = pgTable(
     description: text('description'),
     /** `active` | `disabled` */
     status: text('status').default('active'),
-    /** `{schedule: '<cron UTC>'}` or `{event: '<type>', filter?: {...}}`. */
-    whenConfig: jsonb('when_config').$type<{ schedule?: string; event?: string; filter?: Record<string, unknown> }>().notNull(),
+    /**
+     * `{schedule: cron}` | `{event: type | [types], filter?, maxFiresPer10m?}` —
+     * an array fires on any of the named types. `maxFiresPer10m` is the
+     * event-when's ceiling (default 6, `services/automations/fireGuards.ts`):
+     * fires beyond it in a ten-minute window are held and coalesced into one.
+     */
+    whenConfig: jsonb('when_config').$type<{ schedule?: string; event?: string | string[]; filter?: Record<string, unknown>; maxFiresPer10m?: number }>().notNull(),
     /** `{workflow: '<slug>', input?}` | `{checkMission: '<slug>', prompt?}` (prompt = the authored execution orders for each check) | `{job: '<name>', input?}` (built-in server job). */
-    doConfig: jsonb('do_config').$type<{ workflow?: string; checkMission?: string; job?: string; prompt?: string; input?: Record<string, unknown> }>().notNull(),
+    doConfig: jsonb('do_config').$type<{ workflow?: string; checkMission?: string; job?: string; prompt?: string; requireTool?: string; input?: Record<string, unknown> }>().notNull(),
     /** Owning agent slug. Nullable — `checkMission` inherits the owner from its mission; `job`/`workflow` set it here so the schedule rolls up to an agent. */
     ownerAgentSlug: text('owner_agent_slug'),
+    /**
+     * A person's pause, held apart from the authored `status`. `status` is what
+     * the YAML says and is replaced on every apply; this is an operational hold
+     * a person placed from the app, and apply leaves it alone. Set together:
+     * when, who (`user.id`), and the note they left. All null when not paused.
+     */
+    pausedAt: timestamp('paused_at', { mode: 'date' }),
+    pausedBy: text('paused_by'),
+    pausedNote: text('paused_note'),
     updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().$onUpdate(() => new Date()).notNull(),
     createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
   },
@@ -923,11 +1163,11 @@ export const automationRunSchema = pgTable(
     orgId: text('org_id').notNull(),
     /** The automation's slug — not an FK, so a run survives the automation being removed. */
     slug: text('slug').notNull(),
-    /** Which do-type dispatched: 'workflow' | 'mission_check' | 'job'. */
+    /** Which do-type dispatched: 'workflow' | 'mission_check' | 'job' — or 'control' for a person's pause/resume and 'skipped' for a fire the matcher refused (its own run's event, or the rate ceiling), recorded here so the log holds the whole history. */
     kind: text('kind').notNull(),
     /** 'running' | 'ok' | 'error'. */
     status: text('status').default('running').notNull(),
-    /** `automation:<slug>` for a schedule fire, `user:<id>` for a dashboard test run. */
+    /** `automation:<slug>` for a schedule fire, `dashboard:test-run` for a test run, `user:<id>` for a person's pause or resume. */
     invokedBy: text('invoked_by'),
     /** True when the caller asked for a no-writes rehearsal (test runs). */
     dryRun: boolean('dry_run').default(false).notNull(),
@@ -1144,6 +1384,13 @@ export const missionRunSchema = pgTable('mission_run', {
   /** Workspace SHA active when the run started — stamped for audit. */
   workspaceSha: text('workspace_sha'),
   createdBy: text('created_by'),
+  /**
+   * The automation fires that led to this run, newest first — the check that
+   * started it, then whatever started that. Null for a run a person or the
+   * planner started. Rides every event the run raises, so an automation is
+   * never fired by its own run's residue (`services/automations/fireGuards.ts`).
+   */
+  causedBy: jsonb('caused_by').$type<Array<{ automationSlug: string; automationRunId?: number; missionRunId?: number }>>(),
   rating: text('rating'),
   feedbackNote: text('feedback_note'),
   feedbackBy: text('feedback_by'),
@@ -1345,8 +1592,20 @@ export const conversationSchema = pgTable(
      * queue and trust rules still gate every outward action. Text, not an
      * enum, so a new rung is a code change.
      */
-    autonomy: text('autonomy').default('ask').notNull(),
+    // Done for you by default since 2026-09-18 (migration 0123); a person can pull a thread back to 'ask'.
+    autonomy: text('autonomy').default('act-within-bounds').notNull(),
+    /** How strong a model answers this thread (`libs/llm/modelPrefs.ts`): fast | balanced | deep. Null = balanced, the agent's own. */
+    modelStrength: text('model_strength').$type<'fast' | 'balanced' | 'deep'>(),
+    /** How much it thinks: off | low | medium | high. Null = off. */
+    thinkingEffort: text('thinking_effort').$type<'off' | 'low' | 'medium' | 'high'>(),
     messageCount: integer('message_count').default(0).notNull(),
+    /**
+     * When the conversation was judged over — no turn for the idle window
+     * the `sweep-idle-conversations` job runs with — and `conversation.ended`
+     * was raised for it. Cleared by the next message, so a thread picked up
+     * again ends again later, under a new dedupe key. NULL means open.
+     */
+    endedAt: timestamp('ended_at', { mode: 'date' }),
     updatedAt: timestamp('updated_at', { mode: 'date' })
       .defaultNow()
       .$onUpdate(() => new Date())
@@ -1378,13 +1637,32 @@ export const conversationMessageSchema = pgTable('conversation_message', {
   /** Rendered text content the agent sees on history replay. */
   content: text('content').notNull().default(''),
   /**
+   * How this message reached its agent, when the workspace chose one rather
+   * than the person: the candidates considered, the slug picked and why
+   * (`RoutingDecision` in services/agents/router.ts). On the `user` row the
+   * decision was made for. NULL when the agent was named — by the composer,
+   * an `@mention`, a channel binding — or for assistant turns.
+   */
+  routingJson: jsonb('routing_json').$type<import('@/services/agents/router').RoutingDecision>(),
+  /**
+   * Which agent spoke an assistant turn — the slug the runtime actually ran,
+   * stamped when the row is written. The transcript's "via <specialist>"
+   * eyebrow reads THIS after a reload, never a guess made on the client
+   * before the turn ran (backlog 009: a label that said "via QA" on a turn
+   * the product manager answered). NULL on user rows and on turns written
+   * before the column existed.
+   */
+  agentSlug: text('agent_slug'),
+  /**
    * Structured breadcrumb array for the chat UI: a series of text
    * runs interleaved with tool breadcrumbs. Tool entries are dropped
    * when this row is replayed as history to the agent.
    */
   runsJson: jsonb('runs_json').$type<Array<
     | { type: 'text'; text: string }
-    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string }
+    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string; state?: 'pending' | 'done' | 'error' }
+    | { type: 'card'; id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string; ref?: { type: string; id: number } }
+    | { type: 'card_decision'; cardId: string; action: string; runId?: number; label?: string }
   >>(),
   /**
    * Cited/pulled source documents for this assistant turn — so inline `[n]`
@@ -1420,6 +1698,7 @@ export const conversationMessageSchema = pgTable('conversation_message', {
     resultDetail?: string;
     text?: string;
     result?: string;
+    labels?: { running: string; done: string };
     confidence?: number;
     citations?: Array<{ sourceType: string; title: string; link?: string; snippet?: string; actorId: string }>;
   }>>(),
@@ -1430,6 +1709,28 @@ export const conversationMessageSchema = pgTable('conversation_message', {
    * user messages (which don't produce a trace).
    */
   langfuseTraceId: text('langfuse_trace_id'),
+  /**
+   * How the turn ended — one of `services/chat/turnStatus.ts`'s values:
+   * `complete`, `incomplete`, `failed`, `refused`, `stopped`, `truncated`,
+   * `continued`. NULL means the row predates the vocabulary and is treated as
+   * `complete`, which is what those rows were.
+   *
+   * Free-form text rather than an enum on purpose: the vocabulary is young and
+   * a new ending should not need a migration. `TurnStatus` and the tests around
+   * it are what keep it honest.
+   *
+   * Three things read it — the notice under the turn, whether the text is
+   * replayed to the model next turn (`toHistoryTurns` drops `incomplete`,
+   * `failed` and `refused`), and any count of how turns are ending.
+   */
+  status: text('status'),
+  /**
+   * Why the turn ended that way, in the runtime's own words — "Budget exceeded
+   * for …", "socket hang up". NULL on an ordinary turn. Shown under the notice
+   * so a person reporting a broken turn can say what happened, and so the same
+   * turn reads the same way after a reload as it did live.
+   */
+  statusReason: text('status_reason'),
   /**
    * Agent's self-assessment of confidence for this turn — same enum as
    * skill_run.confidence. Nullable when the runtime doesn't expose a
@@ -1533,6 +1834,12 @@ export const userNavPrefSchema = pgTable(
     userId: text('user_id').notNull(),
     pins: jsonb('pins').$type<string[]>().default([]).notNull(),
     dismissed: jsonb('dismissed').$type<string[]>().default([]).notNull(),
+    /**
+     * Page slug -> ISO instant this person last opened that page. Absent slug
+     * means never opened, and a surface that says "since you last looked"
+     * must say so rather than substitute a window. Migration 0133.
+     */
+    pageSeen: jsonb('page_seen').$type<Record<string, string>>().default({}).notNull(),
     updatedAt: timestamp('updated_at', { mode: 'date' })
       .defaultNow()
       .$onUpdate(() => new Date())
@@ -1608,6 +1915,17 @@ export const evalDatasetSchema = pgTable(
      * up, not the default reading of every page.
      */
     provider: text('provider').default('vocion').notNull(),
+    /**
+     * Pass rate a run of this dataset has to reach before `eval:run` exits 0.
+     *
+     * Null means the runner's own floor decides, which is what every dataset
+     * written before this column had. It belongs to the dataset because the
+     * right bar differs between them: a handful of deterministic cases can be
+     * held to all of them passing, while a set spread across a dozen live
+     * sites will lose one to a page redesign and should not fail a build for
+     * it.
+     */
+    passThreshold: doublePrecision('pass_threshold'),
     description: text('description'),
     /**
      * Test cases, the same shape `EvalDatasetItem` in
@@ -1691,7 +2009,14 @@ export const evalRunSchema = pgTable('eval_run', {
    */
   errorMessage: text('error_message'),
   metrics: jsonb('metrics').$type<{
-    passRate?: number;
+    /** Null when no score said pass or fail; see `scoresWithoutVerdict`. */
+    passRate?: number | null;
+    /**
+     * Scores that ran but gave no pass-or-fail verdict — AWS's ratings on
+     * their own scales. Tells a null pass rate that means "rated, not gated"
+     * apart from one that means "nothing was scored".
+     */
+    scoresWithoutVerdict?: number;
     toolCallCount?: number;
     medianLatencyMs?: number;
     failed?: number;
@@ -1726,7 +2051,7 @@ export const evalCaseResultSchema = pgTable('eval_case_result', {
   latencyMs: integer('latency_ms'),
   /**
    * What this one case cost: the agent run's token usage priced by
-   * `tokenCostCents`, plus how many model turns and tool calls it took.
+   * `tokenCostMicroCents`, plus how many model turns and tool calls it took.
    * NULL on rows written before the column existed and on errored cases.
    */
   usage: jsonb('usage').$type<{
@@ -2079,13 +2404,48 @@ export const agentBudgetSchema = pgTable(
     orgId: text('org_id').notNull(),
     /** Phase 1: nullable for backfill; will be set NOT NULL once data migrates. */
     projectId: text('project_id').references(() => projectSchema.id, { onDelete: 'cascade' }),
+    /**
+     * What the row budgets. Either an agent's slug, or one of the reserved
+     * platform scopes `platform:all` (everything this org spent) and
+     * `platform:<feature>` (one non-agent surface, e.g.
+     * `platform:retrieval.embed`). `BudgetService` owns the spelling — see
+     * `ORG_SCOPE_SLUG` and `featureScopeSlug` there.
+     *
+     * The scope rides in this column rather than in a column of its own
+     * because the unique index below is what makes a charge atomic, and
+     * widening a unique index on a populated table is an expand-and-contract
+     * migration (migrations/CONVENTIONS.md §2) rather than a one-line change.
+     */
     agentSlug: text('agent_slug').notNull(),
+    /**
+     * The Langfuse feature dimension this row rolls up, for a
+     * `platform:<feature>` row — null on an agent row and on `platform:all`.
+     * A typed label to group by, so a report never has to parse the slug.
+     */
+    feature: text('feature'),
     /** daily | monthly */
     period: text('period').default('daily').notNull(),
     /** Tokens consumed in the current period (sum of input + output). */
     currentTokens: bigint('current_tokens', { mode: 'number' }).default(0).notNull(),
-    /** Dollars (in USD cents to keep math integer-safe). */
-    currentCents: bigint('current_cents', { mode: 'number' }).default(0).notNull(),
+    /**
+     * Spend in the current period, in micro-cents — a millionth of a cent.
+     *
+     * The only money column, and a whole number, so a charge is exact and so
+     * is every sum of charges. Charging moved from one call per agent turn to
+     * one call per embedding batch, and a batch of chunks costs a fraction of
+     * a cent: counting in whole cents rounded a tenth of a cent up to one on
+     * every batch and billed a $1 sync as $10.
+     *
+     * Cents for reading are divided out of this at the point of display.
+     * There used to be a `current_cents` column holding that division, and it
+     * was removed: it was a second copy of the same money that could disagree
+     * with this one, and because it was floored per row, the agents' cents
+     * never added up to the workspace's. The database column outlives this
+     * line by one release — nothing reads or writes it now, and a later
+     * migration drops it (see `migrations/CONVENTIONS.md`, expand and
+     * contract).
+     */
+    currentMicroCents: bigint('current_micro_cents', { mode: 'number' }).default(0).notNull(),
     /** Soft cap — warn but don't refuse. */
     softTokenLimit: bigint('soft_token_limit', { mode: 'number' }),
     softCentsLimit: bigint('soft_cents_limit', { mode: 'number' }),
@@ -2570,6 +2930,12 @@ export const knowledgeDocumentSchema = pgTable(
     metadata: jsonb('metadata').$type<Record<string, unknown>>().default({}).notNull(),
     /** SHA-256 of the canonical content. Re-ingest is a no-op when unchanged. */
     contentHash: text('content_hash').notNull(),
+    /** The `contentHash` a document processor last finished on. */
+    processedHash: text('processed_hash'),
+    /** Processor tries on this content without finishing; above zero and under the cap, the sync runs it again. */
+    processorAttempts: integer('processor_attempts').default(0).notNull(),
+    /** Why the last try did not finish. */
+    processorError: text('processor_error'),
     /** Last-modified hints from the upstream source (HTTP ETag / mtime). */
     etag: text('etag'),
     lastModifiedAt: timestamp('last_modified_at', { mode: 'date' }),
@@ -2730,6 +3096,49 @@ export const sourceSyncCheckpointSchema = pgTable(
  * because a minted row now carries ciphertext too, so a rewritten `platform`
  * alone would leave a row the constraint happily accepts as a supplied key.
  */
+/* ------------------------------------------------------------------ */
+/* OAuth 2.1 for assistants (backlog 027)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A client that registered itself to sign a person in — Claude.ai, ChatGPT,
+ * Claude Code, Cursor. Public clients (PKCE, no secret): the redirect list
+ * is what identifies them. Ported from Slate's `oauth_clients` (2026-09-25).
+ */
+export const oauthClientSchema = pgTable('oauth_client', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  redirectUris: jsonb('redirect_uris').$type<string[]>().notNull(),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+});
+
+/**
+ * One sign-in attempt: created at /oauth/authorize, approved by the person on
+ * the consent page (which stamps who and which workspace), exchanged once at
+ * /oauth/token. Ten minutes to live.
+ */
+export const oauthRequestSchema = pgTable(
+  'oauth_request',
+  {
+    id: text('id').primaryKey(),
+    clientId: text('client_id').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    codeChallenge: text('code_challenge').notNull(),
+    state: text('state'),
+    scope: text('scope'),
+    userId: text('user_id'),
+    orgId: text('org_id'),
+    /** The authorization code, set when the person approves; cleared when exchanged. */
+    code: text('code'),
+    status: text('status').default('pending').notNull(),
+    expiresAt: timestamp('expires_at', { mode: 'date' }).notNull(),
+    createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  },
+  table => [
+    uniqueIndex('oauth_request_code_idx').on(table.code),
+  ],
+);
+
 export const apiTokenSchema = pgTable(
   'api_token',
   {
@@ -3042,7 +3451,7 @@ export const actionRunSchema = pgTable(
     /** Registered action id, e.g. `gmail.send`. */
     actionId: text('action_id').notNull(),
     input: jsonb('input').$type<Record<string, unknown>>().default({}).notNull(),
-    /** pending | approved | executing | done | failed | rejected */
+    /** pending | approved | executing | done | failed | rejected | undone (a done run a person put back) */
     status: text('status').default('pending').notNull(),
     result: jsonb('result').$type<Record<string, unknown>>(),
     error: text('error'),
@@ -3072,6 +3481,10 @@ export const actionRunSchema = pgTable(
       evidence?: string[];
       autoApproved?: boolean;
       autoApprovedThreshold?: number;
+      /** Why it ran without a person, in one clause (`libs/actions/autoAccept.ts`). */
+      autoApprovedReason?: string;
+      /** Which rule released it: `trust-rule` (a promoted kind) or `default` (reversible, low-risk, above the bar). */
+      autoApprovedBy?: string;
       /**
        * Which agent's judgement this proposal represents. `invokedBy` cannot
        * always answer that: a proposal made over the API records the human or
@@ -3137,6 +3550,10 @@ export const actionRunSchema = pgTable(
        * field was read off the page.
        */
       labels?: string[];
+      /** Named 0..1 judgements, names from the source's config. */
+      scores?: Record<string, number>;
+      /** Adopted rules the proposer said decided its verdict. Absent: not recorded. [] : checked, none did. */
+      matchedRules?: Array<{ id: string; title?: string; text: string; evidence?: string }>;
     }>(),
     /**
      * Idempotency/upsert key for agent-suggested actions — the review-card
@@ -3200,6 +3617,14 @@ export const actionRunSchema = pgTable(
     /** The reviewer's instruction behind the in-flight regeneration, so every surface can show it. */
     regenerateNote: text('regenerate_note'),
     /**
+     * Why the LAST regeneration did not land, when it did not. Set by the
+     * regenerate route's dispatch failure handler, cleared when the next
+     * regeneration starts and when a redraft lands through the dedup refresh.
+     * Without it a failed regenerate was indistinguishable from one that
+     * changed nothing (ticket 069).
+     */
+    regenerateError: text('regenerate_error'),
+    /**
      * The audit record of AI rewrites asked during review, newest last. The
      * DRAFT itself is never touched by a rewrite (the reviewer carries the
      * copy and passes it back on approve); this is the record of what was
@@ -3213,6 +3638,37 @@ export const actionRunSchema = pgTable(
       body: string;
       ask?: string;
       discardedEdit?: string;
+      at: string;
+      by?: string;
+      /**
+       * What this entry IS, so one column reads as a history rather than a
+       * list of bodies: `proposed` is the copy the agent wrote before any
+       * rewrite touched it, `regenerated` a version that came back, and
+       * `approved` the copy a reviewer vouched for. Optional because every
+       * row written before this shipped is a rewrite's answer, which is what
+       * an absent kind reads as.
+       */
+      kind?: 'proposed' | 'regenerated' | 'approved' | 'failed';
+      /** Why a regeneration asked here did not land; only on a `failed` entry. */
+      failure?: string;
+    }>>(),
+    /**
+     * Which content items a reviewer has approved one at a time, keyed by the
+     * card's content id (`send-2`).
+     *
+     * The value is a HASH of the copy that was approved, never a boolean. A
+     * check is then derived: the tab is checked only while the hash still
+     * matches what is on screen, so a regeneration or an inline edit clears it
+     * on its own. A flag would need clearing logic in three places — the
+     * regenerate route, the dedup refresh that lands a redraft, and the
+     * editor — and the first one anybody forgot would leave a check standing
+     * over copy nobody approved.
+     *
+     * `libs/actions/contentHash.ts` owns the hash, for both the route that
+     * writes it and the surface that compares against it.
+     */
+    contentReview: jsonb('content_review').$type<Record<string, {
+      hash: string;
       at: string;
       by?: string;
     }>>(),
@@ -3275,6 +3731,8 @@ export const eventLogSchema = pgTable(
     /** What this event started — `[{ slug, runId }]`. */
     triggered: jsonb('triggered').$type<Array<{ slug: string; runId: number }>>().default([]).notNull(),
     invokedBy: text('invoked_by'),
+    /** The automation fires whose work raised this event, newest first. Null when no automation was behind it. */
+    causedBy: jsonb('caused_by').$type<Array<{ automationSlug: string; automationRunId?: number; missionRunId?: number }>>(),
     createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
   },
   table => [
@@ -3718,6 +4176,25 @@ export type AskOption = {
 };
 
 /**
+ * One record an ask is about: an object type slug and the object's id, as a
+ * string. Carried on `ask.decided` so a subscriber can write the answer back
+ * where the question came from.
+ */
+export type AskObjectRef = { type: string; id: string };
+
+/**
+ * What sort of thing an ask is waiting for, and how much rides on it. Defined
+ * here, beside the row, so an action module (`libs/actions/ask-file.ts`) can
+ * read the vocabulary without importing the service — the action registry
+ * sits under the service's import graph, and a static import back into it
+ * is a cycle. `AskService` re-exports both.
+ */
+export const ASK_KINDS = ['approval', 'input', 'ruling', 'credential', 'merge', 'recommendation', 'gate'] as const;
+export type AskKind = typeof ASK_KINDS[number];
+export const ASK_RISKS = ['low', 'medium', 'high'] as const;
+export type AskRisk = typeof ASK_RISKS[number];
+
+/**
  * One QUESTION waiting on a PERSON: an approval, a ruling, an input or
  * credential, a merge, a recommendation, a gate. Unlike `action_run` nothing
  * executes when it is answered — the answer IS the outcome, and whoever filed
@@ -3750,6 +4227,20 @@ export const askSchema = pgTable(
     risk: text('risk'),
     /** Named answers. The free-text "other" answer is always available on top. */
     options: jsonb('options').$type<AskOption[]>().default([]).notNull(),
+    /**
+     * The records this question is about — `[{ type, id }]`, an object type
+     * slug and the object's id (migration 0129). Read back onto the record
+     * when the ask is decided: `ask.decided` carries them, so an automation
+     * can write the person's answer where the question came from. Filed by
+     * an agent's `file_ask` or over `POST /api/v1/asks`.
+     */
+    objectRefs: jsonb('object_refs').$type<AskObjectRef[]>().default([]).notNull(),
+    /**
+     * Minutes of a person's attention this decision is estimated to take —
+     * what a batch of asks costs against a daily decision budget. Said by the
+     * asker; null when it did not say.
+     */
+    decisionCost: integer('decision_cost'),
     /** Several asks sharing a key form one decision sheet. */
     groupKey: text('group_key'),
     groupTitle: text('group_title'),
@@ -3947,6 +4438,10 @@ export const artifactSchema = pgTable(
      * would move the audit answer.
      */
     visibility: text('visibility').$type<'user' | 'system'>().default('user').notNull(),
+    /** Who a share opens for (`libs/share/audience.ts`): me | workspace | anyone. Defaulted, so nothing changes for a row nobody touched. */
+    shareAudience: text('share_audience').$type<'me' | 'workspace' | 'anyone'>().default('workspace').notNull(),
+    /** The person who chose `me`; null otherwise. */
+    shareOwnerId: text('share_owner_id'),
     /** Denormalised head author, so the log lists "last editor" without a join. */
     lastAuthorKind: text('last_author_kind').$type<'agent' | 'human' | 'system'>().default('agent').notNull(),
     lastAuthorId: text('last_author_id'),
@@ -4046,3 +4541,42 @@ export const emailThreadSchema = pgTable(
     index('email_thread_conversation_idx').on(table.conversationId),
   ],
 );
+
+/** One lead's outcome inside a bulk job. */
+export type BulkLeadOutcome = {
+  leadId: number;
+  contactName: string | null;
+  state: 'queued' | 'landed' | 'failed';
+  /** Why it failed, in the words a reviewer reads. */
+  error?: string;
+  at?: string;
+};
+
+/**
+ * A bulk action on the personalization queue, as the record a person watches
+ * while it runs and what remains afterwards (Metacto ticket 071). The work
+ * itself is a Temporal workflow keyed to this row's id; `outcomes` carries
+ * one entry per lead, and `done` / `failed` are recomputed from it on every
+ * write so a retried lead never double-counts.
+ */
+export const personalizationBulkJobSchema = pgTable('personalization_bulk_job', {
+  id: serial('id').primaryKey(),
+  orgId: text('org_id').notNull(),
+  /** What the job does to each lead: `regenerate_brief` is the first kind. */
+  kind: text('kind').notNull(),
+  /** The reviewer's one instruction, carried to every lead. */
+  note: text('note').notNull(),
+  leadIds: jsonb('lead_ids').$type<number[]>().notNull(),
+  total: integer('total').notNull(),
+  done: integer('done').notNull().default(0),
+  failed: integer('failed').notNull().default(0),
+  /** queued → running → done. */
+  status: text('status').notNull().default('queued'),
+  outcomes: jsonb('outcomes').$type<BulkLeadOutcome[]>().notNull().default([]),
+  workflowId: text('workflow_id'),
+  createdBy: text('created_by'),
+  createdAt: timestamp('created_at', { mode: 'date' }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { mode: 'date' }).notNull().defaultNow(),
+}, table => [
+  index('personalization_bulk_job_org_idx').on(table.orgId, table.createdAt),
+]);

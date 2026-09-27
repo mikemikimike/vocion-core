@@ -1,6 +1,8 @@
 import { os } from '@orpc/server';
 import { z } from 'zod';
-import { listAttachmentsByMessage } from '@/services/ArtifactService';
+import { MODEL_STRENGTHS, THINKING_EFFORTS } from '@/libs/llm/modelPrefs';
+import { listArtifactsByIdsForChips, listAttachmentsByMessage } from '@/services/ArtifactService';
+import { artifactChipsByMessage } from '@/services/chat/artifactChips';
 import { attachmentFromArtifact } from '@/services/chat/attachments';
 import {
   appendMessage,
@@ -14,6 +16,7 @@ import {
   renameConversation,
   searchConversations,
   setConversationAutonomy,
+  setConversationModel,
   setMessageFeedback,
   tailMessages,
 } from '@/services/ConversationService';
@@ -38,15 +41,24 @@ export const get = os
     if (!conv) {
       throw ApiError.notFound({ id: input.id });
     }
-    const [messages, uploads] = await Promise.all([
+    const [messages, uploads, produced] = await Promise.all([
       listMessages({ orgId, conversationId: input.id }),
       listAttachmentsByMessage({ orgId, conversationId: input.id }),
+      listArtifactsByIdsForChips({ orgId, conversationId: input.id }),
     ]);
     // The files a person attached ride on their message, so a reloaded
-    // transcript shows the chips they saw when they sent it.
+    // transcript shows the chips they saw when they sent it — and so do the
+    // artifacts the agent produced, under the turn that made them
+    // (`artifactChipsByMessage`): the chip is a persisted fact, not a
+    // memory of the live stream.
+    const chips = artifactChipsByMessage(messages, produced);
     return {
       ...conv,
-      messages: messages.map(m => ({ ...m, attachments: (uploads.get(m.id) ?? []).map(attachmentFromArtifact) })),
+      messages: messages.map(m => ({
+        ...m,
+        attachments: (uploads.get(m.id) ?? []).map(attachmentFromArtifact),
+        artifacts: chips.get(m.id) ?? [],
+      })),
     };
   });
 
@@ -159,6 +171,18 @@ export const feedback = os
   });
 
 /** How recommended actions behave in one thread (0094). */
+/** How strong a model answers this thread and how much it thinks (`libs/llm/modelPrefs.ts`). */
+export const setModel = os
+  .input(z.object({ id: z.number().int().positive(), strength: z.enum(MODEL_STRENGTHS), effort: z.enum(THINKING_EFFORTS) }))
+  .handler(async ({ input }) => {
+    const { orgId } = await guardAuth();
+    const row = await setConversationModel({ orgId, id: input.id, strength: input.strength, effort: input.effort });
+    if (!row) {
+      throw ApiError.notFound({ id: input.id });
+    }
+    return { id: row.id, strength: row.modelStrength ?? 'balanced', effort: row.thinkingEffort ?? 'off' };
+  });
+
 export const setAutonomy = os
   .input(z.object({ id: z.number().int().positive(), autonomy: z.enum(CONVERSATION_AUTONOMY) }))
   .handler(async ({ input }) => {
@@ -168,4 +192,36 @@ export const setAutonomy = os
       throw ApiError.notFound({ id: input.id });
     }
     return { id: row.id, autonomy: row.autonomy };
+  });
+
+/**
+ * A person decided a card (backlog 025). The decision is written as a USER
+ * turn the model can bind to — the card's id, the action, the proposal —
+ * never as words the model has to parse ("approve filing it" bound to the
+ * wrong record three times on 2026-09-24).
+ */
+export const recordCardDecision = os
+  .input(z.object({
+    id: z.number().int().positive(),
+    cardId: z.string().min(1),
+    label: z.string().min(1),
+    action: z.enum(['approve', 'reject', 'defer', 'undo']),
+    runId: z.number().int().optional(),
+  }))
+  .handler(async ({ input }) => {
+    const { orgId, userId } = await guardAuth();
+    const conversation = await getConversation({ orgId, id: input.id });
+    if (!conversation) {
+      throw ApiError.notFound({ id: input.id });
+    }
+    const verb = { approve: 'Approved', reject: 'Rejected', defer: 'Deferred', undo: 'Undid' }[input.action];
+    const row = await appendMessage({
+      orgId,
+      conversationId: input.id,
+      role: 'user',
+      userId,
+      content: `${verb} the card "${input.label}"${input.runId !== undefined ? ` (proposal #${input.runId})` : ''}.`,
+      runs: [{ type: 'card_decision', cardId: input.cardId, action: input.action, label: input.label, ...(input.runId !== undefined ? { runId: input.runId } : {}) }],
+    });
+    return { id: row.id };
   });

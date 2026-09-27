@@ -69,6 +69,7 @@ const ROW = 'group flex min-h-11 w-full items-center gap-3 rounded-lg px-2 py-2.
  * @param props.align - Numbers right, text left. Default right.
  * @param props.mono
  * @param props.always - Keep the column on phones.
+ * @param props.grow - Take the leftover width instead of `kind`'s fixed one.
  * @param props.children
  * @param props.className
  */
@@ -77,6 +78,22 @@ export function Column(props: {
   align?: 'left' | 'right';
   mono?: boolean;
   always?: boolean;
+  /**
+   * Take the row's leftover width rather than `kind`'s fixed one, and shrink
+   * below the content rather than pushing it off the end.
+   *
+   * For the ONE column on a row that holds a variable-length set — the
+   * workspaces a person reaches, the workspaces a group opens — where the
+   * content decides how wide it wants to be and the row has to say no. A
+   * fixed width either wastes space or clips a label mid-word; `shrink-0`
+   * (the default, and right for a date or a score) meant the overflow ran off
+   * the row instead of folding into a count. `kind` still sets the column's
+   * MINIMUM, so the order down the list is unchanged.
+   *
+   * One per row. Two growing columns share the leftover and neither is the
+   * width its content asked for.
+   */
+  grow?: boolean;
   children: ReactNode;
   className?: string;
 }) {
@@ -84,8 +101,8 @@ export function Column(props: {
     <span
       data-column={props.kind}
       className={cn(
-        'shrink-0 truncate text-[13px] text-muted-foreground tabular-nums',
-        COLUMN[props.kind],
+        'truncate text-[13px] text-muted-foreground tabular-nums',
+        props.grow ? 'min-w-0 flex-1' : cn('shrink-0', COLUMN[props.kind]),
         props.align === 'left' ? 'text-left' : 'text-right',
         props.mono && 'font-mono text-[12px]',
         !props.always && 'hidden sm:inline-block',
@@ -151,12 +168,35 @@ export type ListRowProps = {
   'title': ReactNode;
   /** `<Subline>` or any one-line node under the title. Raw nodes get the subline's type and spacing. */
   'subline'?: ReactNode;
-  /** `<Column>`s, right-aligned, in a fixed order per page. */
+  /** `<Column>`s, right-aligned, in a fixed order per page. Facts only — they sit INSIDE the row link, so the whole row is one click target. */
   'columns'?: ReactNode;
+  /**
+   * The same `<Column>`s, for a row whose columns carry their own link or
+   * control — a chip that opens the document, a toggle. They render BESIDE
+   * the row link, exactly where `actions` already do, because an anchor or a
+   * button inside an anchor is invalid HTML: the browser closes the outer
+   * link at that point and hydration fails (`<a> cannot be a descendant of
+   * <a>`, /gtm/proposals, 2026-09-19).
+   *
+   * Pass a row's WHOLE set of columns here when ANY one of them is
+   * interactive, so the columns stay in the one order the list reads down.
+   * Same widths, same alignment — `columns` and `columnsAside` are the same
+   * shape, and which one a row uses is decided by one question: does a column
+   * click through to somewhere of its own?
+   */
+  'columnsAside'?: ReactNode;
   /** A status pill, a verdict badge — the row's state, always visible. */
   'chip'?: ReactNode;
   /** Appear on hover and focus-within; always visible on touch. */
   'actions'?: ReactNode;
+  /**
+   * Keep `actions` visible on every device. For a row whose verb is the
+   * POINT of the row rather than a shortcut on it — a Proposals row with
+   * nothing drafted, where Draft is the only thing to do — and never as a
+   * per-row preference: a list decides this by state, and the state is
+   * visible beside it (`/gtm/proposals`, 2026-09-19).
+   */
+  'actionsAlways'?: boolean;
   /** Trailing chevron for navigational rows. Default: on when `href` is set. */
   'chevron'?: boolean;
   'className'?: string;
@@ -187,6 +227,7 @@ export function ListRow(props: ListRowProps) {
         onSelect();
       }
     : undefined;
+  const chip = props.chip && <span className="shrink-0">{props.chip}</span>;
   const content = (
     <>
       {Icon && (
@@ -199,29 +240,40 @@ export function ListRow(props: ListRowProps) {
         {props.subline}
       </span>
       {props.columns}
-      {props.chip && <span className="shrink-0">{props.chip}</span>}
+      {!props.columnsAside && chip}
     </>
   );
   const actions = props.actions && (
     <span
       data-slot="row-actions"
-      className="flex shrink-0 items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100"
+      className={cn(
+        'flex shrink-0 items-center gap-1 opacity-100 transition-opacity',
+        !props.actionsAlways && 'sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100',
+      )}
     >
       {props.actions}
     </span>
   );
+  // Columns then chip then actions, whichever side of the link boundary they
+  // fall on: a list reads down its columns, and the boundary must not reorder
+  // them. So a row with `columnsAside` carries its chip out here too.
   const tail = (
     <>
+      {props.columnsAside}
+      {props.columnsAside && chip}
       {actions}
       {chevron && <ChevronRight className="size-4 shrink-0 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5" aria-hidden />}
     </>
   );
   const classes = cn(ROW, props.selected && 'bg-surface-soft', props.className);
 
-  // A row with actions cannot put them inside its link — a button nested in an
-  // anchor is invalid, and the click would navigate. The link covers the
-  // record (icon, title, columns, chip); the verbs sit beside it.
-  if (props.href && props.actions) {
+  // A row with actions — or with a column that links somewhere of its own —
+  // cannot put them inside its link: an anchor or a button nested in an anchor
+  // is invalid HTML, the browser closes the outer link there, and React's
+  // hydration fails on it. The link covers the record (icon, title, inert
+  // columns, chip); everything that clicks through to somewhere else sits
+  // beside it.
+  if (props.href && (props.actions || props.columnsAside)) {
     return (
       <div data-pattern="list-row" data-testid={props['data-testid']} className={classes}>
         <Link href={props.href} onClick={intercept} aria-current={props.selected ? 'true' : undefined} aria-label={typeof props.title === 'string' ? props.title : undefined} className="flex min-w-0 flex-1 items-center gap-3 outline-none">

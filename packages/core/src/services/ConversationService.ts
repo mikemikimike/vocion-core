@@ -8,11 +8,15 @@
  *   - `toHistoryTurns` drops tool entries before replaying to the agent.
  */
 
+import type { HistoryTurn } from '@/services/chat/historyTools';
 import type { PageContext } from '@/services/chat/pageContext';
+import type { TurnStatus } from '@/services/chat/turnStatus';
 import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from '@/libs/DB';
+import { formatDateTime } from '@/libs/time/zone';
 import { conversationMessageSchema, conversationSchema } from '@/models/Schema';
 import { track } from '@/services/adoption/track';
+import { isDroppedFromHistory, isTurnStatus } from '@/services/chat/turnStatus';
 import { enqueue } from '@/services/FeedbackWorkerService';
 
 const DEFAULT_TITLE = 'New conversation';
@@ -34,7 +38,16 @@ export type ConversationRun
      * `done` for every stored step turned every failure into a success the
      * moment the page refreshed.
      */
-    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string; state?: 'pending' | 'done' | 'error' };
+    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string; state?: 'pending' | 'done' | 'error' }
+    /**
+     * A card the turn put up (a `recommended_action`): what it offered and
+     * the payload it carried. Persisted so the NEXT turn can be told which
+     * card it is being asked to approve — "approve filing it" bound to a
+     * lookup result three times on 2026-09-24 because the card lived only
+     * in the browser.
+     */
+    | { type: 'card'; id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string; ref?: { type: string; id: number } }
+    | { type: 'card_decision'; cardId: string; action: string; runId?: number; label?: string };
 
 /** One persisted node of the turn's activity trace (the UI's TraceNode shape). */
 export type ConversationTraceNode = {
@@ -50,6 +63,8 @@ export type ConversationTraceNode = {
   resultDetail?: string;
   text?: string;
   result?: string;
+  /** Both tenses of the step's name, when a labeler supplied them. */
+  labels?: { running: string; done: string };
   confidence?: number;
   citations?: Array<{ sourceType: string; title: string; link?: string; snippet?: string; actorId: string }>;
   /** How many text runs had started when this step began — its place between the passages. */
@@ -200,6 +215,43 @@ export async function listMessages(opts: { orgId: string; conversationId: number
     .orderBy(asc(conversationMessageSchema.id));
 }
 
+/**
+ * The status to actually store, guarding the column against a word no reader knows.
+ *
+ * Every agent turn written from here on carries a status, so that reading one
+ * is the same question every time instead of "is this NULL because the turn
+ * finished, or because whoever wrote it forgot?". A caller that says nothing
+ * means the ordinary case, `complete` — the statuses that matter are the ones
+ * somebody chose deliberately.
+ *
+ * A person's own message gets NULL, because status describes how an agent's
+ * turn ended and a person's message does not end: they pressed enter and it
+ * was said. NULL also remains on every row written before this vocabulary
+ * existed, and every reader treats it as an ordinary finished turn, which is
+ * what those rows almost always were.
+ *
+ * A word outside the vocabulary is stored as `complete` with a warning naming
+ * it, because a typo would otherwise be wrong quietly and forever — and the
+ * row is still written either way, since the person's answer matters more than
+ * the label on it.
+ * @param status - What the caller asked for.
+ * @param role - Who the message is from; only an assistant turn takes a status.
+ * @returns The status to write into the column.
+ */
+function storableStatus(status: TurnStatus | null | undefined, role: 'user' | 'assistant'): TurnStatus | null {
+  if (role === 'user') {
+    return null;
+  }
+  if (status === null || status === undefined) {
+    return 'complete';
+  }
+  if (!isTurnStatus(status)) {
+    console.warn('appendMessage: unknown turn status, storing it as complete', { status });
+    return 'complete';
+  }
+  return status;
+}
+
 export async function appendMessage(opts: {
   orgId: string;
   conversationId: number;
@@ -212,6 +264,19 @@ export async function appendMessage(opts: {
   userId?: string;
   /** The turn's activity trace, persisted so levels 2 and 3 survive reload. */
   trace?: ConversationTraceNode[] | null;
+  /** How the workspace chose this message's agent, when nobody named one (`services/agents/router.ts`). */
+  routing?: import('@/services/agents/router').RoutingDecision | null;
+  /**
+   * How an assistant turn ended (`services/chat/turnStatus.ts`). Omitted means
+   * `complete`; a `user` message is stored without one whatever is passed.
+   * What it changes: the notice under the turn, and whether the text is
+   * replayed to the model on the next turn.
+   */
+  status?: TurnStatus | null;
+  /** Why it ended that way, in the runtime's own words. Only meaningful beside a `status` that owes an explanation. */
+  statusReason?: string | null;
+  /** Which agent spoke an assistant turn — the slug the runtime ran, so a reloaded transcript attributes the turn truthfully (backlog 009). */
+  agentSlug?: string | null;
 }) {
   const conv = await getConversation({ orgId: opts.orgId, id: opts.conversationId });
   if (!conv) {
@@ -232,6 +297,10 @@ export async function appendMessage(opts: {
       runsJson: opts.runs ?? null,
       documentsJson: opts.documents && opts.documents.length > 0 ? opts.documents : null,
       traceJson: opts.trace && opts.trace.length > 0 ? opts.trace : null,
+      routingJson: opts.routing ?? null,
+      status: storableStatus(opts.status, opts.role),
+      statusReason: opts.statusReason ?? null,
+      agentSlug: opts.role === 'assistant' ? opts.agentSlug ?? null : null,
     })
     .returning();
 
@@ -240,6 +309,8 @@ export async function appendMessage(opts: {
     .set({
       title: derivedTitle,
       messageCount: sql`${conversationSchema.messageCount} + 1`,
+      // A thread picked up again is open again; the idle sweep ends it anew.
+      endedAt: null,
     })
     .where(eq(conversationSchema.id, opts.conversationId));
 
@@ -253,24 +324,63 @@ export async function appendMessage(opts: {
   return msg!;
 }
 
+/** A person's turn is re-stamped with its time after this long a silence. */
+const HISTORY_STAMP_GAP_MS = 6 * 60 * 60 * 1000;
+
 /**
- * Render persisted messages as the {role, content} list the agent
- * expects in its history. Tool runs are intentionally dropped —
- * they're UI ornaments only. (See rev-ai's to_history_turns.)
- * @param messages
+ * Render persisted messages as the turns the agent replays. An agent turn
+ * carries its `runs_json` so the loop can replay the tool calls and cards it
+ * made as calls, not as prose (`services/chat/historyTools.ts`).
+ * Turns that ended badly are dropped too — see `isDroppedFromHistory`.
+ * @param messages - Persisted rows, oldest first; `createdAt` enables the sent-time stamp.
+ * @param opts - Options.
+ * @param opts.timeZone - The person's zone for the stamps; absent, no stamps.
  */
 export function toHistoryTurns(messages: Array<{
+  id?: string | number;
   role: string;
   content: string;
-}>): Array<{ role: 'user' | 'assistant'; content: string }> {
-  const out: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  createdAt?: Date | string | null;
+  status?: string | null;
+  /** The agent turn's ledger (`runs_json`): replayed as the tool calls it was, see `historyTools.ts`. */
+  runsJson?: unknown;
+}>, opts: { timeZone?: string } = {}): HistoryTurn[] {
+  const out: HistoryTurn[] = [];
+  // When a zone is given, a person's turn is stamped with when it was sent —
+  // the first one always, later ones after a gap of six hours or more — so
+  // the model can tell yesterday's question from one asked a minute ago.
+  // History used to reach the model as bare role and content (2026-09-18).
+  let previous: Date | null = null;
   for (const m of messages) {
     if (!m.content.trim()) {
       continue;
     }
-    if (m.role === 'user' || m.role === 'assistant') {
-      out.push({ role: m.role, content: m.content });
+    // Some endings are not replayed. A turn that died part-way stops
+    // mid-thought — sometimes mid-word — and handing that back as something
+    // the agent said lets a half-formed statement harden into fact over the
+    // rest of the thread (issue #114); a turn that was refused or never ran
+    // has nothing to hand back. A turn the PERSON stopped is replayed: they
+    // read it and decided that was enough. The person still sees every one of
+    // these rows; the model starts the next turn without some of them.
+    if (isDroppedFromHistory(m.status)) {
+      continue;
     }
+    if (m.role !== 'user' && m.role !== 'assistant') {
+      continue;
+    }
+    let content = m.content;
+    const at = m.createdAt ? new Date(m.createdAt) : null;
+    const dated = at !== null && !Number.isNaN(at.getTime());
+    if (m.role === 'user' && dated && opts.timeZone) {
+      const gapMs = previous ? at.getTime() - previous.getTime() : Number.POSITIVE_INFINITY;
+      if (gapMs >= HISTORY_STAMP_GAP_MS) {
+        content = `[sent ${formatDateTime(at, opts.timeZone)}] ${content}`;
+      }
+    }
+    if (dated) {
+      previous = at;
+    }
+    out.push({ role: m.role, content, ...(m.id ? { id: m.id } : {}), ...(m.role === 'assistant' && m.runsJson ? { runs: m.runsJson } : {}) });
   }
   return out;
 }
@@ -304,6 +414,25 @@ export async function setConversationAutonomy(opts: { orgId: string; id: number;
   const [row] = await db
     .update(conversationSchema)
     .set({ autonomy: opts.autonomy })
+    .where(and(eq(conversationSchema.orgId, opts.orgId), eq(conversationSchema.id, opts.id)))
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * Set how strong a model answers this thread and how much it thinks
+ * (`libs/llm/modelPrefs.ts`). Per conversation, like autonomy: appetite
+ * differs by task, not by day.
+ * @param opts
+ * @param opts.orgId
+ * @param opts.id
+ * @param opts.strength
+ * @param opts.effort
+ */
+export async function setConversationModel(opts: { orgId: string; id: number; strength: 'fast' | 'balanced' | 'deep'; effort: 'off' | 'low' | 'medium' | 'high' }) {
+  const [row] = await db
+    .update(conversationSchema)
+    .set({ modelStrength: opts.strength, thinkingEffort: opts.effort })
     .where(and(eq(conversationSchema.orgId, opts.orgId), eq(conversationSchema.id, opts.id)))
     .returning();
   return row ?? null;

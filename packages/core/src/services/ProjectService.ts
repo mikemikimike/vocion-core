@@ -2,14 +2,16 @@
  * Projects (workspaces) as a signed-in user may see them.
  *
  * One tenant_account owns the projects; a user reaches them through their
- * account membership. Both the sidebar switcher (`routers/Projects.ts`) and
- * the `/w/[workspace]` entry route resolve "may this user make that project
- * active?" here, so the two cannot drift apart on the membership rule.
+ * account membership. The sidebar switcher (`routers/Projects.ts`) and the
+ * proxy that resolves `/w/<slug>/…` (`src/proxy.ts`) both ask "may this user
+ * make that project active?" here, so the two cannot drift apart on the
+ * membership rule.
  */
 
-import { and, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { accountMembershipSchema, projectSchema, tenantAccountSchema } from '@/models/Schema';
+import { accessibleProjectIds, effectiveRole, enforcementEnabled } from '@/services/WorkspaceAccessService';
 
 export type ProjectSummary = {
   id: string;
@@ -73,7 +75,13 @@ export async function listProjectsForUser(userId: string): Promise<ProjectSummar
   if (!accountId) {
     return [];
   }
-  return db.select(summaryColumns).from(projectSchema).where(eq(projectSchema.accountId, accountId));
+  const all = await db.select(summaryColumns).from(projectSchema).where(eq(projectSchema.accountId, accountId));
+  if (!enforcementEnabled()) {
+    return all;
+  }
+  // The switcher shows what a person holds, not what the account owns.
+  const reachable = new Set(await accessibleProjectIds(userId));
+  return all.filter(p => reachable.has(p.id));
 }
 
 /**
@@ -100,7 +108,71 @@ export async function resolveProjectForUser(userId: string, selector: { id: stri
     .from(projectSchema)
     .where(and(eq(projectSchema.accountId, accountId), match))
     .limit(1);
-  return project ?? null;
+  if (!project) {
+    return null;
+  }
+  if (enforcementEnabled() && !(await effectiveRole(userId, project.id))) {
+    // Null, exactly as for a project on another account — the caller turns
+    // both into the same 404, so "not yours" and "no such thing" are one
+    // answer. On a deployment where workspaces are named after people, the
+    // difference between them is itself a disclosure.
+    return null;
+  }
+  return project;
+}
+
+/**
+ * The workspace a bare `/dashboard/…` request belongs to, for the redirect
+ * that makes every URL canonical (`src/proxy.ts`).
+ *
+ * "Last active" is the `vocion_active_project` cookie when it names a project
+ * on the user's account; otherwise the account's first project — the same
+ * order `resolveTenancyForUser` uses, so the redirect can never send a reader
+ * to a workspace the page would then resolve differently. Null when the user
+ * has no workspace at all (onboarding), which the caller reads as "leave the
+ * URL alone".
+ * @param userId - Auth.js user id.
+ * @param preferredProjectId - `project.id` from the cookie, if any.
+ */
+export async function activeWorkspaceForUser(userId: string, preferredProjectId?: string | null): Promise<{ id: string; accountId: string; slug: string } | null> {
+  const accountId = await accountIdForUser(userId);
+  if (!accountId) {
+    return null;
+  }
+  const columns = { id: projectSchema.id, slug: projectSchema.slug };
+  const enforced = enforcementEnabled();
+  const preferred = preferredProjectId?.trim();
+  if (preferred) {
+    const [chosen] = await db
+      .select(columns)
+      .from(projectSchema)
+      .where(and(eq(projectSchema.id, preferred), eq(projectSchema.accountId, accountId)))
+      .limit(1);
+    if (chosen && (!enforced || await effectiveRole(userId, chosen.id))) {
+      return { ...chosen, accountId };
+    }
+  }
+  if (enforced) {
+    // The first workspace they actually hold, ordered so a person's landing
+    // workspace does not change between requests.
+    const reachable = (await accessibleProjectIds(userId)).sort();
+    const firstId = reachable[0];
+    if (!firstId) {
+      return null;
+    }
+    const [row] = await db.select(columns).from(projectSchema).where(eq(projectSchema.id, firstId)).limit(1);
+    return row ? { ...row, accountId } : null;
+  }
+  // Ordered for the same reason as `resolveTenancyForUser`: an unordered
+  // "first project" is whatever the planner returns, which stops being a
+  // harmless detail as soon as an account holds more than a handful.
+  const [first] = await db
+    .select(columns)
+    .from(projectSchema)
+    .where(eq(projectSchema.accountId, accountId))
+    .orderBy(asc(projectSchema.createdAt), asc(projectSchema.id))
+    .limit(1);
+  return first ? { ...first, accountId } : null;
 }
 
 /**

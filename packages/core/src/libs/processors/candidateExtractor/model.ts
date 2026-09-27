@@ -1,5 +1,5 @@
 /**
- * The one model call per changed document.
+ * The one model call per changed or retried document.
  *
  * Control flow is `services/agents/skillTurn.ts`, a caller-supplied zod
  * output schema, `{ signal }` on `.invoke`, fences tolerated, one corrective
@@ -28,16 +28,19 @@
  */
 
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { SyncBudget } from '../budget';
 import type { CandidateExtractorConfig } from './config';
 import type { ExtractionPrompt } from './prompt';
 import type { SuggestedDecision } from '@/libs/actions/suggestedDecision';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
 import { z } from 'zod';
 import { SUGGESTED_DECISIONS } from '@/libs/actions/suggestedDecision';
 import { cleanUsageDetails, traceFor } from '@/libs/Langfuse';
 import { FEATURES } from '@/libs/Langfuse/features';
 import { buildChatModelForOrg, resolvedModelId } from '@/libs/llm/langchain';
+import { cachedThroughPrefix } from '@/libs/llm/promptCache';
+import { logger } from '@/libs/Logger';
 import { SERIES_NOTE_CAP } from './prompt';
 
 /** One record as the model returned it, before any validation. */
@@ -85,7 +88,13 @@ export type ExtractedRecord = {
    * which is the honest reading and stays out of the agreement rate.
    */
   referencedObjects?: ReferencedObjectVerdict[];
+  /** Raw from the model; `validate.ts` keeps only configured names in 0..1. */
+  scores?: Record<string, unknown>;
+  /** The adopted rules the model says decided its verdict; `validate.ts` keeps only rules the call carried. */
+  matchedRules?: MatchedRuleAnswer[];
 };
+
+export type MatchedRuleAnswer = { id: string; title?: string; evidence?: string };
 
 /** What the model thinks of one object a record points at. */
 export type ReferencedObjectVerdict = {
@@ -104,9 +113,20 @@ export type ExtractionResult
 export type ExtractionSkip
   = | 'model_invalid'
     | 'model_timeout'
+    | 'model_throttled'
     | 'budget_model_calls'
     | 'budget_tokens'
     | 'budget_exceeded';
+
+/** What the runner does with a skip: a refused call or a spent budget cost no work, so it does not use a try. */
+export const SKIP_OUTCOME: Record<ExtractionSkip, 'finished' | 'retry' | 'defer'> = {
+  model_invalid: 'finished',
+  model_timeout: 'retry',
+  model_throttled: 'defer',
+  budget_model_calls: 'defer',
+  budget_tokens: 'defer',
+  budget_exceeded: 'defer',
+};
 
 /**
  * A run id as the model may write it: `41`, `"41"`, `"#41"`. Anything else is
@@ -175,6 +195,17 @@ function envelopeSchema(maxRecords: number) {
         suggestedDecision: z.enum(SUGGESTED_DECISIONS),
         suggestedDecisionReason: z.string().transform(value => value.trim()),
       }).nullable().catch(null)).optional().transform(entries => entries?.filter(entry => entry !== null)),
+      // Forgiving like `referencedObjects`: a malformed value is dropped, never retried.
+      scores: z.record(z.string(), z.unknown()).optional().catch(undefined),
+      matchedRules: z.array(z.object({
+        id: z.string().min(1),
+        title: z.string().optional().catch(undefined),
+        evidence: z.string().optional().catch(undefined),
+      }).nullable().catch(null)).optional().catch(undefined).transform((entries) => {
+        const kept = entries?.filter(entry => entry !== null);
+        // A list the model filled with nothing usable says nothing, not "no rule decided it".
+        return entries && entries.length > 0 && kept?.length === 0 ? undefined : kept;
+      }),
     })).max(maxRecords).default([]),
   });
 }
@@ -194,6 +225,80 @@ function contentText(content: unknown): string {
 }
 
 /**
+ * Where the object opened at `start` closes, or -1 when it never does.
+ * @param text - The answer, already stripped of fences.
+ * @param start - Index of the opening brace.
+ */
+function objectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * The JSON object an answer carries, whichever reasoning a model wrote first.
+ *
+ * Only an object that ENDS the answer is taken, so one quoted mid sentence is
+ * still refused.
+ * @param raw - The answer as the provider returned it.
+ */
+function jsonAnswer(raw: string): string {
+  const stripped = raw.replace(/^```(?:json)?\s*|\s*```$/gm, '').trim();
+  for (let start = stripped.indexOf('{'); start !== -1; start = stripped.indexOf('{', start + 1)) {
+    if (objectEnd(stripped, start) === stripped.length - 1) {
+      return stripped.slice(start);
+    }
+  }
+  return stripped;
+}
+
+/**
+ * Whether the provider refused the call rather than answering it badly.
+ *
+ * Read the two shapes `libs/retrieval/embedder.ts` already reads: the AWS SDK
+ * marks a throttle on `$retryable` and carries the status on
+ * `$metadata.httpStatusCode`, while an OpenAI-shaped client puts it on
+ * `status`. Verified against a live Bedrock refusal, which arrives unwrapped as
+ * `ThrottlingException` with `httpStatusCode: 429`.
+ * @param error - Whatever `.invoke` threw.
+ */
+function isThrottled(error: unknown): boolean {
+  const candidate = error as {
+    status?: number;
+    $metadata?: { httpStatusCode?: number };
+    $retryable?: { throttling?: boolean };
+  } | null;
+  if (candidate?.$retryable?.throttling) {
+    return true;
+  }
+  return (candidate?.status ?? candidate?.$metadata?.httpStatusCode) === 429;
+}
+
+/**
  * Whether a thrown error is the deadline rather than a bad answer.
  * @param error - Whatever `.invoke` threw.
  */
@@ -206,7 +311,7 @@ function isTimeout(error: unknown): boolean {
 type UsageMetadata = {
   input_tokens?: number;
   output_tokens?: number;
-  input_token_details?: { cache_read?: number };
+  input_token_details?: { cache_read?: number; cache_creation?: number };
 };
 
 /**
@@ -253,6 +358,9 @@ export async function extractRecords(opts: {
 
   const model: BaseChatModel = await buildChatModelForOrg('extractor', opts.orgId, {
     temperature: 0,
+    // One bounded reading task. Models that think by default would bill the
+    // thinking as output and spend the call's deadline on it.
+    thinking: 'off',
     // The answer's ceiling, and in practice the real limit on how many records
     // one document can yield: at roughly 250 tokens a record — fields, a
     // verdict, the sentence explaining it, a verdict per referenced object —
@@ -280,10 +388,12 @@ export async function extractRecords(opts: {
   // call: without the context signal an abandoned document keeps spending.
   const signal = AbortSignal.any([opts.signal, AbortSignal.timeout(opts.budget.caps.modelTimeoutMs)]);
 
-  const messages: Array<SystemMessage | HumanMessage> = [
-    new SystemMessage(opts.prompt.system),
-    new HumanMessage(opts.prompt.human),
-  ];
+  const { messages, callOptions }: { messages: BaseMessage[]; callOptions: Record<string, unknown> } = cachedThroughPrefix(
+    model,
+    opts.prompt.system,
+    opts.prompt.humanPrefix,
+    opts.prompt.human.slice(opts.prompt.humanPrefix.length),
+  );
 
   let calls = 0;
   let lastFailure: ExtractionSkip = 'model_invalid';
@@ -291,6 +401,7 @@ export async function extractRecords(opts: {
 
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0 && !opts.budget.take('maxModelCalls')) {
+      lastFailure = 'budget_model_calls';
       break;
     }
     const generation = trace.generation({
@@ -301,7 +412,7 @@ export async function extractRecords(opts: {
     });
     calls += 1;
     try {
-      const res = await model.invoke(messages as never, { signal });
+      const res = await model.invoke(messages as never, { ...callOptions, signal });
       const raw = contentText(res.content);
       const usage = (res as unknown as { usage_metadata?: UsageMetadata }).usage_metadata;
       generation.end({
@@ -311,13 +422,15 @@ export async function extractRecords(opts: {
               input: usage.input_tokens,
               output: usage.output_tokens,
               cache_read_input_tokens: usage.input_token_details?.cache_read,
+              cache_creation_input_tokens: usage.input_token_details?.cache_creation,
             })
           : undefined,
       });
       if (usage) {
-        // `input_tokens` already includes the cached tokens, and `pricing.ts`
-        // only subtracts `cacheReadTokens` when it is given, without this,
-        // cached input is billed at the full rate.
+        // `input_tokens` already includes cache reads and writes, and
+        // `pricing.ts` prices each at its own rate only when it is given. A
+        // spend row that fails to land is not a bad answer: treating it as one
+        // would pay for a corrective call that fixes nothing.
         await chargeUsage({
           orgId: opts.orgId,
           agentSlug: opts.config.agentSlug,
@@ -326,12 +439,17 @@ export async function extractRecords(opts: {
             inputTokens: usage.input_tokens,
             outputTokens: usage.output_tokens,
             cacheReadTokens: usage.input_token_details?.cache_read,
+            cacheWriteTokens: usage.input_token_details?.cache_creation,
           },
+        }).catch((error: unknown) => {
+          logger.warn('candidate extractor: could not record model spend', {
+            sourceSlug: opts.sourceSlug,
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
       }
 
-      const stripped = raw.replace(/^```(?:json)?\s*|\s*```$/gm, '').trim();
-      const parsed = schema.parse(JSON.parse(stripped));
+      const parsed = schema.parse(JSON.parse(jsonAnswer(raw)));
       trace.update({ output: { records: parsed.records.length, calls } });
       return { status: 'ok', records: parsed.records as ExtractedRecord[], calls, traceId: trace.id };
     } catch (error) {
@@ -340,6 +458,13 @@ export async function extractRecords(opts: {
       if (isTimeout(error)) {
         // A timed-out call will time out again: the deadline is shared.
         lastFailure = 'model_timeout';
+        lastDetail = message;
+        break;
+      }
+      if (isThrottled(error)) {
+        // A daily or per-minute allowance will not clear between two
+        // attempts, so the corrective retry is spent for nothing.
+        lastFailure = 'model_throttled';
         lastDetail = message;
         break;
       }

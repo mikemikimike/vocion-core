@@ -1,6 +1,8 @@
 import type { HarnessTarget } from '@/services/agents/harnessTarget';
 import { z } from 'zod';
 import { agentSkillsNameError } from '@/libs/skills/name';
+import { isDayZone, isRelativeDay } from '@/libs/time/relativeDay';
+import { isValidTimeZone } from '@/libs/time/zone';
 import { harnessTargetSchema } from '@/services/agents/harnessTarget';
 
 export const SlugSchema = z.string().regex(/^[a-z][a-z0-9_-]*$/, {
@@ -82,6 +84,12 @@ export const WorkspaceManifestSchema = z.object({
     model: z.string().optional(),
     temperature: z.string().optional(),
     /**
+     * IANA time zone the workspace lives in (`America/Los_Angeles`). The day
+     * boundary for missions, briefings and every run no browser is behind; a
+     * person's own turns carry their browser's zone and win over it.
+     */
+    timezone: z.string().refine(v => isValidTimeZone(v), { message: 'timezone must be an IANA zone such as America/Los_Angeles' }).optional(),
+    /**
      * Which vendor produces this workspace's embeddings, and which model.
      * Omitted keys fall back to `VOCION_EMBEDDING_PROVIDER` /
      * `VOCION_EMBEDDING_MODEL`, then to OpenAI.
@@ -105,6 +113,70 @@ export const WorkspaceManifestSchema = z.object({
      * entry keeps its full-pass regenerate only.
      */
     regenerateSkills: z.record(z.string(), SlugSchema).optional(),
+    /**
+     * Which document playbooks are client-facing, and so cannot be exported
+     * as a PDF without having been read as the sceptical buyer on their
+     * current version (`services/documents/exportGate.ts`).
+     *
+     * Matched against `playbook` on a document artifact's spec — the tag the
+     * writing skill passes to `render_document`. Omit the key and core's
+     * defaults apply (`proposal`, `scope`, `partnership-update`); author an
+     * EMPTY list to gate nothing, which is the only way to turn the gate off
+     * and is deliberately explicit.
+     */
+    clientFacingPlaybooks: z.array(z.string().max(60)).max(40).optional(),
+    /**
+     * How eager this workspace is to improve itself, 0–10. Default 7.
+     *
+     * Moves the confidence bar for the class of actions that change what the
+     * system knows about how to work — adopting a rule from a correction a
+     * person made to an agent's work is the first of them
+     * (`libs/actions/eagerness.ts`). 0 always asks. 7 puts the bar at 72%,
+     * 10 at 60%; both clear a plain directive in the person's own words and
+     * neither clears a rule the model had to infer, because the dial moves
+     * the bar and never the confidence.
+     *
+     * A trust rule that names `autoApproveAbove` for a kind wins over the
+     * dial for that kind — pin one action without changing the appetite.
+     */
+    learningEagerness: z.number().int().min(0).max(10).optional(),
+    /**
+     * The spend cap every agent in this workspace is held to when its own
+     * YAML sets no `budget:` — the workspace's default agent cap (#272).
+     *
+     * `dailyCents` is a hard cap in cents per UTC day: `10000` is $100. `null`
+     * means this workspace chose no default, so an agent without a budget of
+     * its own runs unlimited — for a workspace that manages spend with its
+     * provider's limits instead (AWS Budgets, the Anthropic Console's spend
+     * limits); see `docs/guides/budgets.md` for what those do and do not catch.
+     *
+     * Omit the block and apply leaves whatever default is stored alone, and
+     * with none stored the built-in $100 a day applies
+     * (`BudgetService.DEFAULT_AGENT_DAILY_HARD_CENTS`).
+     */
+    agentBudget: z.object({
+      dailyCents: z.number().int().min(0).nullable(),
+    }).optional(),
+    /**
+     * The proposal budget every agent in this workspace is held to when its
+     * own YAML sets no `proposals:` — how many undecided items it may hold in
+     * Review at once when acting on its own schedule, and how many new ideas
+     * it may file a week. See `AgentSchema.proposals`. Omit and the built-in
+     * default applies (`ProposalBudgetService.DEFAULT_PROPOSAL_BUDGET`).
+     */
+    agentProposals: z.object({
+      openMax: z.number().int().min(0).optional(),
+      weeklyMax: z.number().int().min(0).optional(),
+    }).optional(),
+    /**
+     * How strict the handoff judges are in THIS workspace: overrides every
+     * gate's `judge.sampleRate` / `judge.escalateBelow` at apply time. The
+     * plugin declares the gates; the workspace turns the dial.
+     */
+    gates: z.object({
+      sampleRate: z.number().min(0).max(1).optional(),
+      escalateBelow: z.number().min(0).max(1).optional(),
+    }).optional(),
   }).partial().optional(),
   /**
    * Optional dashboard surfaces to switch on, by registry id (see
@@ -131,11 +203,61 @@ export const WorkspaceManifestSchema = z.object({
   use: z.union([z.literal('all'), ActivationSelectorSchema]).optional(),
   /**
    * Suppress a core default even under `use: all` — the escape hatch. A
-   * disabled slug is omitted from the merged workspace entirely.
+   * disabled slug is omitted from the merged workspace entirely. Applies to
+   * plugin-provided slugs too.
    */
   disable: ActivationSelectorSchema.optional(),
+  /**
+   * Plugins to turn on, by slug (`templates/plugins/<slug>/plugin.yaml`). A
+   * plugin is a bundle of agents, skills, object types, missions, automations,
+   * teams, pages and trust rules that composes UNDER the workspace the way the
+   * base pack does — always fully active, overridable by slug with
+   * `extends: core`, suppressible with `disable:`. Dependencies (`depends:`)
+   * are pulled in automatically. Omit for none.
+   */
+  plugins: z.array(SlugSchema).default([]),
 });
 export type WorkspaceManifest = z.infer<typeof WorkspaceManifestSchema>;
+
+/**
+ * `plugin.yaml` — the identity of a workspace plugin shipped inside
+ * vocion-core at `packages/core/templates/plugins/<slug>/`. A plugin is the
+ * abstract rung of the ladder made installable: the same directory shape as
+ * a workspace (agents/, skills/, objects/, missions/, automations/, teams/,
+ * pages/, trust.yaml), turned on with one line in workspace.yaml.
+ *
+ * `recommend.when` is what the chat reads to suggest a plugin that is off:
+ * short phrases naming the conversation patterns it serves. `connectors` are
+ * the connector slugs it works better with, so the same suggestion can say
+ * which system to connect.
+ */
+export const PluginManifestSchema = z.object({
+  slug: SlugSchema,
+  name: z.string().min(1),
+  version: z.string().regex(/^\d+\.\d+\.\d+$/, 'plugin version must be semver x.y.z'),
+  description: z.string().min(1).describe('one line: what turning it on gives a person'),
+  /** Other plugins this one needs; turned on with it, ordered before it. */
+  depends: z.array(SlugSchema).default([]),
+  /** Core-registered surfaces (`features/navigation/surfaces.ts`) this plugin switches on. */
+  surfaces: z.array(z.string()).default([]),
+  /**
+   * Where the plugin's rows sit in the sidebar — its pages, the core routes it
+   * owns (`DashboardRoute.plugin`) and its surfaces, all together. Default
+   * `Workspace`: beside Chat and Review, pinned by default. Name a section only
+   * when the plugin is part of a named app — `GTM` puts its rows under that
+   * heading with the app's other surfaces. A page's own `nav.section` still
+   * wins for that page when it names one.
+   */
+  nav: z.object({
+    section: z.string().min(1).default('Workspace'),
+    order: z.number().default(0),
+  }).default({ section: 'Workspace', order: 0 }),
+  recommend: z.object({
+    when: z.array(z.string().min(1)).default([]),
+    connectors: z.array(z.string().min(1)).default([]),
+  }).default({ when: [], connectors: [] }),
+});
+export type PluginManifest = z.infer<typeof PluginManifestSchema>;
 
 /**
  * Team manifest (F1) — workspace/<org>/teams/<slug>.yaml. The team's
@@ -275,8 +397,21 @@ export const VerifiedMeasureSourceSchema = z.discriminatedUnion('connector', [
  * is that an account gained a member, and the measure's own `label` is where
  * the workspace's word for that belongs.
  */
-export const OBSERVED_ROW_KINDS = ['workspace-members'] as const;
+export const OBSERVED_ROW_KINDS = ['workspace-members', 'artifacts', 'data-rooms', 'data-room-sources'] as const;
 export type ObservedRowKind = typeof OBSERVED_ROW_KINDS[number];
+
+/**
+ * Narrows `rows: artifacts` — the artifact table is every kind of output, and
+ * a measure is about one of them: the wiki's pages (`folder: wiki`), the
+ * proposals rendered (`kind: document, playbook: proposal`), the ones that
+ * render-verified clean (`verified: true`). All optional, all ANDed.
+ */
+export const ObservedRowsWhereSchema = z.object({
+  kind: z.string().min(1).optional(),
+  folder: z.string().min(1).optional(),
+  playbook: z.string().min(1).optional(),
+  verified: z.boolean().optional(),
+}).partial();
 
 /**
  * `observed` — Vocion saw it happen in our own tables: `action_run` rows that
@@ -289,9 +424,14 @@ export const ObservedMeasureSourceSchema = z.object({
   actions: ActionIdList.optional(),
   counts: CountsKey.optional(),
   rows: z.enum(OBSERVED_ROW_KINDS).optional(),
+  /** Only with `rows: artifacts`. */
+  where: ObservedRowsWhereSchema.optional(),
 }).refine(
   s => [s.actions, s.counts, s.rows].filter(v => v !== undefined).length === 1,
   'observed source names exactly one of actions, a counts key or rows',
+).refine(
+  s => s.where === undefined || s.rows === 'artifacts',
+  '`where` narrows `rows: artifacts` only',
 );
 
 /**
@@ -456,6 +596,44 @@ export const AgentManifestSchema = z.object({
   icon: z.string().optional(),
   active: z.boolean().default(true),
   /**
+   * This agent's spend caps, in cents. A turn is refused once the period's
+   * spend reaches the cap, and a turn that crosses it partway is stopped at
+   * its next model call (#272). `dailyCents: 5000` is $50 per UTC day;
+   * `monthlyCents` is per UTC calendar month. Either may be left out.
+   *
+   * An agent with no daily cap of its own is held to the workspace's default
+   * agent cap (`defaults.agentBudget` in workspace.yaml) and, failing that, to
+   * the built-in $100 a day. So leaving this out is not "unlimited".
+   *
+   * Omit the block and apply leaves the agent's stored caps alone — a cap set
+   * when the agent was hired, or by an admin, survives. Write it and the YAML
+   * owns those caps: the next apply puts them back to what is written here.
+   * See `docs/guides/budgets.md`.
+   */
+  budget: z.object({
+    dailyCents: z.number().int().min(0).optional(),
+    monthlyCents: z.number().int().min(0).optional(),
+  }).optional(),
+  /**
+   * THE PROPOSAL BUDGET — no runaway queues (Chris, 2026-09-24: "700 items
+   * need attention is uselessly overwhelming").
+   *
+   * When this agent acts on its own schedule (a mission check, an automation,
+   * anything with no person in the conversation) it may hold at most
+   * `openMax` undecided items in Review — pending action runs and open asks
+   * it filed — and file at most `weeklyMax` new candidate records (ideas) in
+   * a rolling week. Past either, filing is refused with the list of its own
+   * open items and the instruction to withdraw one first
+   * (`withdraw_proposal`), so a better idea retires an older one instead of
+   * stacking on it. A proposal made inside a person's own chat turn never
+   * counts: the person asked. Omit for the workspace default
+   * (`defaults.agentProposals`), then the built-in one.
+   */
+  proposals: z.object({
+    openMax: z.number().int().min(0).optional(),
+    weeklyMax: z.number().int().min(0).optional(),
+  }).optional(),
+  /**
    * Slug of the primary agent this specialist reports to. Omit for
    * primary agents. One level deep: the referenced agent must itself
    * have no `parent`. Source of truth for the agent hierarchy.
@@ -556,6 +734,24 @@ export const AgentManifestSchema = z.object({
   /** Short tagline shown above the chat title. */
   eyebrow: z.string().optional(),
   /**
+   * What this agent answers for — short topics, intents or example asks
+   * (`handles: [wiki, standing rules, research, plans]`). When a message
+   * names no agent, the router matches it against these first, then the
+   * description and suggestions, and defaults to the workspace lead
+   * (`services/agents/router.ts`). Empty: reached by name or delegation only.
+   */
+  handles: z.array(z.string().min(1)).default([]),
+  /**
+   * How much this agent volunteers — `low` | `normal` | `high`, default
+   * `normal`. Three effects, each real: it breaks a routing tie; `high` ends
+   * a turn that produced a standing fact, decision or plan with one offer to
+   * carry it forward, `low` never volunteers; and `low` sits out debriefs —
+   * the automations that fire on completed work (`worker_run.completed`,
+   * `mission_run.completed`, `conversation.ended`, `pr.merged`,
+   * `automation_run.completed`).
+   */
+  initiative: z.enum(['low', 'normal', 'high']).default('normal'),
+  /**
    * Harness config (v0.3) — per-agent knobs for the reusable agent
    * harness. `provider` selects where the agent loop executes:
    * `local` (in-process deepagents loop, the default), `agentcore`
@@ -576,7 +772,8 @@ export const AgentManifestSchema = z.object({
    * our loop implements. Neither routes inference — a Bedrock call is a
    * direct Converse call in all three cases. `interrupts` lists skill/tool slugs that pause for
    * human approval (via the hitl_gate flow) before executing;
-   * `maxTokens` caps the model's output tokens; `excludeTools`
+   * `maxTokens` caps the model's output tokens; `maxSteps` stops a turn
+   * after that many steps; `excludeTools`
    * withholds built-in tools by name (e.g. `propose_action` for agents
    * that should have no CRM-write surface at all); `model` overrides the
    * model id; `modelProvider` overrides which vendor serves it.
@@ -618,6 +815,17 @@ export const AgentManifestSchema = z.object({
     provider: harnessTargetSchema.optional(),
     interrupts: z.array(z.string()).default([]),
     maxTokens: z.number().int().positive().optional(),
+    /**
+     * Stop one turn after this many steps. A step is a LangGraph graph step:
+     * one model call plus the tools it asked for is about two. The
+     * AWS-managed harness counts tool rounds instead and gets half.
+     *
+     * Optional rather than defaulted: an agent that says nothing keeps each
+     * provider's own backstop (deepagents' 10,000 steps, AgentCore's 12
+     * rounds). Set it to stop a loop sooner — see
+     * `services/agents/stepLimit.ts`.
+     */
+    maxSteps: z.number().int().positive().optional(),
     excludeTools: z.array(z.string()).default([]),
     /**
      * Granted-only tools this agent receives. Some built-ins (the discovery
@@ -629,6 +837,23 @@ export const AgentManifestSchema = z.object({
     model: z.string().optional(),
     modelProvider: z.enum(['anthropic', 'openai', 'bedrock']).optional(),
     /**
+     * Ask the vendor to cache this agent's prompt prefix, or forbid it.
+     *
+     * On by default for Anthropic and Bedrock, so an author writes this only
+     * to say `false` — an agent whose system prompt or mounted files must not
+     * sit in a vendor's cache for the five minutes the TTL lasts. Setting it
+     * here beats the caller, because the person who wrote the agent is the one
+     * who knows what its prompt carries.
+     *
+     * Optional rather than defaulted so the stored row keeps saying nothing
+     * when the author said nothing: `VOCION_PROMPT_CACHE=0` and the process
+     * default both have to stay reachable, and a written-in `true` would make
+     * the kill switch look like it had been overruled per agent. See
+     * `libs/llm/promptCache.ts` for what caching buys and what silently will
+     * not cache.
+     */
+    promptCache: z.boolean().optional(),
+    /**
      * Structural guarantee for A2UI action cards: when true and a turn ends
      * with ZERO recommend_action calls, the runtime runs a small follow-up
      * pass over the finished answer that emits the cards the agent's rules
@@ -637,6 +862,17 @@ export const AgentManifestSchema = z.object({
      * mode and it stops calling the tool (observed 3→0 card regression).
      */
     recommendActionBackstop: z.boolean().optional(),
+    /**
+     * Action kinds this agent earns trust for on its OWN ledger. A proposal
+     * of a listed kind keys the autonomy ladder on `<kind>.<agent-slug>`
+     * (`wiki.write_page.wiki-researcher`) instead of the shared kind, so a
+     * trust rule, the rung and the alignment evidence can be this agent's
+     * alone while every other agent keeps the kind's rule. Honoured by the
+     * actions that carry a `by` field — `wiki.write_page` today; the tool
+     * fills it from the agent, never from the model. Optional rather than
+     * defaulted so agents applied before this exist stay unchanged.
+     */
+    ownLedger: z.array(z.string().min(1)).optional(),
   }).partial().transform(normalizeHarnessBlock).default({}),
 }).refine(
   v => !!(v.systemPromptFile || v.systemPrompt),
@@ -830,6 +1066,101 @@ export const VoiceManifestSchema = z.object({
 });
 export type VoiceManifest = z.infer<typeof VoiceManifestSchema>;
 
+/**
+ * Operating intent, authored at workspace/<org>/operating-intent.yaml.
+ *
+ * The highest-leverage thing a person does is not approving individual work.
+ * It is saying what they want: what we are trying to achieve now, what beats
+ * what, what the factory may not do without asking, what it may spend, and
+ * which classes of action may proceed unattended.
+ *
+ * Workspace-as-code rather than a settings screen, for the same reason the
+ * playbooks are: it is versioned, it is diffable, a change to it is a commit
+ * with a reason on it, and the agents read the same file a person edits. A
+ * priority nobody can point at is not a priority.
+ *
+ * Applied onto `project.operating_intent` and composed into the system prompt
+ * of every agent in a workspace that states one
+ * (`services/agents/harness.ts`, `operatingIntentPromptNote`). A workspace
+ * that has authored nothing gets no section at all, because a section saying
+ * there are no constraints is a claim nobody made.
+ */
+export const OperatingIntentManifestSchema = z.object({
+  /**
+   * What we are trying to achieve now, most important first. One line each,
+   * stated as an outcome a person could later say yes or no to.
+   */
+  outcomes: z.array(z.object({
+    /** The outcome, in one line. */
+    statement: z.string().min(1),
+    /** Why it matters now, when that is not obvious from the statement. */
+    because: z.string().optional(),
+    /** When it is meant to be true by, as a plain date or a phrase like "this quarter". */
+    by: z.string().optional(),
+  })).default([]),
+  /**
+   * What beats what. Ordered, most important first: the list IS the ranking,
+   * so an agent choosing between two candidates reads down it rather than
+   * comparing two integers.
+   */
+  priorities: z.array(z.object({
+    /** The thing that is being ranked, in the workspace's own words. */
+    statement: z.string().min(1),
+    /** What it beats, when the comparison is the point ("reliability over a second product"). */
+    over: z.string().optional(),
+  })).default([]),
+  /**
+   * What the factory may NOT do without asking. Each is a refusal, not a
+   * preference: an agent that finds itself about to do one of these raises an
+   * ask and stops.
+   */
+  constraints: z.array(z.object({
+    /** The thing that must not happen unattended. */
+    statement: z.string().min(1),
+    /** Why, so the ask that quotes it can explain itself. */
+    because: z.string().optional(),
+  })).default([]),
+  /**
+   * Spend allowed without asking, per window. ADVISORY as of this version:
+   * it is composed into the prompts of the agents that choose work, and it is
+   * not enforced by the run budget. `services/autonomy` owns the enforced
+   * caps, and a figure here that disagrees with those caps does not override
+   * them.
+   */
+  budget: z.object({
+    /** The ceiling, in cents, for the window below. */
+    limitCents: z.number().int().min(0),
+    /** The window the ceiling applies to. */
+    window: z.enum(['day', 'week', 'month']),
+    /** What the ceiling covers and what it does not, in one line. */
+    note: z.string().optional(),
+  }).optional(),
+  /**
+   * Which classes of action may proceed unattended. Names action classes in
+   * the workspace's own words rather than registered action ids: the trust
+   * ladder (`trust.yaml`) is what actually gates an action, and this is the
+   * stated intent the ladder is supposed to express. Where the two disagree,
+   * the ladder wins and the disagreement is worth fixing.
+   */
+  autonomy: z.array(z.object({
+    /** The class of action, e.g. "routine releases", "answering a question". */
+    actionClass: z.string().min(1),
+    /** `unattended` proceeds; `ask` raises a decision; `never` does not happen. */
+    policy: z.enum(['unattended', 'ask', 'never']),
+    /** Why this class sits where it does. */
+    because: z.string().optional(),
+  })).default([]),
+  /**
+   * Product judgment the agents cannot derive from records: taste, standing
+   * calls, things that were tried and did not work, what "good" means here.
+   * Free prose, one note each.
+   */
+  productJudgment: z.array(z.string().min(1)).default([]),
+  /** When this was last reviewed by a person, so a stale intent reads as stale. */
+  reviewedAt: z.string().optional(),
+});
+export type OperatingIntentManifest = z.infer<typeof OperatingIntentManifestSchema>;
+
 export const AutomationManifestSchema = z.object({
   slug: SlugSchema,
   name: z.string().optional(),
@@ -846,10 +1177,17 @@ export const AutomationManifestSchema = z.object({
     /** 5-field cron, UTC. */
     schedule: z.string().regex(/^\S+ \S+ \S+ \S+ \S+$/, 'schedule must be a 5-field cron').optional(),
     /** Event type, e.g. `prospect.reply`. */
-    event: z.string().optional(),
+    /** One event type, or several — the automation fires on any of them. */
+    event: z.union([z.string(), z.array(z.string().min(1)).min(1)]).optional(),
     /** Payload filter for event-whens: every key must equal the payload's value. */
     filter: z.record(z.string(), z.unknown()).optional(),
-  }).refine(w => !!w.schedule !== !!w.event, { message: 'when must have exactly one of schedule | event' }),
+    /**
+     * Ceiling on event fires in a rolling ten-minute window (default 6).
+     * Beyond it the fires are held and coalesced into one run after the
+     * window. Event-whens only — a schedule fires on its cron.
+     */
+    maxFiresPer10m: z.number().int().min(1).max(1000).optional(),
+  }).refine(w => !!w.schedule !== !!w.event, { message: 'when must have exactly one of schedule | event' }).refine(w => w.maxFiresPer10m === undefined || !!w.event, { message: 'when.maxFiresPer10m applies to event-whens only — a schedule fires on its cron' }),
   do: z.object({
     workflow: z.string().optional(),
     checkMission: z.string().optional(),
@@ -862,11 +1200,21 @@ export const AutomationManifestSchema = z.object({
      * scheduled-check brief when omitted.
      */
     prompt: z.string().optional(),
+    /**
+     * The tool a `checkMission` fire's work must end in — e.g. `record_verdict`
+     * for a review. A pass that never calls it (or only has it refused) gets
+     * one recording pass over its own report with the tool chosen; a miss
+     * after that fails the fire, visibly.
+     */
+    requireTool: z.string().min(1).optional(),
     /** Fixed input passed to the workflow run / job. */
     input: z.record(z.string(), z.unknown()).optional(),
   }).refine(
     d => [d.workflow, d.checkMission, d.job].filter(Boolean).length === 1,
     { message: 'do must have exactly one of workflow | checkMission | job' },
+  ).refine(
+    d => !d.requireTool || !!d.checkMission,
+    { message: 'do.requireTool requires do.checkMission — only a mission check runs an agent whose tools can be required' },
   ).refine(
     d => !d.prompt || !!d.checkMission,
     { message: 'do.prompt requires do.checkMission — only mission checks carry an execution prompt' },
@@ -922,6 +1270,141 @@ export type MissionManifest = z.infer<typeof MissionManifestSchema>;
 // Re-export InterpolatableStringSchema for step authors who want to type inputs explicitly.
 export { InterpolatableStringSchema };
 
+/**
+ * A metadata key as it may be inlined into a `metadata ->> 'key'` expression:
+ * a rollup's link fields reach the database as literals, so the grammar is
+ * what makes that safe rather than a convention.
+ */
+const MetaKeySchema = z.string().regex(/^[a-z_]\w*$/i, {
+  message: 'a metadata key is letters, digits and underscores',
+});
+
+/**
+ * Which of a parent's children one rollup counts. `field` is either `status`
+ * (the object's own column, which is where a task's `accepted`, `rejected`
+ * and `abandoned` live) or a metadata key. `in` lists the values that
+ * qualify. Omitted, every child counts, which is what the cost rollups want.
+ *
+ * This is what lets one type carry two figures over the same children: a
+ * request's `actualCents` is every task it took, and its `reworkCents` is
+ * only the tasks that were thrown away.
+ */
+export const RollupWhereSchema = z.object({
+  field: MetaKeySchema,
+  in: z.array(z.string()).min(1),
+});
+
+/**
+ * One figure this type carries that is COMPUTED from another type's rows:
+ * the sum of a child field, the earliest of a child date, or the count of
+ * children, rather than typed.
+ *
+ * The link runs one of three ways: `by` names the child's field that holds
+ * this record's id (`engineering_task.requestId` → `request`), `ids` names
+ * this record's field that lists child ids (`release.taskIds`), and `inList`
+ * names the child's field that LISTS this record's id (`release.requestIds`
+ * → `request`, which is how a request learns when it shipped). Core
+ * recomputes every rollup that reaches a child when that child is written,
+ * and stamps `rollupsUpdatedAt` beside the figures; a page reads them like
+ * any other metadata. Nothing here reaches the database schema; the
+ * declaration is read from the type file at the moment it is needed, the way
+ * pages are.
+ */
+export const RollupSchema = z.object({
+  /** The metadata key written on THIS type. */
+  field: MetaKeySchema,
+  from: z.object({
+    /** The child object type. */
+    type: SlugSchema,
+    /** The child's metadata key holding this record's id. */
+    by: MetaKeySchema.optional(),
+    /** This record's metadata key listing child ids. */
+    ids: MetaKeySchema.optional(),
+    /** The child's metadata key whose list of ids contains this record's. */
+    inList: MetaKeySchema.optional(),
+    /**
+     * With `by`: THIS record's metadata key the child's `by` value names,
+     * instead of this record's id. A request names its product by slug
+     * (`product: send`), not by row id, so the product's rollups over its
+     * requests join `by: product` to `match: slug` (2026-09-24).
+     */
+    match: MetaKeySchema.optional(),
+  })
+    .refine(l => [l.by, l.ids, l.inList].filter(v => v !== undefined).length === 1, { message: 'a rollup link names exactly one of `by` (the child points here), `ids` (this record lists its children) or `inList` (the child lists this record)' })
+    .refine(l => l.match === undefined || l.by !== undefined, { message: '`match` only makes sense with `by`: the child names this record by the value under `match`' }),
+  /** The child's metadata key to sum. Omitted with no `min`/`max`, the rollup is a count of children. */
+  sum: MetaKeySchema.optional(),
+  /** The child's date key whose EARLIEST value is written, as an ISO string. */
+  min: MetaKeySchema.optional(),
+  /** The child's date key whose LATEST value is written, as an ISO string. */
+  max: MetaKeySchema.optional(),
+  /** Which children count; see {@link RollupWhereSchema}. */
+  where: RollupWhereSchema.optional(),
+}).refine(r => [r.sum, r.min, r.max].filter(v => v !== undefined).length <= 1, { message: 'a rollup is a sum, a min, a max or a count of children, not two of them' });
+export type Rollup = z.infer<typeof RollupSchema>;
+
+/**
+ * One thing a record must satisfy to cross a gate. Grown on 2026-09-25 to
+ * express the two gates that were TypeScript until then (backlog 011): a
+ * requirement can apply only `if` another field has one of some values, can
+ * demand that `allItems` of a list carry a field equal to a value, can pass
+ * when `anyOf` several alternatives pass, and can say something different for
+ * each bad value (`valueMessages`) and for a missing one (`missingMessage`).
+ * Messages may carry `{to}`, `{value}`, `{days}`, `{unmet}`, `{total}` and
+ * `{first}`.
+ */
+export type GateRequirementManifest = {
+  field: string;
+  present?: boolean;
+  minItems?: number;
+  oneOf?: string[];
+  maxAgeDays?: number;
+  allItems?: { field: string; equals: string | number | boolean; label?: string };
+  anyOf?: GateRequirementManifest[];
+  if?: { field: string; oneOf: string[] };
+  valueMessages?: Record<string, string>;
+  missingMessage?: string;
+  message?: string;
+};
+const GateRequirementSchema: z.ZodType<GateRequirementManifest> = z.lazy(() => z.object({
+  field: z.string().min(1),
+  present: z.boolean().optional(),
+  minItems: z.number().int().min(0).optional(),
+  oneOf: z.array(z.string()).min(1).optional(),
+  maxAgeDays: z.number().min(0).optional(),
+  allItems: z.object({ field: z.string().min(1), equals: z.union([z.string(), z.number(), z.boolean()]), label: z.string().min(1).optional() }).optional(),
+  anyOf: z.array(GateRequirementSchema).min(2).optional(),
+  if: z.object({ field: z.string().min(1), oneOf: z.array(z.string()).min(1) }).optional(),
+  valueMessages: z.record(z.string(), z.string()).optional(),
+  missingMessage: z.string().optional(),
+  message: z.string().optional(),
+}).refine(r => r.present || r.minItems !== undefined || r.oneOf || r.maxAgeDays !== undefined || r.allItems || r.anyOf, { message: 'a requirement needs present, minItems, oneOf, maxAgeDays, allItems or anyOf' }));
+
+/**
+ * The judgement half of a gate: after the deterministic checks pass, one
+ * model call reads the record against the seat's rubric (a skill) and, when
+ * named, the reference cases (an eval dataset), and says pass, return, or
+ * escalate to a person. The workspace steers the numbers (`defaults.gates`).
+ */
+export const GateJudgeSchema = z.object({
+  rubric: z.string().min(1).describe('skill slug — the seat\'s one-page rubric'),
+  cases: z.string().min(1).optional().describe('eval dataset slug — the reference cases the judge is calibrated on'),
+  /** Below this confidence in its own verdict, the judge escalates to a person instead of deciding. */
+  escalateBelow: z.number().min(0).max(1).default(0.6),
+  /** How often the judge runs at all; 1 = every crossing. Autonomy earned lowers it. */
+  sampleRate: z.number().min(0).max(1).default(1),
+  /** Field values that always go to a person whatever the judge says (e.g. riskClass: [schema, billing]). */
+  alwaysEscalate: z.record(z.string(), z.array(z.string())).optional(),
+});
+
+export const HandoffGateSchema = z.object({
+  name: z.string().min(1),
+  when: z.object({ field: z.string().min(1), becomes: z.array(z.string().min(1)).min(1) }),
+  producedBy: z.string().min(1).describe('the agent slug whose work this is — where a failure is returned'),
+  require: z.array(GateRequirementSchema).min(1),
+  judge: GateJudgeSchema.optional(),
+});
+
 export const ObjectTypeManifestSchema = z.object({
   slug: SlugSchema,
   label: z.string(),
@@ -932,6 +1415,15 @@ export const ObjectTypeManifestSchema = z.object({
   classificationPromptFile: z.string().optional(),
   classificationPrompt: z.string().optional(),
   fewShotExamples: z.array(FewShotExampleSchema).default([]),
+  /** Figures computed from another type's rows — see {@link RollupSchema}. */
+  rollups: z.array(RollupSchema).optional(),
+  /**
+   * HANDOFF GATES: what must be on a record before it may cross a transition,
+   * and which seat the record goes back to when it is not
+   * (`libs/gates/handoffGate.ts`). Declared here by the plugin, steered by
+   * the workspace, enforced where the record is written — never a prompt.
+   */
+  gates: z.array(HandoffGateSchema).optional(),
 });
 export type ObjectTypeManifest = z.infer<typeof ObjectTypeManifestSchema>;
 
@@ -962,6 +1454,78 @@ export type ObjectTypeManifest = z.infer<typeof ObjectTypeManifestSchema>;
  * `workspace/<org>/evals/<slug>.yaml` declares one dataset.
  */
 /**
+ * Whether a dot path names one value rather than every item of a list. A
+ * `where` filter needs a single answer per call, so `*` is refused there.
+ * @param path - A dot path from the manifest.
+ */
+function readsOneValue(path: string): boolean {
+  return !path.split('.').includes('*');
+}
+
+/**
+ * How many `*` segments a dot path has.
+ * @param path - A dot path from the manifest, or nothing.
+ */
+function countEveryItem(path: string | undefined): number {
+  return path ? path.split('.').filter(segment => segment === '*').length : 0;
+}
+
+/**
+ * One `where` filter on a `toolCalledWith` or `toolReturned` check. `present: false` exists so
+ * a rule can step around the one legitimate exception to it — a series
+ * refresh, which is the only event proposal carrying a `recurrence`, keeps
+ * its first `startDate` even when that day has passed.
+ */
+const ToolCallFilterSchema = z.object({
+  path: z.string().refine(readsOneValue, { message: 'a where path reads one value; a * segment only belongs in path' }),
+  equals: z.unknown().optional(),
+  present: z.boolean().optional(),
+}).refine(
+  filter => filter.equals !== undefined || filter.present !== undefined,
+  { message: 'a where filter needs equals or present — otherwise it matches every call' },
+);
+
+/**
+ * The condition a `toolCalledWith` or `toolReturned` check carries. The two
+ * differ only in what `path` and `timezoneFrom` read — the call's arguments
+ * or what the tool handed back — so they share one shape and one set of
+ * refusals.
+ * @param checkName - The check's key, for the refusal message.
+ * @param readsFrom - What `path` reads, for the field descriptions.
+ */
+function toolConditionSchema(checkName: 'toolCalledWith' | 'toolReturned', readsFrom: string) {
+  return z.object({
+    tool: z.string(),
+    where: z.union([ToolCallFilterSchema, z.array(ToolCallFilterSchema).min(1)]).optional().describe('only the calls whose arguments match this filter, or every filter in a list — one tool often files several kinds of thing'),
+    noCalls: z.enum(['fail', 'pass']).optional().describe('what no matching call means; fail by default'),
+    path: z.string().optional().describe(`dot path into ${readsFrom}; a * segment means every item of a list`),
+    equals: z.unknown().optional(),
+    contains: z.string().optional(),
+    present: z.boolean().optional(),
+    subsetOf: z.array(z.string()).optional().describe('every element at the path must be one of these'),
+    onOrAfter: z.string().refine(isRelativeDay, { message: 'onOrAfter must be today, yesterday, tomorrow, last/next week|month|year, "N days|weeks|months|years ago", "in N days|weeks|months|years", or YYYY-MM-DD' }).optional().describe('the date at the path must fall on or after this day, resolved when the check runs'),
+    onOrBefore: z.string().refine(isRelativeDay, { message: 'onOrBefore must be today, yesterday, tomorrow, last/next week|month|year, "N days|weeks|months|years ago", "in N days|weeks|months|years", or YYYY-MM-DD' }).optional().describe('the date at the path must fall on or before this day, resolved when the check runs'),
+    timezone: z.string().refine(isDayZone, { message: 'timezone must be utc, local, workspace, or an IANA zone like America/New_York' }).optional().describe('which zone "today" is in for onOrAfter and onOrBefore; utc by default'),
+    timezoneFrom: z.string().min(1).optional().describe(`dot path into ${readsFrom} naming the zone; a * means the same item path is on; timezone applies when it names none`),
+    calls: z.enum(['every', 'some']).optional().describe('how many of the tool\'s calls must match; every by default'),
+  }).refine(
+    condition => condition.equals !== undefined
+      || condition.contains !== undefined
+      || condition.present !== undefined
+      || condition.subsetOf !== undefined
+      || condition.onOrAfter !== undefined
+      || condition.onOrBefore !== undefined,
+    { message: `${checkName} needs one of equals, contains, present, subsetOf, onOrAfter or onOrBefore — otherwise it asserts nothing` },
+  ).refine(
+    // Each `*` in timezoneFrom is the item the matching `*` in path is on, so
+    // it cannot have more of them than path does — there would be no item to
+    // stand for.
+    condition => countEveryItem(condition.timezoneFrom) <= countEveryItem(condition.path),
+    { message: 'timezoneFrom has more * segments than path; each * in timezoneFrom stands for the item the matching * in path is on' },
+  );
+}
+
+/**
  * One deterministic check we run ourselves.
  *
  * A closed list, deliberately. Arbitrary code in a manifest would need a
@@ -973,6 +1537,36 @@ export type ObjectTypeManifest = z.infer<typeof ObjectTypeManifestSchema>;
 const EvalCheckSchema = z.union([
   z.object({ toolCalled: z.string() }),
   z.object({ toolNotCalled: z.string() }),
+  z.object({
+    /**
+     * What a tool call's arguments had to look like. The tool name and the
+     * answer text were all a check could read before this, which left the
+     * envelope shape, the dedup key and the suggested decision — all of them
+     * arguments — measurable by nothing we have.
+     */
+    toolCalledWith: toolConditionSchema('toolCalledWith', 'the call\'s arguments, e.g. action_input.dedupOn'),
+  }),
+  z.object({
+    /**
+     * What the tool handed back had to look like. Arguments say what the
+     * agent asked for; only the return says whether it got what it needed —
+     * a lookup that returns records without their ids leaves the agent
+     * unable to write anything back to them.
+     */
+    toolReturned: toolConditionSchema('toolReturned', 'the tool\'s return value, parsed as JSON, e.g. *.id'),
+  }),
+  z.object({
+    /** How many times the tool was allowed to be called. */
+    toolCallCount: z.object({
+      tool: z.string(),
+      exactly: z.number().int().nonnegative().optional(),
+      min: z.number().int().nonnegative().optional(),
+      max: z.number().int().nonnegative().optional(),
+    }).refine(
+      condition => condition.exactly !== undefined || condition.min !== undefined || condition.max !== undefined,
+      { message: 'toolCallCount needs one of exactly, min or max — otherwise it asserts nothing' },
+    ),
+  }),
   z.object({ outputMatches: z.string().describe('regular expression the answer must match') }),
   z.object({ outputContains: z.string() }),
   z.object({ outputNotContains: z.string() }),
@@ -1043,6 +1637,16 @@ export const EvalDatasetManifestSchema = z.object({
    */
   provider: z.enum(['vocion', 'agentcore']).default('vocion'),
   /**
+   * The pass rate this dataset has to reach for `eval:run` to exit 0.
+   *
+   * A single number for the whole dataset, not a bar every case has to clear,
+   * because a dataset spread across a dozen live sources will lose a case to
+   * one of them redesigning a page, and a gate that fails the build for that
+   * teaches people to ignore the gate. Omitted, the runner's own floor
+   * applies, so every dataset written before this field keeps its behaviour.
+   */
+  passThreshold: z.number().min(0).max(1).optional().describe('pass rate the run must reach, 0 to 1'),
+  /**
    * The evaluators this dataset's grader should use. Each one names its own
    * provider, which must be the dataset's — a dataset scored by Vocion cannot
    * carry an AgentCore evaluator, because nothing would ever run it.
@@ -1085,22 +1689,12 @@ export const EvalDatasetManifestSchema = z.object({
     }
   }
 
-  // `checks` run inside our own judge and nowhere else, so on a dataset graded
-  // by anyone else they are written, applied, and then silently never run —
-  // and the case still reports a pass rate, which reads as if they had. Refuse
-  // the file instead. A dataset that needs deterministic checks belongs to
-  // Vocion; inside AgentCore the equivalent is a `codeBased` evaluator.
-  if (dataset.provider !== 'vocion') {
-    dataset.items.forEach((item, index) => {
-      if (item.checks?.length) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['items', index, 'checks'],
-          message: `case ${index + 1} has checks, which only run under the vocion grader — this dataset is graded by ${dataset.provider}`,
-        });
-      }
-    });
-  }
+  // `checks` used to be refused on anything but a Vocion dataset, because
+  // only the Vocion grader ran them. They now run over the transcript
+  // whichever grader scores the case — the transcript is ours either way —
+  // so a dataset can send its cases to AWS and still assert the things a
+  // model should never be asked to judge, like whether the dedup key had the
+  // right three fields in it.
 });
 export type EvalDatasetManifest = z.infer<typeof EvalDatasetManifestSchema>;
 export type EvalEvaluatorManifest = z.infer<typeof EvalEvaluatorManifestSchema>;

@@ -1,24 +1,33 @@
 'use client';
 
-import type { AgentOption } from './types';
+import type { AgentSurfaceRequest } from './agentSurface';
+import type { AgentOption, ChatAttachment } from './types';
+import type { PageContext } from '@/services/chat/pageContext';
 import { MessagesSquare } from 'lucide-react';
 import { useTranslations } from 'next-intl';
-import { useEffect } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState as PageEmptyState } from '@/components/ui/empty-state';
 import { ShellBarActionsPortal } from '@/features/dashboard/ShellBarActions';
 import { PreviewPanel } from '@/features/preview/PreviewPanel';
-import { AGENT_SURFACE_EVENT, focusAgentComposer } from './agentSurface';
-import { AutonomyControl } from './AutonomyControl';
+import { usePathname, useRouter } from '@/libs/I18nNavigation';
+import { client } from '@/libs/Orpc';
+import { AboutRecordChip } from './AboutRecordChip';
+import { AGENT_SURFACE_EVENT, agentSurfaceRequestOf, focusAgentComposer, takeChatAbout } from './agentSurface';
+import { AUTONOMY_SETTING_ID, autonomyFromOption, autonomyMenuSetting } from './autonomyOptions';
+import { CardDecisionProvider } from './cards/CardDecisions';
 import { ChatComposer } from './ChatComposer';
-import { ChatMenu } from './ChatMenu';
+import { ChatHeaderActions } from './ChatHeaderActions';
 import { useComposerQueueProps } from './composerQueue';
 import { EmptyState, NoAgentsState } from './EmptyState';
-import { HistoryPopover } from './HistoryPopover';
 import { HitlGate } from './HitlGate';
 import { MessageList } from './MessageList';
-import { hasWorkspaceAgents, parseSearchCommand } from './routing';
+import { ModelControl } from './ModelControl';
+import { QuotedPassage } from './QuotedPassage';
+import { defaultAgentSlug, hasWorkspaceAgents, parseSearchCommand } from './routing';
 import { SourcesPanel } from './SourcesPanel';
 import { useComposerTags } from './tagSearch';
+import { transcriptOf } from './transcript';
+import { useChatCommands } from './useChatCommands';
 import { useChatSession } from './useChatSession';
 
 /**
@@ -52,12 +61,16 @@ export type ChatShellProps = {
   agents: AgentOption[];
   /** Pre-fills the composer without sending (e.g. the org chart's seeded "how's the quarter?" prompt). */
   initialComposerValue?: string;
+  /** `?attach=<ids>` — files already uploaded (Share to Vocion) that start in the composer. */
+  initialAttachments?: ChatAttachment[];
   /** Dynamic workspace-scoped empty-state chips (urgency + capability). */
   suggestions?: Array<{ label: string; prompt: string }>;
   /** Empty-state greeting: org eyebrow + "Ask <workspace>". */
   greeting?: { eyebrow?: string; workspace: string };
   /** A thread the URL names (`?conversation=<id>`) — resume it instead of starting fresh (§9). */
   conversationId?: number | null;
+  /** `?new=1` — forget this browser session's thread and start fresh (⌘⇧O from a page with no surface). */
+  startNew?: boolean;
 };
 
 /**
@@ -79,16 +92,20 @@ export type ChatShellProps = {
  * @param props - Component props.
  * @param props.agents - Agents available to pick from. Empty renders the empty state.
  * @param props.initialComposerValue - Text to pre-fill the composer with.
+ * @param props.initialAttachments - Uploaded files that start in the composer.
  * @param props.suggestions - Empty-state chips.
  * @param props.greeting - Empty-state greeting.
  * @param props.conversationId
+ * @param props.startNew
  */
 export function ChatShell({
   agents,
   initialComposerValue,
+  initialAttachments,
   suggestions = [],
   greeting,
   conversationId = null,
+  startNew = false,
 }: ChatShellProps) {
   if (agents.length === 0) {
     return <NoAgentsToChatWith />;
@@ -98,9 +115,11 @@ export function ChatShell({
     <ChatShellInner
       agents={agents}
       initialComposerValue={initialComposerValue}
+      initialAttachments={initialAttachments}
       suggestions={suggestions}
       greeting={greeting}
       conversationId={conversationId}
+      startNew={startNew}
     />
   );
 }
@@ -127,12 +146,110 @@ function NoAgentsToChatWith() {
 function ChatShellInner({
   agents,
   initialComposerValue,
+  initialAttachments,
   suggestions = [],
   greeting,
   conversationId = null,
+  startNew = false,
 }: ChatShellProps) {
   const t = useTranslations('Chat');
-  const session = useChatSession({ agents, initialComposerValue, suggestions, greeting, resumeConversationId: conversationId });
+  const router = useRouter();
+  const pathname = usePathname();
+  // Intent handed to this surface — a passage highlighted in the transcript
+  // ("Reply"), or in a document — rides out with the next turn as
+  // `page_context.selection`, exactly as the rail does it.
+  const [intent, setIntent] = useState<AgentSurfaceRequest | null>(null);
+  const pageContext = useMemo<PageContext | undefined>(() => {
+    const c = intent?.context;
+    if (!c) {
+      return undefined;
+    }
+    return {
+      path: c.path || pathname,
+      title: c.title,
+      ...(c.record ? { record: c.record } : {}),
+      ...(c.selection ? { selection: c.selection } : {}),
+      ...(c.refs ? { refs: c.refs } : {}),
+      openedFrom: true as const,
+    };
+  }, [intent, pathname]);
+  const session = useChatSession({ agents, initialComposerValue, initialAttachments, suggestions, greeting, resumeConversationId: conversationId, pageContext });
+  // A card's decision becomes a typed user turn in THIS conversation (backlog 025).
+  const recordCardDecision = useCallback((d: { cardId: string; label: string; action: 'approve' | 'reject' | 'defer' | 'undo'; runId?: number }) => {
+    if (session.conversationId === null) {
+      return;
+    }
+    void client.conversations.recordCardDecision({ id: session.conversationId, ...d }).catch((err: unknown) => {
+      console.warn('card decision was not written to the conversation', err);
+    });
+  }, [session.conversationId]);
+  const sessionRef = useRef(session);
+  useEffect(() => {
+    sessionRef.current = session;
+  });
+  // Starting over always lands the caret in the box — ⌘⇧O, `/new`, the ⋯ menu,
+  // the history popover — so the next words go straight in (Chris, 2026-09-18).
+  const startNewChat = useCallback(() => {
+    sessionRef.current.handleNewChat();
+    focusAgentComposer(null);
+  }, []);
+  const onCommand = useChatCommands(startNewChat);
+
+  // The approval gate, as a transcript block pinned to the end. `afterIndex`
+  // past the last message is how `MessageList` says "after whatever is last"
+  // without the caller tracking the index itself.
+  const gateBlocks = useMemo(
+    () => (session.pendingHitl
+      ? [{
+          key: 'hitl-gate',
+          afterIndex: session.messages.length,
+          node: (
+            <HitlGate
+              gate={session.pendingHitl}
+              onApprove={session.handleApproveHitl}
+              onReject={session.handleRejectHitl}
+              disabled={session.isStreaming}
+            />
+          ),
+        }]
+      : []),
+    [session.pendingHitl, session.messages.length, session.handleApproveHitl, session.handleRejectHitl, session.isStreaming],
+  );
+  // Arriving on the page (⌘⇧L, the sidebar, a link) focuses the composer once
+  // the saved thread has settled; keyboard-only never has to click the box.
+  useEffect(() => {
+    if (session.booted) {
+      focusAgentComposer(null);
+    }
+  }, [session.booted]);
+  // A turn went out: the quoted passage has been consumed.
+  const turnCount = session.messages.length;
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks-extra/no-direct-set-state-in-use-effect
+    setIntent(null);
+  }, [turnCount]);
+  // `?new=1`: once the saved thread has settled, forget it and clear the URL.
+  const startedNew = useRef(false);
+  useEffect(() => {
+    if (!startNew || !session.booted || startedNew.current) {
+      return;
+    }
+    startedNew.current = true;
+    sessionRef.current.handleNewChat();
+    // A record carried in without a question ("Chat about this" from a page
+    // with no rail) becomes the About chip; the person writes the first line.
+    const about = takeChatAbout();
+    if (about) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks-extra/no-direct-set-state-in-use-effect -- the URL said "new": one deliberate reset, not a cascade
+      setIntent({ context: { path: window.location.pathname, title: document.title, record: about, openedFrom: true } });
+    }
+    // Drop only `new`: a `preview=` opened beside the fresh thread stays.
+    const params = new URLSearchParams(window.location.search);
+    params.delete('new');
+    const qs = params.toString();
+    focusAgentComposer(null);
+    router.replace(`${pathname}${qs ? `?${qs}` : ''}`);
+  }, [startNew, session.booted, router, pathname]);
   const queueProps = useComposerQueueProps(session);
   // `@` and `(+)` offer the same list: the artifact contract, then the records
   // this surface knows. The full page is not on a record, so there is no page
@@ -151,6 +268,19 @@ function ChatShellInner({
   useEffect(() => {
     function onRequest(e: Event) {
       e.preventDefault();
+      const req = agentSurfaceRequestOf(e);
+      if (req.newChat) {
+        sessionRef.current.handleNewChat();
+      }
+      if (req.prompt !== undefined || req.context) {
+        setIntent(req);
+        if (req.prompt !== undefined) {
+          sessionRef.current.setComposerValue(req.prompt);
+        }
+      }
+      for (const tag of req.tags ?? []) {
+        sessionRef.current.addContextRef(tag);
+      }
       focusAgentComposer(null);
     }
     window.addEventListener(AGENT_SURFACE_EVENT, onRequest);
@@ -162,30 +292,33 @@ function ChatShellInner({
       {/* The single small chat menu — portaled into the shell top bar beside
           the account menu, so the conversation canvas stays clean. */}
       <ShellBarActionsPortal>
-        <div className="flex items-center gap-1">
-          {/* One identity (§9.10): the surface speaks as the workspace. */}
-          <span data-testid="speaker-chip" className="truncate text-sm font-medium text-foreground/80">{session.workspaceName}</span>
-          <HistoryPopover
-            recent={session.recentChats}
-            currentId={session.conversationId}
-            onPick={id => void session.handlePickConversation(id)}
-            onNewChat={session.handleNewChat}
-            search={session.searchConversations}
-          />
-          {/* The conversation's rung rides with the conversation's identity on
-              every surface, not inside the composer (§9.7). */}
-          <AutonomyControl
-            value={session.autonomy}
-            onChange={session.setAutonomy}
-            copy={autonomyCopy}
-            label={t('autonomy')}
-          />
-          <ChatMenu onNewChat={session.handleNewChat} />
-        </div>
+        {/* New chat + the conversations dropdown as icons; the ⋯ menu only on a
+            phone. No workspace name here — the sidebar says it (2026-09-18). */}
+        <ChatHeaderActions
+          onNewChat={startNewChat}
+          onCopy={session.messages.length > 0 ? () => transcriptOf(session.messages, session.workspaceName) : null}
+          history={{
+            recent: session.recentChats,
+            currentId: session.conversationId,
+            onPick: id => void session.handlePickConversation(id),
+            search: session.searchConversations,
+          }}
+        />
       </ShellBarActionsPortal>
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="flex flex-1 flex-col">
+        {/* `min-w-0` is load-bearing. A flex item's floor is its min-content,
+            and one unbroken line in the stream (a reasoning preview, a tool
+            result) made that 800px on a 390px phone: the transcript AND the
+            composer widened with it and this row's `overflow-hidden` cut the
+            right side off (2026-09-25, Safari, measured live in WebKit). */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {/* The approval gate is a BLOCK IN THE TRANSCRIPT (058's mechanism,
+              the same one the dock's review cards use), after the turn that
+              raised it — not a strip pinned above the composer. `afterIndex`
+              past the last message pins it to the end, and `MessageList`
+              re-pins the view when a block moves, as it does for a new
+              message. */}
           {!session.booted || (session.resuming && session.messages.length === 0)
             ? (
                 // One stable skeleton until the restore + resume settles, so a
@@ -199,7 +332,7 @@ function ChatShellInner({
                   ))}
                 </div>
               )
-            : session.messages.length === 0
+            : session.messages.length === 0 && !session.pendingHitl
               ? (
                   hasWorkspaceAgents(agents)
                     ? (
@@ -213,29 +346,44 @@ function ChatShellInner({
                     : <NoAgentsState />
                 )
               : (
-                  <MessageList
-                    messages={session.messages}
-                    agentName={session.workspaceName}
-                    streaming={session.isStreaming}
-                    activity={session.activity}
-                    onShowSources={session.handleShowSources}
-                    onCitationClick={session.handleCitationClick}
-                    onFeedback={session.handleFeedback}
-                    autonomy={session.autonomy}
-                    conversationId={session.conversationId}
-                  />
+                  <CardDecisionProvider value={recordCardDecision}>
+                    <MessageList
+                      messages={session.messages}
+                      agentName={session.workspaceName}
+                      // The workspace speaks through its lead; a specialist's turn is attributed.
+                      ownAgentSlug={defaultAgentSlug(agents)}
+                      streaming={session.isStreaming}
+                      activity={session.activity}
+                      onShowSources={session.handleShowSources}
+                      onCitationClick={session.handleCitationClick}
+                      onFeedback={session.handleFeedback}
+                      autonomy={session.autonomy}
+                      conversationId={session.conversationId}
+                      blocks={gateBlocks}
+                    />
+                  </CardDecisionProvider>
                 )}
 
-          {session.pendingHitl && (
-            <HitlGate
-              gate={session.pendingHitl}
-              onApprove={session.handleApproveHitl}
-              onReject={session.handleRejectHitl}
-              disabled={session.isStreaming}
-            />
-          )}
-
           <ChatComposer
+            above={intent?.context?.selection || intent?.context?.record
+              ? (
+                  <>
+                    {intent.context.record && <AboutRecordChip record={intent.context.record} onDrop={() => setIntent(i => (i?.context ? { ...i, context: { ...i.context, record: undefined } } : i))} />}
+                    {intent.context.selection && <QuotedPassage text={intent.context.selection.text} onDrop={() => setIntent(i => (i?.context ? { ...i, context: { ...i.context, selection: undefined } } : i))} />}
+                  </>
+                )
+              : undefined}
+            onCommand={onCommand}
+            // The thread's settings, in the bar: its rung (done for you / ask
+            // first) and its model — one cluster, every surface (2026-09-18).
+            controls={<ModelControl value={session.modelPrefs} onChange={session.setModelPrefs} />}
+            settings={[autonomyMenuSetting(session.autonomy, autonomyCopy, t('autonomy_thread'))]}
+            onSetting={(id, opt) => {
+              const rung = id === AUTONOMY_SETTING_ID ? autonomyFromOption(opt) : null;
+              if (rung) {
+                session.setAutonomy(rung);
+              }
+            }}
             value={session.composerValue}
             onChange={session.setComposerValue}
             onSubmit={() => void session.sendMessage(session.composerValue)}

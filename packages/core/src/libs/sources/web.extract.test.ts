@@ -151,11 +151,12 @@ describe('extractFromHtml on a show detail page', () => {
     expect(content).toContain('$31.00-$36.00');
   });
 
-  it('leads with the og:image as an absolute URL, entities decoded', () => {
-    const { content } = extractFromHtml(DETAIL_HTML, DETAIL_URL);
+  it('declares the og:image as an absolute URL, entities decoded, and keeps it out of the text', () => {
+    const { content, structure } = extractFromHtml(DETAIL_HTML, DETAIL_URL);
 
-    expect(content.split('\n')[0]).toBe('Image: https://bellwaterhall.example/?og_img=1&pid=40405');
-    expect(content).not.toContain('og_img=1&#038;');
+    expect(structure?.ogImage).toBe('https://bellwaterhall.example/?og_img=1&pid=40405');
+    expect(structure?.ogImage).not.toContain('og_img=1&#038;');
+    expect(content).not.toContain('og_img=1');
   });
 
   it('renders a <time> as its label plus the machine-readable stamp', () => {
@@ -211,9 +212,9 @@ describe('extractFromHtml on a listing page', () => {
   });
 
   it('resolves a relative og:image and a relative card image', () => {
-    const { content } = extractFromHtml(LISTING_HTML, LISTING_URL);
+    const { content, structure } = extractFromHtml(LISTING_HTML, LISTING_URL);
 
-    expect(content).toContain('Image: https://bellwaterhall.example/wp-content/uploads/2026/05/LAP-20241004-9175.jpg');
+    expect(structure?.ogImage).toBe('https://bellwaterhall.example/wp-content/uploads/2026/05/LAP-20241004-9175.jpg');
     expect(content).toContain('[image: Nina Calder](https://bellwaterhall.example/wp-content/uploads/nina-calder.jpg)');
     expect(content).not.toContain('data:image');
   });
@@ -239,9 +240,9 @@ describe('extractFromHtml on a listing page', () => {
   });
 
   it('leaves relative URLs alone when no base URL is given', () => {
-    const { content } = extractFromHtml(LISTING_HTML);
+    const { content, structure } = extractFromHtml(LISTING_HTML);
 
-    expect(content).toContain('Image: /wp-content/uploads/2026/05/LAP-20241004-9175.jpg');
+    expect(structure?.ogImage).toBe('/wp-content/uploads/2026/05/LAP-20241004-9175.jpg');
     expect(content).toContain('(/events/nina-calder/)');
     expect(content).toContain('[image: Nina Calder](/wp-content/uploads/nina-calder.jpg)');
     expect(content).not.toContain('https://bellwaterhall.example/events/nina-calder/');
@@ -371,30 +372,108 @@ const SMALL_HTML = `<!doctype html><html><head><title>T</title>
 <main><p>Hello <a href="/t">buy</a>.</p></main></body></html>`;
 
 const SMALL_CONTENT = [
-  'Image: https://ex.test/i.jpg',
-  '',
   'Hello buy (https://ex.test/t).',
   '',
   'Structured data (JSON-LD):',
   '{"@type":"Event","name":"N"}',
 ].join('\n');
 
+/**
+ * SMALL_HTML with the two things a site adds that are not the page: an SEO
+ * graph restamped on every request, and a widget listing other shows that
+ * rotates daily. Ignoring both must give back exactly SMALL_CONTENT.
+ * @param other - the show the widget lists today.
+ * @param stamp - the SEO graph's dateModified.
+ */
+function sidebarPage(other: string, stamp: string): string {
+  return SMALL_HTML
+    .replace('</head>', `<script type="application/ld+json" class="seo-graph">{"@graph":[{"@type":"WebPage","dateModified":"${stamp}"}]}</script></head>`)
+    .replace('</main>', `</main><div class="widget-area"><p>Upcoming: <a href="/other-${other}">${other}</a></p></div>`);
+}
+const SIDEBAR_IGNORE = ['.widget-area', 'script.seo-graph'];
+
 describe('extractFromHtml, the content contract', () => {
-  it('returns exactly the text it always did', () => {
+  it('returns exactly the text the ingest hashes', () => {
     const { content } = extractFromHtml(SMALL_HTML, SMALL_URL);
 
     expect(content).toBe(SMALL_CONTENT);
   });
 
-  it('is unchanged by the structure it now also returns', () => {
+  it('is unchanged by the structure it also returns', () => {
     const { content, structure } = extractFromHtml(SMALL_HTML, SMALL_URL);
 
     expect(content).toBe(SMALL_CONTENT);
     expect(structure?.jsonLd).toBeDefined();
+    expect(structure?.ogImage).toBe('https://ex.test/i.jpg');
+  });
+
+  it('reads two fetches that differ only in the og:image URL as the same text', () => {
+    const dated = (day: string): string => SMALL_HTML.replace('content="/i.jpg"', `content="/i.jpg?v=${day}"`);
+
+    const first = extractFromHtml(dated('20260921'), SMALL_URL);
+    const second = extractFromHtml(dated('20260922'), SMALL_URL);
+
+    expect(first.content).toBe(second.content);
+    expect(first.structure?.ogImage).not.toBe(second.structure?.ogImage);
+  });
+
+  it('is empty for a page whose only content was its image', () => {
+    const imageOnly = '<!doctype html><html><head><meta property="og:image" content="/i.jpg"></head><body></body></html>';
+
+    const { content, structure } = extractFromHtml(imageOnly, SMALL_URL);
+
+    expect(content).toBe('');
+    expect(structure?.ogImage).toBe('https://ex.test/i.jpg');
+  });
+
+  it('reads two fetches that differ only inside ignored elements as the same text', () => {
+    const first = extractFromHtml(sidebarPage('alpha', '2026-09-23T23:42:43+00:00'), SMALL_URL, SIDEBAR_IGNORE);
+    const second = extractFromHtml(sidebarPage('beta', '2026-09-24T02:18:32+00:00'), SMALL_URL, SIDEBAR_IGNORE);
+
+    expect(first.content).toBe(SMALL_CONTENT);
+    expect(second.content).toBe(SMALL_CONTENT);
+
+    const bare = (other: string): string => extractFromHtml(sidebarPage(other, other), SMALL_URL).content;
+
+    expect(bare('alpha')).not.toBe(bare('beta'));
+  });
+
+  it('is unchanged by an empty ignore list or a selector that matches nothing', () => {
+    const plain = extractFromHtml(SMALL_HTML, SMALL_URL);
+
+    for (const ignore of [[], ['#absent']]) {
+      const { content, structure } = extractFromHtml(SMALL_HTML, SMALL_URL, ignore);
+
+      expect(content).toBe(SMALL_CONTENT);
+      expect(structure).toStrictEqual(plain.structure);
+    }
+  });
+
+  it('never removes the page itself, whatever the selector matches', () => {
+    const classed = '<!doctype html><html class="home"><head><title>T</title></head>'
+      + '<body class="home page"><div class="kid">Kid</div><p>Keep me.</p></body></html>';
+
+    for (const ignore of [['.home'], ['[class]'], [':has(.kid)']]) {
+      const { content } = extractFromHtml(classed, SMALL_URL, ignore);
+
+      expect(content).toContain('Keep me.');
+    }
+
+    expect(extractFromHtml(classed, SMALL_URL, ['[class]']).content).not.toContain('Kid');
   });
 });
 
 describe('extractFromHtml, the structure it returns', () => {
+  it('leaves out the URLs and JSON-LD inside an ignored element, which is not part of the page', () => {
+    const ignored = extractFromHtml(sidebarPage('alpha', 't1'), SMALL_URL, SIDEBAR_IGNORE);
+    const kept = extractFromHtml(sidebarPage('alpha', 't1'), SMALL_URL);
+
+    expect(ignored.structure?.links?.map(link => link.url)).toEqual(['https://ex.test/nav', 'https://ex.test/t']);
+    expect(ignored.structure?.jsonLd).toEqual([{ '@type': 'Event', 'name': 'N' }]);
+    expect(kept.structure?.links?.map(link => link.url)).toContain('https://ex.test/other-alpha');
+    expect(kept.structure?.jsonLd).toHaveLength(2);
+  });
+
   it('returns the JSON-LD parsed, not re-stringified into the text', () => {
     const { structure } = extractFromHtml(DETAIL_HTML, DETAIL_URL);
 
@@ -434,6 +513,21 @@ describe('extractFromHtml, the structure it returns', () => {
 
     expect(structure).toEqual({});
   });
+
+  it('says when every JSON-LD block is also in the text, whole', () => {
+    const { structure } = extractFromHtml(SMALL_HTML, SMALL_URL);
+
+    expect(structure?.jsonLdInText).toBe(true);
+  });
+
+  it('does not claim the text carries the JSON-LD once the text section had to cut it', () => {
+    const block = `<script type="application/ld+json">{"@type":"Event","name":"Long","description":"${'z'.repeat(25_000)}"}</script>`;
+    const { content, structure } = extractFromHtml(`<html><head>${block}</head><body><main><p>Hello.</p></main></body></html>`, SMALL_URL);
+
+    expect(content).toContain('[structured data truncated]');
+    expect(structure?.jsonLd).toHaveLength(1);
+    expect(structure).not.toHaveProperty('jsonLdInText');
+  });
 });
 
 describe('pageMetadata, the blob that reaches the document row', () => {
@@ -449,6 +543,11 @@ describe('pageMetadata, the blob that reaches the document row', () => {
 
     expect(meta.jsonLd).toEqual([{ keep: 1 }, big]);
     expect(meta.truncated).toBe(true);
+  });
+
+  it('carries the in-text flag only alongside JSON-LD it kept', () => {
+    expect(pageMetadata({ jsonLd: [{ '@type': 'Event' }], jsonLdInText: true }).jsonLdInText).toBe(true);
+    expect(pageMetadata({ jsonLdInText: true })).toEqual({});
   });
 
   it('caps the block count too', () => {

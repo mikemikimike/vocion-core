@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-react';
 import { page, userEvent } from 'vitest/browser';
 import { AgentMessage } from './AgentMessage';
+// The phone-width test below is about CSS — the real stylesheet, not the component tree.
+import '@/styles/global.css';
 
 describe('AgentMessage inline citations', () => {
   it('renders [n] markers in the prose as tappable citations wired to the handler', async () => {
@@ -320,9 +322,276 @@ describe('the work sits where it happened (interleaved, not hoisted)', () => {
       />,
     );
 
-    const folded = page.getByRole('button', { name: /Worked it out · 2 steps/ });
+    const folded = page.getByRole('button', { name: /Looked up 3 deals and read the briefing · 2 steps/ });
 
     await expect.element(folded).toBeInTheDocument();
     expect(folded.element().compareDocumentPosition(page.getByText('Done.').element()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+// 2026-09-20: a transcript showed `<scratch> No engineering tasks on record.
+// Let me check knowledge / wiki … </scratch>` as body text, twice, between
+// tool-call rows, the second one cut mid-sentence. A block in a stored text
+// run is the model thinking; it folds to a muted line and never reads as prose.
+describe('a <scratch> block in a stored text run folds to "Thinking"', () => {
+  it('hides the block behind a disclosure and keeps the prose around it', async () => {
+    await render(
+      <AgentMessage
+        agentName="Northwind Lead"
+        message={{
+          role: 'assistant',
+          content: 'Checking.\n\n<scratch>No engineering tasks on record. Let me check knowledge / wiki.</scratch>\n\nFifteen runs, two still going.',
+          runs: [{ type: 'text', text: 'Checking.\n\n<scratch>No engineering tasks on record. Let me check knowledge / wiki.</scratch>\n\nFifteen runs, two still going.' }],
+        }}
+      />,
+    );
+
+    await expect.element(page.getByText('Checking.')).toBeInTheDocument();
+    await expect.element(page.getByText('Fifteen runs, two still going.')).toBeInTheDocument();
+    // Neither tag reaches the page, and the block's words stay folded.
+    expect(document.body.textContent).not.toContain('<scratch>');
+    expect(document.body.textContent).not.toContain('</scratch>');
+    expect(page.getByTestId('scratch-fold-body').query()).toBeNull();
+
+    const fold = page.getByRole('button', { name: 'Show thinking' });
+
+    await expect.element(fold).toBeInTheDocument();
+
+    await userEvent.click(fold);
+
+    await expect.element(page.getByTestId('scratch-fold-body')).toHaveTextContent('No engineering tasks on record. Let me check knowledge / wiki.');
+  });
+
+  it('folds a block the stream cut off before it closed', async () => {
+    await render(
+      <AgentMessage
+        agentName="Northwind Lead"
+        message={{
+          role: 'assistant',
+          content: 'No tasks on record.\n\n<scratch>Let me check knowledge / wiki for what was bui',
+          runs: [{ type: 'text', text: 'No tasks on record.\n\n<scratch>Let me check knowledge / wiki for what was bui' }],
+        }}
+      />,
+    );
+
+    await expect.element(page.getByText('No tasks on record.')).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('<scratch>');
+    // Folded: the line carries its first sentence as a preview, the way the
+    // trace's reasoning line does; the body itself stays closed.
+    await expect.element(page.getByTestId('scratch-fold')).toBeInTheDocument();
+    expect(page.getByTestId('scratch-fold-body').query()).toBeNull();
+    expect(page.getByText('what was bui').query()?.tagName).not.toBe('P');
+  });
+
+  it('renders a plain answer with no fold at all', async () => {
+    await render(
+      <AgentMessage
+        agentName="Northwind Lead"
+        message={{ role: 'assistant', content: 'Fifteen runs.', runs: [{ type: 'text', text: 'Fifteen runs.' }] }}
+      />,
+    );
+
+    await expect.element(page.getByText('Fifteen runs.')).toBeInTheDocument();
+    expect(page.getByTestId('scratch-fold').query()).toBeNull();
+  });
+
+  it('a turn that failed outright names itself and opens its reason', async () => {
+    // What Chris met on a phone: an empty bubble with a red chip reading
+    // "error failed" — the node's generic label glued to the word failed —
+    // and the reason a tap away with no hover to hint that there was one.
+    await render(
+      <AgentMessage
+        agentName="Send Lead"
+        conversationId={77}
+        timestamp={Date.parse('2026-09-22T18:07:00.000Z')}
+        message={{
+          id: 941,
+          role: 'assistant',
+          content: '',
+          runs: [],
+          trace: [{
+            id: 'n1',
+            actor: { id: 'lead', kind: 'lead' as const, name: 'Send Lead' },
+            kind: 'delegate' as const,
+            status: 'error' as const,
+            label: 'Error',
+            detail: 'no model credentials configured for this workspace',
+          }],
+        }}
+      />,
+    );
+
+    await expect.element(page.getByTestId('tool-error-badge')).toHaveTextContent('This turn failed');
+    // Open already: there is nothing else on screen to read.
+    await expect.element(page.getByTestId('tool-error-detail')).toHaveTextContent('no model credentials');
+  });
+});
+
+describe('AgentMessage — a turn that died part-way (#114)', () => {
+  it('says the answer is unfinished when the row is marked incomplete', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{
+          role: 'assistant',
+          content: 'Four deals closed last month, worth',
+          status: 'incomplete',
+          statusReason: 'the model connection dropped mid-answer',
+          runs: [{ type: 'text', text: 'Four deals closed last month, worth' }],
+        }}
+      />,
+    );
+
+    await expect.element(page.getByTestId('incomplete-turn-notice')).toBeInTheDocument();
+    await expect.element(page.getByText(/stopped partway/)).toBeInTheDocument();
+    // What went wrong, in the runtime's words, so a person can report it.
+    await expect.element(page.getByText(/connection dropped mid-answer/)).toBeInTheDocument();
+    // And no tool-error badge: nothing here was a failing tool.
+    expect(page.getByTestId('tool-error-badge').elements()).toHaveLength(0);
+  });
+
+  it('says nothing on a turn that finished, so a healthy answer carries no warning', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{
+          role: 'assistant',
+          content: 'Four deals closed last month.',
+          runs: [{ type: 'text', text: 'Four deals closed last month.' }],
+        }}
+      />,
+    );
+
+    await expect.element(page.getByText(/Four deals closed/)).toBeInTheDocument();
+    expect(page.getByTestId('incomplete-turn-notice').elements()).toHaveLength(0);
+  });
+
+  it('tells a person whose turn never ran that there is no answer above it', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{ role: 'assistant', content: '', status: 'failed', statusReason: 'the model refused the request' }}
+      />,
+    );
+
+    // "Stopped partway through" would be describing nothing — there is no text.
+    await expect.element(page.getByText(/did not run/)).toBeInTheDocument();
+    expect(page.getByText(/stopped partway/).elements()).toHaveLength(0);
+  });
+
+  it('tells a person whose workspace declined the turn that nothing is broken', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{
+          role: 'assistant',
+          content: '',
+          status: 'refused',
+          statusReason: 'Budget exceeded for "revenue-lead" (monthly: 5100/5000). Raise the cap under Budgets or wait for the next period.',
+        }}
+      />,
+    );
+
+    // A spent budget is not a fault, and "ask again" is useless advice for it.
+    await expect.element(page.getByText(/Nothing is broken/)).toBeInTheDocument();
+    await expect.element(page.getByText(/Raise the cap under Budgets/)).toBeInTheDocument();
+    expect(page.getByText(/Ask again for a complete one/).elements()).toHaveLength(0);
+  });
+
+  it('marks a stopped turn quietly, because the person chose where it ended', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{ role: 'assistant', content: 'Northwind renews in March and', status: 'stopped' }}
+      />,
+    );
+
+    await expect.element(page.getByTestId('turn-ending-marker')).toBeInTheDocument();
+    await expect.element(page.getByText(/You stopped this answer/)).toBeInTheDocument();
+    // Not a failure: no alarm-coloured notice over a turn that did what was asked.
+    expect(page.getByTestId('incomplete-turn-notice').elements()).toHaveLength(0);
+  });
+
+  it('says which message holds the rest, on the half that holds it', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{ role: 'assistant', content: '$1.4M across eleven deals.', status: 'continued' }}
+      />,
+    );
+
+    // Otherwise the second bubble reads as a new turn that started mid-sentence.
+    await expect.element(page.getByText(/the rest of the answer above/)).toBeInTheDocument();
+    expect(page.getByTestId('incomplete-turn-notice').elements()).toHaveLength(0);
+  });
+
+  it('does not say "not run" under the answer of a turn stopped partway by its budget', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{
+          role: 'assistant',
+          content: 'Northwind renews in March and',
+          status: 'refused',
+          statusReason: 'This turn stopped partway because it reached its budget.',
+        }}
+      />,
+    );
+
+    await expect.element(page.getByText(/This answer stopped before it finished/)).toBeInTheDocument();
+    expect(page.getByText(/This turn was not run/).elements()).toHaveLength(0);
+  });
+
+  it('labels a refusal\'s reason without calling it a fault', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{ role: 'assistant', content: '', status: 'refused', statusReason: 'Budget exceeded for "revenue-lead".' }}
+      />,
+    );
+
+    // The sentence above just said nothing is broken; "what went wrong" would
+    // take that straight back.
+    await expect.element(page.getByText(/Why:/)).toBeInTheDocument();
+    expect(page.getByText(/What went wrong/).elements()).toHaveLength(0);
+  });
+
+  it('says where the rest of a truncated answer went', async () => {
+    await render(
+      <AgentMessage
+        agentName="Revenue"
+        message={{ role: 'assistant', content: 'The pipeline stands at', status: 'truncated' }}
+      />,
+    );
+
+    await expect.element(page.getByText(/cut off at a time limit/)).toBeInTheDocument();
+    expect(page.getByTestId('incomplete-turn-notice').elements()).toHaveLength(0);
+  });
+});
+
+describe('agent prose fits a phone (backlog 023)', () => {
+  it('a wide table, an unbroken id and a long URL never widen the column past its box', async () => {
+    const wide = `| What | State | Owner | Cost | Risk | Since |\n|---|---|---|---|---|---|\n| Request #121 — Send/share from file detail | Triaged, recommended build, plan exists | Product manager | $18–30 | Email deliverability | 2026-09-22 |\n\nRun id: ${'a1b2c3d4'.repeat(30)}\n\nhttps://example.com/${'segment/'.repeat(40)}`;
+    const screen = await render(
+      <div style={{ width: 320 }} data-testid="phone-column">
+        <AgentMessage agentName="Product manager" message={{ role: 'assistant', content: wide, runs: [{ type: 'text', text: wide }] }} />
+      </div>,
+    );
+
+    await expect.element(page.getByText(/Run id:/)).toBeInTheDocument();
+
+    const column = screen.container.querySelector('[data-testid="phone-column"]') as HTMLElement;
+
+    // The column itself never grows; a table scrolls INSIDE its own box.
+    expect(column.scrollWidth).toBeLessThanOrEqual(column.clientWidth);
+
+    const hanging = Array.from(column.querySelectorAll('*')).filter((el) => {
+      const r = el.getBoundingClientRect();
+      const c = column.getBoundingClientRect();
+      // Cells inside a scrolling table are allowed past the edge; nothing else is.
+      return r.right > c.right + 1 && !el.closest('.overflow-x-auto');
+    });
+
+    expect(hanging.map(el => el.tagName)).toEqual([]);
   });
 });

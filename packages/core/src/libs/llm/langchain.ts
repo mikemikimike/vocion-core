@@ -18,7 +18,9 @@ import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { ChatOpenAI } from '@langchain/openai';
 import { bedrockRegion, resolveBedrockCredentials } from './bedrockCredentials';
+import { thinkingBudgetFor } from './modelPrefs';
 import { resolveOrgProviderKey } from './orgKey';
+import { CachingChatAnthropic, CachingChatBedrockConverse, promptCacheAllowed } from './promptCache';
 import { llmMode } from './replay';
 import { getReplayCache } from './replayCache';
 import { buildScriptedChatModel } from './scripted';
@@ -66,6 +68,18 @@ export function anthropicOmitsSampling(model: string): boolean {
  */
 export function anthropicAdaptiveThinking(model: string): boolean {
   return /claude-(?:sonnet-4-6|opus-4-[678]|sonnet-5|opus-5|fable-5|mythos-5)/.test(model);
+}
+
+/**
+ * Whether this Anthropic model thinks when a request leaves `thinking` out, and
+ * takes `{ type: 'disabled' }` to stop. On these models "no thinking field" is
+ * not "no thinking", so an `off` has to be sent. Fable 5 and Mythos 5 answer
+ * `disabled` with a 400 and are left out, as is anything newer than Opus 5
+ * until its behaviour is known.
+ * @param model - The model id, bare or Bedrock-decorated.
+ */
+export function anthropicThinksUnlessDisabled(model: string): boolean {
+  return /claude-(?:sonnet|opus)-5(?!-\d)/.test(model);
 }
 
 /**
@@ -161,7 +175,7 @@ function isLangChainProvider(value: string): value is LangChainProvider {
  * Returned values are normalised to lowercase.
  * @param role
  */
-function resolveProvider(role: ModelRole): LangChainProvider {
+export function resolveProvider(role: ModelRole): LangChainProvider {
   const roleSpecific = process.env[`VOCION_LLM_PROVIDER_${role.toUpperCase()}`];
   const fallback = process.env.VOCION_LLM_PROVIDER;
   const raw = (roleSpecific || fallback || 'anthropic').toLowerCase();
@@ -222,6 +236,16 @@ export function resolvedModelId(role: ModelRole): string {
 }
 
 /**
+ * The model id a role resolves to on a NAMED provider — the agent's vendor
+ * rather than the env's (`services/AgentService.ts` model preferences).
+ * @param role
+ * @param provider
+ */
+export function resolvedModelIdFor(role: ModelRole, provider: LangChainProvider): string {
+  return resolveModel(role, provider);
+}
+
+/**
  * Extended-thinking opt-in (Anthropic only).
  *
  * When `VOCION_THINKING_BUDGET` is set to a positive integer (tokens,
@@ -271,6 +295,15 @@ export type BuildChatModelOptions = {
   /** Cap on output tokens. Unset = the provider integration's default. */
   maxTokens?: number;
   /**
+   * Extended thinking for THIS model, chosen per conversation
+   * (`libs/llm/modelPrefs.ts`). Wins over `VOCION_THINKING_BUDGET`: `off`
+   * turns thinking off even when the env turns it on, and says so on models
+   * that think unless told not to; an effort sends its
+   * budget on budgeted models and adaptive thinking on models that size
+   * their own. Anthropic and Bedrock-Claude only; ignored elsewhere.
+   */
+  thinking?: 'off' | 'low' | 'medium' | 'high';
+  /**
    * Provider key to authenticate with. Wins over the env var, and is how an
    * org's own stored key reaches the model. Unset falls back to the server's
    * key, which is the right answer for any org that has not supplied one.
@@ -291,6 +324,19 @@ export type BuildChatModelOptions = {
    * `us-west-2`.
    */
   region?: string;
+  /**
+   * Ask the vendor to cache the prompt prefix on every call this model makes.
+   *
+   * On by default for Anthropic and Bedrock, which is what stops an agent loop
+   * paying full input price for the same system prompt, tool list and
+   * conversation history on every turn — see `./promptCache.ts` for the
+   * measured reason and for what silently does not cache. Pass `false` for an
+   * agent whose prompt must never sit in a vendor's cache; the whole process
+   * can be switched off with `VOCION_PROMPT_CACHE=0`.
+   *
+   * OpenAI ignores this: its caching is automatic and has no per-call switch.
+   */
+  promptCache?: boolean;
 };
 
 /**
@@ -320,6 +366,12 @@ export function buildChatModel(
   // provider below is constructed but never called.
   const mode = llmMode();
   const streaming = mode === 'live' ? (opts.streaming ?? true) : false;
+  // Caching is the default, and the class carrying it is chosen here because
+  // neither vendor integration takes the instruction at construction time.
+  // Replay mode builds a model it never calls, so the choice is moot there.
+  const caching = (opts.promptCache ?? true) && promptCacheAllowed();
+  const Anthropic = caching ? CachingChatAnthropic : ChatAnthropic;
+  const Bedrock = caching ? CachingChatBedrockConverse : ChatBedrockConverse;
 
   switch (provider) {
     case 'anthropic': {
@@ -327,7 +379,7 @@ export function buildChatModel(
       if (!apiKey) {
         throw new Error(`ANTHROPIC_API_KEY is not set; cannot construct chat model for role ${role}`);
       }
-      const thinkingBudget = resolveThinkingBudget(role);
+      const thinkingBudget = opts.thinking ? thinkingBudgetFor(opts.thinking) : resolveThinkingBudget(role);
       if (thinkingBudget !== null && anthropicAdaptiveThinking(model)) {
         // 4.6+: the switch is still VOCION_THINKING_BUDGET (set = on), but the
         // number is not sent — the model sizes its own thinking. No
@@ -335,7 +387,7 @@ export function buildChatModel(
         // value other than the default anyway. This branch was `enabled` +
         // `budget_tokens` + `temperature: 1` until 2026-09-15, all three of
         // which 4.7+ answer with a 400.
-        return withReplay(new ChatAnthropic({
+        return withReplay(new Anthropic({
           model,
           streaming,
           apiKey,
@@ -344,7 +396,7 @@ export function buildChatModel(
         }));
       }
       if (thinkingBudget !== null) {
-        return withReplay(new ChatAnthropic({
+        return withReplay(new Anthropic({
           model,
           // Pre-4.6: budgeted thinking requires temperature 1 — override the
           // deterministic default 0 ONLY on this opt-in path.
@@ -363,13 +415,14 @@ export function buildChatModel(
               : {}),
         }));
       }
-      return withReplay(new ChatAnthropic({
+      return withReplay(new Anthropic({
         model,
         // 4.6+/5-family models 400 on any sampling parameter — omit it.
         ...(anthropicOmitsSampling(model) ? {} : { temperature }),
         streaming,
         apiKey,
         ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
+        ...(opts.thinking === 'off' && anthropicThinksUnlessDisabled(model) ? { thinking: { type: 'disabled' as const } } : {}),
       }));
     }
     case 'openai': {
@@ -394,7 +447,7 @@ export function buildChatModel(
       // shared profile, or the host's instance role. Refusing here because one
       // named env var is empty would break every host that authenticates by
       // instance role, which is how the deployed path already works.
-      return withReplay(new ChatBedrockConverse({
+      return withReplay(new Bedrock({
         model,
         region: opts.region ?? bedrockRegion(),
         // Bedrock is a different transport to the same models, so it refuses
@@ -405,6 +458,9 @@ export function buildChatModel(
         streaming,
         ...(opts.awsCredentials ? { credentials: opts.awsCredentials } : {}),
         ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
+        ...(opts.thinking === 'off' && anthropicThinksUnlessDisabled(model)
+          ? { additionalModelRequestFields: { thinking: { type: 'disabled' } } }
+          : {}),
       }));
     }
   }
@@ -472,55 +528,16 @@ function withReplay<T extends BaseChatModel>(model: T): T {
 }
 
 /**
- * Anthropic prompt-caching helper.
+ * Prompt caching moved out of this file on 2026-09-22 (LARK-261).
  *
- * Marks the trailing message-content block as cacheable with the
- * ephemeral cache type. Anthropic's prompt cache keys on a hash of all
- * content up to and including the most-recently marked block, so the
- * common pattern is: mark the last shared block (system prompt, large
- * playbook injection, etc.) before any per-turn content.
+ * `withPromptCache(messages)` used to live here. It marked the LAST message's
+ * final text block as cacheable, which is the wrong end of the prompt: what
+ * repeats between calls is the system prompt, the tool list and the settled
+ * history, not the newest user message. It also had no call site, so nothing
+ * was ever cached by it.
  *
- * Usage:
- *   const msgs = withPromptCache([
- *     { role: 'system', content: largeSystemPrompt },
- *     ...userMessages,
- *   ]);
- *
- * The helper is a no-op for non-Anthropic models — the
- * `cache_control` field is ignored by other providers.
+ * Caching is now a property of the model rather than of a message array — see
+ * `./promptCache.ts`, and the `promptCache` option above — so every call made
+ * through the built model caches, including the calls the agent graph makes
+ * that this codebase never touches.
  */
-export type CacheableMessageContent
-  = | string
-    | Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }>;
-
-export type CacheableMessage = {
-  role: string;
-  content: CacheableMessageContent;
-};
-
-export function withPromptCache<T extends CacheableMessage>(messages: T[]): T[] {
-  if (messages.length === 0) {
-    return messages;
-  }
-  // Find the last message that has string or text-block content and
-  // mark its final text block as cacheable. Keep other messages
-  // untouched.
-  const last = messages[messages.length - 1];
-  if (!last) {
-    return messages;
-  }
-  const blocks: Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }>
-    = typeof last.content === 'string'
-      ? [{ type: 'text', text: last.content }]
-      : [...last.content];
-  if (blocks.length === 0) {
-    return messages;
-  }
-  const lastBlock = blocks[blocks.length - 1];
-  if (!lastBlock) {
-    return messages;
-  }
-  blocks[blocks.length - 1] = { ...lastBlock, cache_control: { type: 'ephemeral' } };
-  const updated = { ...last, content: blocks } as T;
-  return [...messages.slice(0, -1), updated];
-}

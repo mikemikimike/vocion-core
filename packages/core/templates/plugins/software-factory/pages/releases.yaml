@@ -1,0 +1,67 @@
+# Releases. What actually reached people, newest first.
+#
+# Buried under Activity: it has no nav row of its own, and is reached from
+# Activity and from Products. It now carries the announcement line the
+# Changelog used to show on a page of its own, so the public wording of every
+# release is still one place, beside the deploy that carried it.
+#
+# The row the Products board's "shipped this month" counts, and the row
+# `tell-the-requester` reads to close the loop. Written by the deploy (a
+# script or the engineer) over POST /api/v1/objects with the deploy's own key,
+# then the health result against the same row once the post-deploy check has
+# run.
+slug: releases
+title: Releases
+description: Every deploy that reached people, with product, version, what it carried, the announcement line the public reads, what the post-deploy check said, and who has been told.
+icon: rocket
+nav: {section: Software factory, order: 3}
+archetype: list
+source: {kind: objects, objectType: release}
+sort: {field: meta.releasedAt, dir: desc}
+groupBy: meta.product
+stats:
+  - {label: Releases, kind: count}
+  - {label: Major, kind: countWhere, where: {field: meta.sizeClass, op: eq, value: major}}
+  - {label: Patch, kind: countWhere, where: {field: meta.sizeClass, op: eq, value: patch}}
+  - {label: Unhealthy after, kind: countWhere, where: {field: meta.healthAfter, op: in, value: [down, degraded]}}
+  - {label: Health unknown, kind: countWhere, where: {field: meta.healthAfter, op: eq, value: unknown}}
+  - {label: Notes owned by a person, kind: countWhere, where: {field: meta.notesSource, op: eq, value: human}}
+# What production said, derived (`libs/workspace/releaseOutcome.ts`). The
+# derivation is where a release too young to judge reads "watching", one old
+# enough with nobody having looked reads "outcome not checked", and each
+# measure is stated against what it was BEFORE — because "share completion
+# 76%" says nothing and "91% → 76%" says the release broke something.
+derive: releaseOutcome
+primary:
+  field: title
+  subtitle: [version, size, outcome, measures, health, released, commit]
+fields:
+  - {key: title, label: Release}
+  - {key: version, label: Version, from: meta.version, format: mono}
+  - {key: size, label: Size, from: meta.sizeClass, format: badge, tones: {major: warn, minor: info, patch: muted}}
+  # Two different questions, and they are not the same one asked twice.
+  # `health` is the smoke test minutes after the swap: did the DEPLOY work.
+  # `outcome` is what production said once it had been live long enough to
+  # tell: did the CHANGE work. A release can be perfectly healthy and have
+  # cost fifteen points of a funnel.
+  - {key: health, label: Health after, from: meta.healthAfter, format: badge, tones: {ok: ok, degraded: warn, down: bad, unknown: muted}}
+  - {key: outcome, label: Outcome, from: meta.outcomeLine, format: badge, tones: {validated: ok, regressed: bad, inconclusive: muted, watching: info, outcome not checked: warn}}
+  - {key: measures, label: What moved, from: meta.outcomeMeasures}
+  - {key: released, label: Released, from: meta.releasedAt, format: date}
+  - {key: deploy, label: Deploy run, from: meta.deployRunUrl, format: link, priority: 3}
+  - {key: commit, label: Commit, from: meta.commitSha, format: mono}
+  # What the shipped tasks were expected to cost and what they cost, rolled up
+  # over `taskIds`; the total under each product is that product's spend on
+  # what actually reached people.
+  - {key: estimate, label: Estimated, from: meta.estimateCents, format: money, total: true, priority: 2}
+  - {key: actual, label: Actual, from: meta.actualCents, format: money, total: true, priority: 2}
+  - {key: notesBy, label: Notes by, from: meta.notesSource, format: badge, tones: {agent: info, human: ok}, priority: 3}
+  - {key: announced, label: Announced, from: meta.announcedAt, format: date, priority: 2}
+  # The line the public reads. This is what the Changelog page carried; it
+  # is a column here rather than a page of its own.
+  - {key: announcement, label: What shipped, from: meta.announcement}
+rowLink: /dashboard/objects/{id}
+# A product card opens THIS page as that product's work: `?product=send`
+# narrows every lane to Send and the page says so, with a way back.
+queryFilters:
+  - {param: product, field: meta.product, label: Product}

@@ -5,7 +5,8 @@ import type { KnowledgeDocumentDetail } from '@/services/SourceSyncService';
 import { and, asc, desc, eq } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { inspectDocument } from '@/libs/documents/sheets';
-import { artifactSchema, briefingSchema, conversationMessageSchema, conversationSchema, leadBriefSchema } from '@/models/Schema';
+import { canOpenArtifact } from '@/libs/share/audience';
+import { artifactSchema, briefingSchema, conversationMessageSchema, conversationSchema, leadBriefSchema, toolCallSchema, workerRunSchema } from '@/models/Schema';
 import { findDocumentForCitation } from './documentRef';
 import { registerPreview } from './registry';
 
@@ -24,12 +25,19 @@ import { registerPreview } from './registry';
 /** Long bodies are cut; the panel links to the page that holds the rest. */
 const BODY_LIMIT = 6000;
 
-function body(text: string | null | undefined): { body?: string; truncated?: boolean } {
+function body(text: string | null | undefined, limit = BODY_LIMIT): { body?: string; truncated?: boolean } {
   const t = (text ?? '').trim();
   if (!t) {
     return {};
   }
-  return t.length > BODY_LIMIT ? { body: `${t.slice(0, BODY_LIMIT)}…`, truncated: true } : { body: t };
+  return t.length > limit ? { body: `${t.slice(0, limit)}…`, truncated: true } : { body: t };
+}
+
+/** A thread or a run log is read to the end: a larger cap, the newest kept. */
+const LOG_LIMIT = 40_000;
+function tailBody(text: string): { body?: string; truncated?: boolean } {
+  const t = text.trim();
+  return t.length > LOG_LIMIT ? { body: `…${t.slice(-LOG_LIMIT)}`, truncated: true } : body(t, LOG_LIMIT);
 }
 
 function when(date: Date | null | undefined): string | null {
@@ -149,7 +157,46 @@ async function resolveCrmRecord(ref: RecordRef, ctx: { orgId: string; userId: st
 }
 
 registerPreview('deal', { sourceLabel: 'HubSpot', resolve: resolveCrmRecord });
-registerPreview('object', { sourceLabel: 'HubSpot', resolve: resolveCrmRecord });
+
+/**
+ * An `object` ref is a business object first — a data room, since 2026-09-18
+ * the record a chat turn most often makes — and a HubSpot record otherwise.
+ * The room's preview is its status, cast, sources and open items, with the
+ * room page one click away.
+ * @param ref
+ * @param ctx
+ * @param ctx.orgId
+ * @param ctx.userId
+ */
+async function resolveObject(ref: RecordRef, ctx: { orgId: string; userId: string | null }): Promise<PreviewDoc | null> {
+  if (/^\d+$/.test(ref.id)) {
+    const { exportDataRoom, getDataRoom, roomHref } = await import('@/services/DataRoomService');
+    const room = await getDataRoom(ctx.orgId, Number.parseInt(ref.id, 10));
+    if (room) {
+      const md = (await exportDataRoom(ctx.orgId, room.id)) ?? '';
+      const cut = md.length > 6000;
+      return {
+        ref,
+        title: room.title,
+        sourceLabel: 'Data room',
+        kind: 'data_room',
+        subtitle: room.meta.status ?? undefined,
+        facts: [
+          room.meta.stage ? { label: 'Stage', value: room.meta.stage } : null,
+          room.meta.client ? { label: 'Client', value: room.meta.client } : null,
+          { label: 'Sources', value: String(room.meta.sources?.length ?? 0) },
+          { label: 'Cast', value: String(room.meta.cast?.length ?? 0) },
+        ].filter((f): f is { label: string; value: string } => f !== null),
+        body: cut ? md.slice(0, 6000) : md,
+        href: roomHref(room.id),
+        ...(cut ? { truncated: true } : {}),
+      };
+    }
+  }
+  return resolveCrmRecord(ref, ctx);
+}
+
+registerPreview('object', { sourceLabel: 'HubSpot', resolve: resolveObject });
 
 /**
  * What to show in the panel for an artifact whose body is STRUCTURE rather
@@ -206,12 +253,17 @@ registerPreview('artifact', {
       return null;
     }
     const [row] = await db
-      .select({ id: artifactSchema.id, title: artifactSchema.title, kind: artifactSchema.kind, spec: artifactSchema.spec, url: artifactSchema.url, folder: artifactSchema.folder, version: artifactSchema.currentVersion, updatedAt: artifactSchema.updatedAt, author: artifactSchema.lastAuthorId })
+      .select({ id: artifactSchema.id, title: artifactSchema.title, kind: artifactSchema.kind, spec: artifactSchema.spec, url: artifactSchema.url, folder: artifactSchema.folder, version: artifactSchema.currentVersion, updatedAt: artifactSchema.updatedAt, author: artifactSchema.lastAuthorId, shareAudience: artifactSchema.shareAudience, shareOwnerId: artifactSchema.shareOwnerId })
       .from(artifactSchema)
       .where(and(eq(artifactSchema.orgId, ctx.orgId), eq(artifactSchema.id, id)))
       .limit(1);
     if (!row) {
       return null;
+    }
+    // Shared with its owner only: the title is a fact of the workspace, the
+    // body is not (`libs/share/audience.ts`).
+    if (!canOpenArtifact({ audience: row.shareAudience, ownerId: row.shareOwnerId ?? null }, { userId: ctx.userId, isMember: true, hasToken: false })) {
+      return { ref, title: row.title, sourceLabel: 'Artifact', kind: row.kind, unresolved: { reason: 'Shared with its owner only. Ask them to widen the audience.', reference: `artifact ${row.id}` } };
     }
     const spec = row.spec as Record<string, unknown>;
     // `md` FIRST, because that is what every markdown artifact actually
@@ -228,6 +280,7 @@ registerPreview('artifact', {
       ref,
       title: row.title,
       sourceLabel: 'Artifact',
+      kind: row.kind,
       subtitle: row.folder ?? undefined,
       facts: facts(
         { label: 'Kind', value: row.kind },
@@ -288,11 +341,20 @@ registerPreview('conversation', {
       return null;
     }
     const messages = await db
-      .select({ role: conversationMessageSchema.role, content: conversationMessageSchema.content })
+      .select({ role: conversationMessageSchema.role, content: conversationMessageSchema.content, at: conversationMessageSchema.createdAt })
       .from(conversationMessageSchema)
       .where(eq(conversationMessageSchema.conversationId, id))
       .orderBy(asc(conversationMessageSchema.id))
-      .limit(12);
+      .limit(40);
+    // THE AGENT'S WORK, not just its words: every tool call in the thread,
+    // placed before the reply it led to, with whether it failed (Chris,
+    // 2026-09-25: "I want to see log history for agent runs").
+    const calls = await db
+      .select({ tool: toolCallSchema.tool, error: toolCallSchema.error, ms: toolCallSchema.durationMs, at: toolCallSchema.createdAt })
+      .from(toolCallSchema)
+      .where(and(eq(toolCallSchema.orgId, ctx.orgId), eq(toolCallSchema.conversationId, id)))
+      .orderBy(asc(toolCallSchema.createdAt))
+      .limit(200);
     return {
       ref,
       title: row.title,
@@ -303,7 +365,58 @@ registerPreview('conversation', {
         row.createdBy && { label: 'Started by', value: row.createdBy },
         { label: 'Started', value: when(row.createdAt) ?? '' },
       ),
-      ...body(messages.map(m => `**${m.role}**\n\n${m.content}`).join('\n\n')),
+      ...body(messages.map((m, i) => {
+        const since = i === 0 ? null : messages[i - 1]!.at;
+        const steps = m.role === 'assistant'
+          ? calls.filter(c => c.at <= m.at && (since === null || c.at > since))
+          : [];
+        const log = steps.length > 0
+          ? `${steps.map(c => `- \`${c.tool}\`${c.error ? ' — failed' : ''}${c.ms ? ` · ${(c.ms / 1000).toFixed(1)}s` : ''}`).join('\n')}\n\n`
+          : '';
+        return `**${m.role}** · ${when(m.at) ?? ''}\n\n${log}${m.content}`;
+      }).join('\n\n---\n\n'), LOG_LIMIT),
+    };
+  },
+});
+
+registerPreview('worker_run', {
+  sourceLabel: 'Engineering run',
+  resolve: async (ref, ctx) => {
+    const id = Number.parseInt(ref.id, 10);
+    if (!Number.isSafeInteger(id)) {
+      return null;
+    }
+    const [run] = await db.select().from(workerRunSchema).where(and(eq(workerRunSchema.orgId, ctx.orgId), eq(workerRunSchema.id, id))).limit(1);
+    if (!run) {
+      return null;
+    }
+    const progress = (run.progress ?? {}) as Record<string, unknown>;
+    const logLines = Array.isArray(progress.log) ? (progress.log as unknown[]).map(String) : typeof progress.log === 'string' ? progress.log.split('\n') : [];
+    const failures = Array.isArray(run.failures) ? (run.failures as Array<{ scope?: string; message?: string }>) : [];
+    const input = (run.input ?? {}) as { task?: { task_id?: string; objective?: string; repo?: string } };
+    const text = [
+      input.task?.objective ? `**Objective** — ${input.task.objective}` : null,
+      run.summary ? `**Summary**\n\n${run.summary}` : null,
+      run.error ? `**Error** — ${run.error}` : null,
+      failures.length > 0 ? `**Failures**\n\n${failures.map(f => `- ${f.scope ?? 'run'}: ${f.message ?? ''}`).join('\n')}` : null,
+      typeof progress.step === 'string' ? `**Last step** — ${progress.step}` : null,
+      logLines.length > 0 ? `**Log (last ${Math.min(logLines.length, 80)} lines)**\n\n\`\`\`\n${logLines.slice(-80).join('\n')}\n\`\`\`` : null,
+    ].filter(Boolean).join('\n\n');
+    return {
+      ref,
+      title: input.task?.task_id ?? `Engineering run ${run.id}`,
+      sourceLabel: 'Engineering run',
+      facts: facts(
+        { label: 'Status', value: run.status },
+        { label: 'Agent', value: run.agentSlug },
+        run.model && { label: 'Model', value: run.model },
+        typeof run.cents === 'number' && { label: 'Cost', value: `$${(run.cents / 100).toFixed(2)}` },
+        { label: 'Queued', value: when(run.createdAt) ?? '' },
+        run.claimedAt && { label: 'Started', value: when(run.claimedAt) ?? '' },
+        run.completedAt && { label: 'Ended', value: when(run.completedAt) ?? '' },
+        input.task?.repo && { label: 'Repo', value: input.task.repo },
+      ),
+      ...tailBody(text || 'This run has reported nothing yet.'),
     };
   },
 });

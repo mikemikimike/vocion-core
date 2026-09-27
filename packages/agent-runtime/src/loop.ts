@@ -17,6 +17,7 @@ import { loadHistory, memoryEnabled, retrieveLongTerm, saveTurn } from './memory
 import { createMemoryDigestMiddleware } from './memoryDigest.js';
 import { buildChatModel } from './model.js';
 import { readOnlyBackend } from './readOnlyBackend.js';
+import { stepLimitStreamConfig, turnFailureMessage } from './stepLimit.js';
 import { sessionIdFor, withSession } from './telemetry.js';
 import { buildTransportTools } from './tools.js';
 import { createRuntimeTrace } from './tracing.js';
@@ -158,6 +159,10 @@ async function getGraph(req: InvocationRequest): Promise<GraphEntry> {
     model: req.agent.model,
     temperature: req.agent.temperature,
     maxTokens: req.agent.maxTokens,
+    // Spread rather than passed straight through: `buildChatModel` defaults it
+    // to on, and an absent field in the request means "core said nothing",
+    // which has to stay distinguishable from an explicit false.
+    ...(req.agent.promptCache !== undefined ? { promptCache: req.agent.promptCache } : {}),
     readAwsSession: () => currentInvocationContext().awsSession,
   });
 
@@ -212,10 +217,15 @@ async function getGraph(req: InvocationRequest): Promise<GraphEntry> {
  * @param req - The invocation payload: agent definition, message, tool spec,
  * and this caller's temporary Bedrock session.
  * @param emit - Where this turn's events go. Belongs to this caller alone.
+ * @param signal - Aborts the turn: the server fires it when the caller hangs
+ * up, which is how vocion-core stops a turn that reached its budget (#272).
+ * Without it the loop would go on calling the model with nobody left to
+ * charge the spend to.
  */
 export async function runInvocation(
   req: InvocationRequest,
   emit: (event: AgentEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const context: InvocationContext = {
     emit,
@@ -223,12 +233,13 @@ export async function runInvocation(
     toolEndpoint: req.tools.endpoint,
     toolClaim: req.tools.claim,
   };
-  return invocationContext.run(context, () => withSession(sessionIdFor(req), () => runTurn(req, emit)));
+  return invocationContext.run(context, () => withSession(sessionIdFor(req), () => runTurn(req, emit, signal)));
 }
 
 async function runTurn(
   req: InvocationRequest,
   emit: (event: AgentEvent) => void,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   const entry = await getGraph(req);
 
@@ -299,6 +310,8 @@ async function runTurn(
     const run = await entry.graph.streamEvents(input as never, {
       version: 'v3',
       callbacks: [trace.handler],
+      signal,
+      ...stepLimitStreamConfig(req.agent.maxSteps),
     } as never);
 
     await Promise.all([
@@ -366,7 +379,7 @@ async function runTurn(
 
     await run.output;
   } catch (err) {
-    const message = (err as Error).message ?? 'agent run failed';
+    const message = turnFailureMessage(err, req.agent.maxSteps);
     emit({ type: 'error', message });
     await trace.end({ error: message });
     throw err;

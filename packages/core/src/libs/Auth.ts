@@ -1,14 +1,14 @@
 import type { DefaultSession } from 'next-auth';
+import type { WorkspaceRole } from '@/services/authz';
 import { DrizzleAdapter } from '@auth/drizzle-adapter';
 import bcrypt from 'bcrypt';
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import NextAuth from 'next-auth';
 import Credentials from 'next-auth/providers/credentials';
-import { cookies } from 'next/headers';
 import { z } from 'zod';
-import { accountMembershipSchema, authAccountSchema, projectSchema, sessionSchema, userSchema, verificationTokenSchema } from '@/models/Schema';
-import { ACTIVE_PROJECT_COOKIE } from './activeProject';
+import { authAccountSchema, sessionSchema, userSchema, verificationTokenSchema } from '@/models/Schema';
 import { db } from './DB';
+import { resolveTenancyForUser } from './tenancy';
 
 /**
  * auth.js (next-auth v5) configuration. This is the default auth backend
@@ -16,11 +16,11 @@ import { db } from './DB';
  * (toggled via VOCION_AUTH_PROVIDER=clerk; not yet wired in this commit).
  *
  * Tenancy: every session carries a `projectId` — the currently-active
- * project for that user. For self-hosted "team mode" (1 tenant_account)
- * we pick the user's first project on sign-in. Switching projects flips
- * a `vocion_active_project` cookie that the JWT callback honors on next
- * issue. The cookie is written by the `/w/[workspace]` entry route (and the
- * sidebar switcher, which navigates through it) — see `libs/activeProject.ts`.
+ * project for that user. The canonical URL decides it (`/w/<slug>/…`,
+ * resolved by `src/proxy.ts` and forwarded as a request header); the
+ * `vocion_active_project` cookie is the fallback for a bare `/dashboard/…`
+ * URL and for the first project picked at sign-in. See
+ * `resolveTenancyForUser` below and `libs/activeProject.ts`.
  */
 
 const credentialsSchema = z.object({
@@ -36,6 +36,13 @@ declare module 'next-auth' {
       accountId: string | null;
       projectId: string | null;
       role: 'admin' | 'member' | null;
+      /**
+       * The role held IN `projectId`, which is what `services/authz.ts` turns
+       * into grants. Distinct from `role` above, which is account-wide. Null
+       * when there is no active project, or when enforcement is off and the
+       * account role still stands in for it.
+       */
+      workspaceRole: WorkspaceRole | null;
     };
   }
 }
@@ -47,6 +54,7 @@ declare module '@auth/core/jwt' {
     accountId?: string | null;
     projectId?: string | null;
     role?: 'admin' | 'member' | null;
+    workspaceRole?: WorkspaceRole | null;
   }
 }
 
@@ -98,6 +106,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         token.accountId = tenancy.accountId;
         token.projectId = tenancy.projectId;
         token.role = tenancy.role;
+        token.workspaceRole = tenancy.workspaceRole;
         // Sign-in is the one moment JWT auth becomes observable server-side —
         // record it for the adoption stream. Fire-and-forget; never blocks auth.
         if (tenancy.projectId) {
@@ -116,6 +125,7 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         token.accountId = tenancy.accountId;
         token.projectId = tenancy.projectId;
         token.role = tenancy.role;
+        token.workspaceRole = tenancy.workspaceRole;
       }
       return token;
     },
@@ -130,80 +140,17 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
         session.user.accountId = tenancy.accountId;
         session.user.projectId = tenancy.projectId;
         session.user.role = tenancy.role;
+        session.user.workspaceRole = tenancy.workspaceRole;
       } else {
         session.user.accountId = null;
         session.user.projectId = null;
         session.user.role = null;
+        session.user.workspaceRole = null;
       }
       return session;
     },
   },
 });
-
-/**
- * Find the user's current tenant + active project. Self-hosted: each
- * user belongs to exactly one tenant_account; the active project is
- * whichever the `vocion_active_project` cookie names (if the user has
- * access to it), else the first project on the account.
- * @param userId
- */
-async function resolveTenancyForUser(userId: string): Promise<{
-  accountId: string | null;
-  projectId: string | null;
-  role: 'admin' | 'member' | null;
-}> {
-  const [membership] = await db
-    .select({
-      accountId: accountMembershipSchema.accountId,
-      role: accountMembershipSchema.role,
-    })
-    .from(accountMembershipSchema)
-    .where(eq(accountMembershipSchema.userId, userId))
-    .limit(1);
-
-  if (!membership) {
-    return { accountId: null, projectId: null, role: null };
-  }
-
-  // Honor `vocion_active_project` cookie when the named project belongs to
-  // the user's account. `cookies()` is available in both Route Handlers and
-  // Server Actions — the JWT callback runs in one of those contexts.
-  let requestedId: string | undefined;
-  try {
-    const jar = await cookies();
-    requestedId = jar.get(ACTIVE_PROJECT_COOKIE)?.value;
-  } catch {
-    // cookies() throws when called outside a request scope; fall through
-    // to the default first-project selection.
-  }
-
-  if (requestedId) {
-    const [chosen] = await db
-      .select({ id: projectSchema.id })
-      .from(projectSchema)
-      .where(and(eq(projectSchema.id, requestedId), eq(projectSchema.accountId, membership.accountId)))
-      .limit(1);
-    if (chosen) {
-      return {
-        accountId: membership.accountId,
-        projectId: chosen.id,
-        role: membership.role as 'admin' | 'member',
-      };
-    }
-  }
-
-  const [proj] = await db
-    .select({ id: projectSchema.id })
-    .from(projectSchema)
-    .where(eq(projectSchema.accountId, membership.accountId))
-    .limit(1);
-
-  return {
-    accountId: membership.accountId,
-    projectId: proj?.id ?? null,
-    role: membership.role as 'admin' | 'member',
-  };
-}
 
 /**
  * Hash a password with bcrypt. Used by /api/setup, /api/team/invite/accept,
@@ -228,6 +175,8 @@ export async function clerkAuth(): Promise<{
   accountId: string | null;
   projectId: string | null;
   role: 'admin' | 'member' | null;
+  /** The role held in `projectId`, resolved per request. */
+  workspaceRole: WorkspaceRole | null;
   has: (args: { role: string }) => boolean;
 }> {
   const session = await auth();
@@ -238,6 +187,7 @@ export async function clerkAuth(): Promise<{
     accountId: session?.user?.accountId ?? null,
     projectId: session?.user?.projectId ?? null,
     role,
+    workspaceRole: session?.user?.workspaceRole ?? null,
     has: ({ role: required }) => {
       if (!role) {
         return false;

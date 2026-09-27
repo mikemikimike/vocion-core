@@ -1,6 +1,6 @@
 /**
- * The `candidate-extractor` model stage: one bounded model call per changed
- * document, then a deterministic pipeline over what it returned.
+ * The `candidate-extractor` model stage: one bounded model call per changed or
+ * retried document, then a deterministic pipeline over what it returned.
  *
  *   known cards (once per sync) ─┐
  *   adopted rules (once per sync)─┼─> prompt ─> ONE model call ─> records
@@ -28,12 +28,14 @@ import type { DocumentProcessor, ProcessorResult } from '../types';
 import type { CandidateExtractorConfig } from './config';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { pushScore } from '@/libs/Langfuse';
+import { keepIdentity, loadDocumentCards } from './identity';
 import { loadKnownCards } from './knownCards';
 import { labelRecords } from './labels';
 import { renderLearnings } from './learnings';
-import { extractRecords } from './model';
+import { extractRecords, SKIP_OUTCOME } from './model';
+import { oncePerSync } from './oncePerSync';
 import { buildExtractionPrompt } from './prompt';
-import { proposeRecords } from './propose';
+import { PROPOSAL_CAP_HIT_NOTE, proposeRecords } from './propose';
 import { proposeRelatedObjects, resolveRecords } from './resolve';
 import { calendarToday, validateRecords } from './validate';
 
@@ -96,37 +98,34 @@ async function learningStepsFor(orgId: string, config: CandidateExtractorConfig)
   }
 }
 
-/**
- * Anything cached for the length of one sync, keyed on the object type.
- * @param cache - The sync-wide cache from the processor context.
- * @param key - Cache key.
- * @param build - Builds the value on a miss.
- */
-async function oncePerSync<T>(cache: Map<string, unknown>, key: string, build: () => Promise<T>): Promise<T> {
-  const cached = cache.get(key);
-  if (cached !== undefined) {
-    return cached as T;
-  }
-  const value = await build();
-  cache.set(key, value);
-  return value;
-}
-
 export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResult> => {
   const config = ctx.config as CandidateExtractorConfig;
   const counts: Record<string, number> = {};
   const notes: string[] = [];
+
+  // Nothing it found could be proposed, so a model call now would be spent for nothing.
+  if (ctx.budget.spent.maxProposalsPerSync >= ctx.budget.caps.maxProposalsPerSync) {
+    return { produced: 0, skipped: 1, notes: [PROPOSAL_CAP_HIT_NOTE], counts, retry: { reason: PROPOSAL_CAP_HIT_NOTE, countsAsTry: false } };
+  }
   const today = calendarToday(config.timezone);
 
-  const metadata = (ctx.document.metadata ?? {}) as { jsonLd?: unknown[]; links?: PageLink[]; publishedUrls?: string[] };
+  const metadata = (ctx.document.metadata ?? {}) as {
+    jsonLd?: unknown[];
+    jsonLdInText?: boolean;
+    links?: PageLink[];
+    publishedUrls?: string[];
+    ogImage?: string;
+    feedUrl?: string;
+  };
   const jsonLdBlocks = metadata.jsonLd ?? [];
 
-  const [known, rules, objectSchema] = await Promise.all([
+  const [known, rules, objectSchema, documentCards] = await Promise.all([
     loadKnownCards({ orgId: ctx.orgId, config, syncContext: ctx.syncContext, today }),
     oncePerSync(ctx.syncContext.cache, `rules:${config.agentSlug}`, async () =>
       renderLearnings(ctx.orgId, await learningStepsFor(ctx.orgId, config))),
     oncePerSync(ctx.syncContext.cache, `schema:${config.objectType}`, () =>
       loadObjectSchema(ctx.orgId, config.objectType)),
+    loadDocumentCards({ orgId: ctx.orgId, sourceSlug: ctx.sourceSlug, config, syncContext: ctx.syncContext }),
   ]);
   if (rules.failedSteps.length > 0) {
     notes.push(`learning steps that could not be read: ${rules.failedSteps.join(', ')}`);
@@ -136,9 +135,11 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     config,
     rules: rules.text,
     known: known.text,
-    jsonLd: jsonLdBlocks.length > 0 ? JSON.stringify(jsonLdBlocks) : '',
+    // Sent on its own only when the page text does not already carry it whole.
+    jsonLd: jsonLdBlocks.length > 0 && metadata.jsonLdInText !== true ? JSON.stringify(jsonLdBlocks) : '',
     pageText: ctx.document.content,
     uri: ctx.document.uri,
+    ogImage: metadata.ogImage,
     maxInputTokens: ctx.budget.caps.maxInputTokensPerCall,
   });
   if (prompt.trimmed.length > 0) {
@@ -164,9 +165,12 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
   if (extraction.status === 'skipped') {
     counts[extraction.reason] = (counts[extraction.reason] ?? 0) + 1;
     pushScore({ traceId: extraction.traceId, name: 'extraction-ok', value: 0 });
-    ctx.onProgress({ kind: 'skipped', uri: ctx.document.uri, message: `extraction skipped: ${extraction.reason}` });
-    notes.push(`extraction skipped: ${extraction.reason}${extraction.detail ? ` (${extraction.detail})` : ''}`);
-    return { produced: 0, skipped: 1, notes, counts };
+    const skipMessage = `extraction skipped: ${extraction.reason}${extraction.detail ? ` (${extraction.detail})` : ''}`;
+    ctx.onProgress({ kind: 'skipped', uri: ctx.document.uri, message: skipMessage });
+    notes.push(skipMessage);
+    const outcome = SKIP_OUTCOME[extraction.reason];
+    const retry = outcome === 'finished' ? undefined : { reason: skipMessage, countsAsTry: outcome === 'retry' };
+    return { produced: 0, skipped: 1, notes, counts, ...(retry ? { retry } : {}) };
   }
 
   counts.found = extraction.records.length;
@@ -178,8 +182,18 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     links: metadata.links,
     jsonLd: jsonLdBlocks,
     publishedUrls: metadata.publishedUrls,
+    // The feed a split entry came from, and only that. An ICS event travels,
+    // so its feed is not reliably its base (see `splitIcs`), and an HTML page
+    // already resolves its own links in the connector.
+    baseUrl: metadata.feedUrl,
+    // The document's own image, declared to the gate so a model that returned
+    // it is believed. The same value is stated in the prompt above, because
+    // the connector keeps it out of `content`: that text is hashed to decide
+    // the document changed, and a dated image URL would change it daily.
+    ogImage: metadata.ogImage,
     knownIds: known.ids,
     today,
+    rules: rules.rules,
   });
   merge(counts, validated.counts);
   notes.push(...validated.notes);
@@ -191,6 +205,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     syncContext: ctx.syncContext,
   });
   merge(counts, resolved.counts);
+  merge(counts, keepIdentity({ config, records: validated.records, stored: documentCards.get(ctx.document.externalId) ?? [] }));
 
   merge(counts, await proposeRelatedObjects({
     orgId: ctx.orgId,
@@ -225,5 +240,6 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
   // Langfuse without reading the counters.
   pushScore({ traceId: extraction.traceId, name: 'extraction-ok', value: produced > 0 ? 1 : 0 });
 
-  return { produced, skipped: Math.max(0, skipped), notes, counts };
+  const retry = proposed.proposalCapHit ? { reason: PROPOSAL_CAP_HIT_NOTE, countsAsTry: true } : undefined;
+  return { produced, skipped: Math.max(0, skipped), notes, counts, ...(retry ? { retry } : {}) };
 };

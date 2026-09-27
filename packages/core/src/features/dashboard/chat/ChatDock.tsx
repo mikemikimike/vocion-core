@@ -2,7 +2,7 @@
 
 import type { AgentSurfaceRequest } from './agentSurface';
 import type { AgentOption } from './types';
-import type { ReviewCardRun } from '@/features/review/ReviewActionCard';
+import type { ReviewCardRun } from '@/features/review/ReviewSurface';
 import type { PageContext } from '@/services/chat/pageContext';
 import { MessageSquare, PanelRightClose, X } from 'lucide-react';
 import { useTranslations } from 'next-intl';
@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useViewportBelow } from '@/components/ui/useMobile';
 import { CommentChips } from '@/features/comments/AnchoredComments';
 import { useCommentLayer } from '@/features/comments/CommentLayer';
 import { usePageRecord } from '@/features/dashboard/context/PageContextProvider';
@@ -17,18 +18,20 @@ import { contentIdForAsk } from '@/features/personalization/guidedFlow';
 import { useGuidedReview } from '@/features/personalization/GuidedReview';
 import { GuidedReviewPanel } from '@/features/personalization/GuidedReviewPanel';
 import { SequencePointer } from '@/features/personalization/SequencePointer';
+import { client } from '@/libs/Orpc';
 import { pageShowsRecord, scopeRefToRecord } from '@/services/chat/pageContext';
 import { AGENT_SURFACE_EVENT, agentSurfaceRequestOf, focusAgentComposer } from './agentSurface';
-import { AutonomyControl } from './AutonomyControl';
+import { AUTONOMY_SETTING_ID, autonomyFromOption, autonomyMenuSetting } from './autonomyOptions';
+import { CardDecisionProvider } from './cards/CardDecisions';
 import { ChatComposer } from './ChatComposer';
-import { ChatMenu } from './ChatMenu';
+import { ChatHeaderActions } from './ChatHeaderActions';
 import { useComposerQueueProps } from './composerQueue';
 import { hasChangeIntent } from './composerTags';
 import { RAIL_SET_EVENT } from './dockState';
 import { EmptyState, NoAgentsState } from './EmptyState';
-import { HistoryPopover } from './HistoryPopover';
 import { HitlGate } from './HitlGate';
 import { MessageList } from './MessageList';
+import { ModelControl } from './ModelControl';
 import { RailColumn } from './RailColumn';
 import {
   clampRailWidth,
@@ -44,7 +47,13 @@ import {
 } from './railState';
 import { hasWorkspaceAgents, parseSearchCommand } from './routing';
 import { useComposerTags } from './tagSearch';
+import { transcriptOf } from './transcript';
+import { useChatCommands } from './useChatCommands';
 import { useChatSession } from './useChatSession';
+
+function isPhoneViewport(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches;
+}
 
 export type ChatDockProps = {
   /** Agents available to pick from — server-loaded, same list every chat surface uses. Empty array renders nothing. */
@@ -132,18 +141,12 @@ const EMPTY_RUN = {
 /**
  * Whether the viewport is too narrow for a side-by-side rail — below the
  * breakpoint the rail covers the page as a sheet instead of narrowing it.
+ *
+ * One hook (`components/ui/useMobile`) answers this for every surface that
+ * asks; this names the rail's own breakpoint and nothing else.
  */
 function useNarrowViewport(): boolean {
-  const [narrow, setNarrow] = useState(false);
-  useEffect(() => {
-    const mql = window.matchMedia(`(max-width: ${RAIL_SHEET_BREAKPOINT - 1}px)`);
-    const onChange = () => setNarrow(mql.matches);
-    // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks-extra/no-direct-set-state-in-use-effect
-    setNarrow(mql.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return narrow;
+  return useViewportBelow(RAIL_SHEET_BREAKPOINT);
 }
 
 /**
@@ -277,7 +280,17 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     };
   }, [pageContext, intent, recordDismissed]);
   const session = useChatSession({ agents, scopeRef, pageContext: effectiveContext, resumeConversationId });
+  // A card's decision becomes a typed user turn in THIS conversation (backlog 025).
+  const recordCardDecision = useCallback((d: { cardId: string; label: string; action: 'approve' | 'reject' | 'defer' | 'undo'; runId?: number }) => {
+    if (session.conversationId === null) {
+      return;
+    }
+    void client.conversations.recordCardDecision({ id: session.conversationId, ...d }).catch((err: unknown) => {
+      console.warn('card decision was not written to the conversation', err);
+    });
+  }, [session.conversationId]);
   const queueProps = useComposerQueueProps(session);
+  const onCommand = useChatCommands(session.handleNewChat);
   // The rail IS on a page, so `(+)` offers `@page` and the record in view
   // beside `@artifact` — the same list `@` resolves against. `@change` joins
   // it only where a sequence draft is in view, which is exactly where the
@@ -335,6 +348,10 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     function onRequest(e: Event) {
       e.preventDefault();
       const req = agentSurfaceRequestOf(e);
+      // ⌘⇧O / `/new` / the palette: start over in this rail, then open it.
+      if (req.newChat) {
+        sessionRef.current.handleNewChat();
+      }
       // A toggle request with nothing to apply closes an open rail, so the
       // titlebar control is one button that both opens and collapses. A
       // request carrying intent always opens — someone asking about a record
@@ -414,8 +431,11 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
   // One-time read of client-only values (localStorage, viewport) on mount; it
   // cannot happen during render because it would mismatch the server render.
   useEffect(() => {
+    // ON A PHONE THE CHAT IS A SHEET OVER THE PAGE, so it never reopens on its
+    // own (2026-09-26: a feature page opened under a half-screen chat that
+    // hid its title and pictures, because the rail was left open last time).
     // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks-extra/no-direct-set-state-in-use-effect
-    setCollapsed(readCollapsed(startCollapsed));
+    setCollapsed(isPhoneViewport() ? true : readCollapsed(startCollapsed));
     const stored = readStoredRailWidth();
     // eslint-disable-next-line react-hooks-extra/no-direct-set-state-in-use-effect
     setWidth(clampRailWidth(stored ?? defaultRailWidth(window.innerWidth), window.innerWidth));
@@ -440,7 +460,7 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     } catch {
       /* storage unavailable */
     }
-    if (storedCollapse === null && typeof railState.railOpen === 'boolean') {
+    if (storedCollapse === null && typeof railState.railOpen === 'boolean' && !isPhoneViewport()) {
       // eslint-disable-next-line react-hooks-extra/no-direct-set-state-in-use-effect
       setCollapsed(!railState.railOpen);
     }
@@ -549,6 +569,25 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
       ? [{ key: 'pointer', afterIndex: -1, node: <SequencePointer run={run} guided={guided} /> }]
       : [];
 
+  // The approval gate joins the transcript blocks instead of sitting above the
+  // composer (Chris, 2026-09-24: "show inline instead of sticky to the compose
+  // bar"). It goes last so a guided card and a gate raised in the same turn
+  // read in the order they happened.
+  const blocks = session.pendingHitl
+    ? [...cardBlocks, {
+        key: 'hitl-gate',
+        afterIndex: session.messages.length,
+        node: (
+          <HitlGate
+            gate={session.pendingHitl}
+            onApprove={session.handleApproveHitl}
+            onReject={session.handleRejectHitl}
+            disabled={session.isStreaming}
+          />
+        ),
+      }]
+    : cardBlocks;
+
   const autonomyCopy = {
     ask: t('autonomy_ask'),
     act: t('autonomy_act'),
@@ -569,22 +608,18 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
 
   const body = (
     <>
-      {/* ONE hairline-separated row, 48px tall (2026-09-15): the workspace
-          mark + its name as the title, then four equal 32px ghost controls —
-          history, the autonomy rung, the ⋯ menu, collapse. The underlined
-          "All conversations" link that used to sit under the title read as an
-          error; it is a row in the ⋯ menu now, and the history icon carries
-          the job it was doing. */}
+      {/* ONE hairline-separated row, 48px tall: "Chat" with the bubble as the
+          title, then 32px ghost controls — New chat, the conversations
+          dropdown (All conversations is its last row), collapse; the ⋯ menu
+          only in the phone sheet. The autonomy rung moved into the input bar
+          beside the model control on 2026-09-18. */}
       {/* In the sheet the close control is absolutely positioned in this
           corner, so the row keeps clear of it rather than stacking under it. */}
       <div className={`flex h-12 shrink-0 items-center gap-1 border-b border-border pl-3 ${narrow ? 'pr-11' : 'pr-1.5'}`}>
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          {!scopeRef && (
-            <span aria-hidden className="grid size-6 shrink-0 place-items-center rounded-md bg-brand-amber-tint text-[11px] font-semibold text-brand-amber-deep">
-              {headerName.slice(0, 1).toUpperCase()}
-            </span>
-          )}
-          <span className="truncate text-sm font-semibold">{headerName}</span>
+          {/* Unscoped, the rail is titled "Chat" with the bubble — not the workspace's name, which the sidebar already says (Chris, 2026-09-18). */}
+          {!scopeRef && <MessageSquare className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
+          <span className="truncate text-sm font-semibold">{scopeRef ? headerName : t('rail_title')}</span>
           {/* The drawer's scope, when an affordance opened it with one
               (`docs/specs/personalization-v2.md`): one line naming the
               subject, so an ask has an unambiguous referent. Not a panel and
@@ -601,25 +636,21 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
             <span className="truncate text-xs text-muted-foreground">{session.workspaceName}</span>
           )}
         </div>
-        {!scopeRef && (
-          <HistoryPopover
-            recent={session.recentChats}
-            currentId={session.conversationId}
-            onPick={id => void session.handlePickConversation(id)}
-            onNewChat={session.handleNewChat}
-            search={session.searchConversations}
-          />
-        )}
-        {/* The conversation's rung — a setting, so it lives beside the
-            conversation's name and not inside the composer (§9.7). */}
-        <AutonomyControl
-          value={session.autonomy}
-          onChange={session.setAutonomy}
-          copy={autonomyCopy}
-          label={t('autonomy')}
+        {/* New chat + conversations as icons; the ⋯ menu in the phone sheet.
+            The rung moved into the input bar beside the model control. */}
+        <ChatHeaderActions
+          onNewChat={session.handleNewChat}
+          onCopy={session.messages.length > 0 ? () => transcriptOf(session.messages, session.workspaceName) : null}
+          history={scopeRef
+            ? null
+            : {
+                recent: session.recentChats,
+                currentId: session.conversationId,
+                onPick: id => void session.handlePickConversation(id),
+                search: session.searchConversations,
+              }}
+          compact={narrow}
         />
-        {/* New chat + all conversations. There is no agent to pick (§9.10). */}
-        <ChatMenu onNewChat={session.handleNewChat} />
         {/* The sheet carries its own close control in this corner; a second
             one underneath it was two buttons in one 32px square. */}
         {!narrow && (
@@ -644,9 +675,9 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
             mounted after a decision so the outcome card can state what
             happened — hiding the flow the moment it is decided would drop the
             one card that says so. */}
-        {session.messages.length === 0 && cardBlocks.length === 0 && !workspaceHasAgents
+        {session.messages.length === 0 && blocks.length === 0 && !workspaceHasAgents
           ? <NoAgentsState />
-          : session.messages.length === 0 && cardBlocks.length === 0
+          : session.messages.length === 0 && blocks.length === 0
             ? (
                 <EmptyState
                   greeting={session.emptyGreeting}
@@ -657,26 +688,19 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
                 />
               )
             : (
-                <MessageList
-                  messages={session.messages}
-                  agentName={session.workspaceName}
-                  streaming={session.isStreaming}
-                  activity={session.activity}
-                  blocks={cardBlocks}
-                  onFeedback={session.handleFeedback}
-                  autonomy={session.autonomy}
-                  conversationId={session.conversationId}
-                />
+                <CardDecisionProvider value={recordCardDecision}>
+                  <MessageList
+                    messages={session.messages}
+                    agentName={session.workspaceName}
+                    streaming={session.isStreaming}
+                    activity={session.activity}
+                    blocks={blocks}
+                    onFeedback={session.handleFeedback}
+                    autonomy={session.autonomy}
+                    conversationId={session.conversationId}
+                  />
+                </CardDecisionProvider>
               )}
-
-        {session.pendingHitl && (
-          <HitlGate
-            gate={session.pendingHitl}
-            onApprove={session.handleApproveHitl}
-            onReject={session.handleRejectHitl}
-            disabled={session.isStreaming}
-          />
-        )}
 
         {/* The cards have scrolled up behind newer turns: one click brings
             them back to the bottom, the same as asking for them (058). */}
@@ -786,6 +810,15 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
           onDismissAttachError={session.clearAttachError}
           onAttachFiles={files => void session.attachFiles(files)}
           onRemoveAttachment={session.removeAttachment}
+          onCommand={onCommand}
+          controls={<ModelControl value={session.modelPrefs} onChange={session.setModelPrefs} />}
+          settings={[autonomyMenuSetting(session.autonomy, autonomyCopy, t('autonomy_thread'))]}
+          onSetting={(id, opt) => {
+            const rung = id === AUTONOMY_SETTING_ID ? autonomyFromOption(opt) : null;
+            if (rung) {
+              session.setAutonomy(rung);
+            }
+          }}
         />
       </div>
     </>
@@ -811,19 +844,34 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     return null;
   }
 
-  const edgeTab = (
-    <button
-      type="button"
-      onClick={() => setCollapsedPersisted(false)}
-      aria-label={t('open_rail')}
-      title={t('open_rail')}
-      data-testid="rail-edge-tab"
-      className="fixed top-1/2 right-0 z-40 flex -translate-y-1/2 flex-col items-center gap-2 rounded-l-xl border border-r-0 border-border bg-background px-1.5 py-3 text-muted-foreground shadow-sm transition hover:bg-muted hover:text-foreground"
-    >
-      <MessageSquare className="size-4" aria-hidden="true" />
-      <span className="text-[10px] font-medium tracking-wide [writing-mode:vertical-rl]">Chat</span>
-    </button>
-  );
+  // The edge tab is a POINTER affordance, and it exists only where there is
+  // room for it. On a phone it sat over the page's right edge at the vertical
+  // centre — across a table's last column, a row's cost, the thing the reader
+  // was trying to read — and it was a second door to a room the titlebar
+  // already opens: `AgentSurfaceButton` is in the header on every page
+  // (principle 6, two surfaces doing one job is a defect). So below the
+  // breakpoint the rail collapses to nothing and the header keeps the entry
+  // point, which is also what makes the sheet feel like a mobile surface
+  // rather than a desktop rail squeezed onto a phone.
+  const edgeTab = narrow
+    ? null
+    : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => setCollapsedPersisted(false)}
+              aria-label={t('open_rail')}
+              data-testid="rail-edge-tab"
+              className="fixed top-1/2 right-0 z-40 flex -translate-y-1/2 flex-col items-center gap-2 rounded-l-xl border border-r-0 border-border bg-background px-1.5 py-3 text-muted-foreground shadow-sm transition hover:bg-muted hover:text-foreground"
+            >
+              <MessageSquare className="size-4" aria-hidden="true" />
+              <span className="text-[10px] font-medium tracking-wide [writing-mode:vertical-rl]">Chat</span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="left">{t('open_rail')}</TooltipContent>
+        </Tooltip>
+      );
 
   // The resize handle on the column's left edge (§9): drag, or arrow keys
   // when focused. One width for the column, never one per pane.
@@ -855,7 +903,18 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
       );
 
   // Below the breakpoint the column covers the page as a sheet instead of
-  // narrowing it (032 §3.2), and shows one pane at a time.
+  // narrowing it (032 §3.2).
+  //
+  // The sheet comes up from the BOTTOM. It used to slide in from the right
+  // and then cover the whole screen anyway, so it paid an animation from the
+  // wrong edge for nothing — and it put the composer, the one control a
+  // person actually reaches for, as far from the thumb as the screen allows.
+  // A bottom sheet is where a phone expects a transient surface to live.
+  //
+  // It opens tall (88vh) rather than at a peek height. This sheet's job is a
+  // conversation, and a conversation with the keyboard up has almost no room
+  // left at a peek — the reason to drag it open would be immediate and
+  // constant, so it simply opens where a reader would have dragged it.
   const column = (
     <RailColumn
       priority="dock"
@@ -868,7 +927,19 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
       frame={narrow
         ? content => (
           <Sheet open onOpenChange={open => setCollapsedPersisted(!open)}>
-            <SheetContent side="right" className="flex w-full max-w-[28rem] flex-col gap-0 p-0 sm:max-w-[28rem]" aria-label={ariaLabel}>
+            <SheetContent
+              side="bottom"
+              className="flex h-[88dvh] w-full min-w-0 flex-col gap-0 overflow-x-clip rounded-t-2xl p-0"
+              // The grabber (16px) then a 48px header row puts that row's
+              // centre at 40px; the close belongs on it, beside the ⋯ menu,
+              // not in the sheet's corner 24px above everything it sits with.
+              closeClassName="top-10 right-3 -translate-y-1/2"
+              aria-label={ariaLabel}
+            >
+              {/* The grabber. It is not a control — the sheet is dismissed by
+                  its close button or the overlay — but it is what tells a
+                  reader at a glance which edge this surface belongs to. */}
+              <div aria-hidden className="mx-auto mt-2 mb-1 h-1 w-9 shrink-0 rounded-full bg-border" />
               <SheetHeader className="sr-only">
                 <SheetTitle>{ariaLabel}</SheetTitle>
                 {/* One identity (§9.10): the sheet is described as the workspace, never an agent. */}

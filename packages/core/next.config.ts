@@ -50,6 +50,11 @@ const baseConfig: NextConfig = {
   devIndicators: false,
   poweredByHeader: false,
   reactStrictMode: true,
+  // CI type-checks core once, in the `static` job's `check:types`, and fails
+  // the pull request there. Without this, `next build` ran the same check
+  // again inside every build job (#629). Only CI skips it: a deploy or a
+  // local build still refuses to produce an app with a type error in it.
+  typescript: { ignoreBuildErrors: !!process.env.CI },
   // Temporal's client can't be webpack-bundled: its gRPC/proto data files
   // don't ride into the bundle, so Connection.connect() throws at runtime
   // (the dashboard then shows "not scheduled yet" for every schedule).
@@ -63,8 +68,13 @@ const baseConfig: NextConfig = {
     // Keyed broadly: the DB (and thus the seed copy) boots in every function.
     // The pglite wasm bundle + extensions load via computed fs paths the
     // tracer cannot see; include them explicitly (hoisted at the repo root).
-    '/': ['./migrations/**/*', './demo/**/*', '../../node_modules/@electric-sql/pglite/dist/**/*'],
-    '/**': ['./migrations/**/*', './demo/**/*', '../../node_modules/@electric-sql/pglite/dist/**/*'],
+    // templates/**: the base pack and the plugins are read from disk at
+    // request time by directory walk (plugin.yaml, pages/, teams/, trust.yaml,
+    // README.md), which the tracer cannot follow — on 2026-09-18 the image
+    // shipped each plugin's agents/ and skills/ only, so the Plugins page and
+    // the chat saw an empty catalogue in production.
+    '/': ['./migrations/**/*', './demo/**/*', './templates/**/*', '../../node_modules/@electric-sql/pglite/dist/**/*'],
+    '/**': ['./migrations/**/*', './demo/**/*', './templates/**/*', '../../node_modules/@electric-sql/pglite/dist/**/*'],
   },
 };
 
@@ -115,5 +125,29 @@ if (!process.env.NEXT_PUBLIC_SENTRY_DISABLED) {
   });
 }
 
-const nextConfig = configWithPlugins;
+/**
+ * Hosts allowed to load `/_next/*` in dev.
+ *
+ * Next dev refuses cross-origin requests for its own assets, and refuses them
+ * SILENTLY as far as the page is concerned: the server still renders, so a
+ * reader gets HTML — the `loading.tsx` shimmer, a chat shell — and then the
+ * client bundle never arrives, nothing hydrates, and the page sits on its
+ * loading state forever. Every button is dead, because the handler that would
+ * have run was never downloaded.
+ *
+ * That is what a tunnelled preview looks like from outside: the app appears
+ * to hang on a skeleton. So any host the dev server is reached through has to
+ * be named here. `VOCION_DEV_ORIGINS` (comma separated) covers a one-off
+ * tunnel; the permanent preview host is listed by default so reconnecting it
+ * needs no config at all.
+ */
+const devOrigins = [
+  'dev.agents.metacto.com',
+  ...(process.env.VOCION_DEV_ORIGINS ?? '')
+    .split(',')
+    .map(h => h.trim())
+    .filter(Boolean),
+];
+
+const nextConfig = { ...configWithPlugins, allowedDevOrigins: devOrigins };
 export default nextConfig;

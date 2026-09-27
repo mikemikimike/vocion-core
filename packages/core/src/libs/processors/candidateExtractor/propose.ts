@@ -65,9 +65,13 @@ function log(level: 'info' | 'warn', message: string, properties: Record<string,
     .catch(() => {});
 }
 
+export const PROPOSAL_CAP_HIT_NOTE = 'the sync\'s proposal budget is spent, so the rest of this document was not proposed';
+
 export type ProposeOutput = {
   counts: Record<string, number>;
   notes: string[];
+  /** The sync's proposal budget ran out before every record was proposed. */
+  proposalCapHit: boolean;
 };
 
 /**
@@ -100,16 +104,18 @@ export async function proposeRecords(opts: {
     counts[key] = (counts[key] ?? 0) + by;
   };
   if (opts.records.length === 0) {
-    return { counts, notes };
+    return { counts, notes, proposalCapHit: false };
   }
 
   const { proposeAction } = await import('@/services/ActionService');
   const { addDocumentLink } = await import('@/services/BusinessObjectService');
   const { candidateObjectIdForRun } = await import('@/libs/actions/objects-propose-candidate');
 
+  let proposalCapHit = false;
   for (const record of opts.records) {
     if (!opts.budget.take('maxProposalsPerSync')) {
-      notes.push('the sync\'s proposal budget is spent, so the rest of this document was not proposed');
+      notes.push(PROPOSAL_CAP_HIT_NOTE);
+      proposalCapHit = true;
       break;
     }
 
@@ -135,6 +141,24 @@ export async function proposeRecords(opts: {
       rawExtractRef: `knowledge_document:${opts.documentId}`,
     };
 
+    // Computed once so the dry-run line logs exactly what a live run stores.
+    //
+    // What the model thinks should happen to this card, and why, in one
+    // sentence. Distinct from the proposal's `rationale`: that says where the card
+    // came from, this says what to do with it, and for a `reject` the two
+    // are nothing alike, because the extraction can be perfect and the
+    // record still not belong in the queue.
+    //
+    // A card the model called a duplicate of a known one is a `reject`
+    // whatever it recommended, and the reason says so in core's words
+    // rather than the model's: the duplicate id is our determination, and
+    // a reviewer reading "duplicate of #412" should be reading a claim we
+    // can stand behind. Still only a recommendation: core keeps the card
+    // pending for a person and scores agreement against what they do.
+    const verdict = record.duplicateOf !== undefined
+      ? { suggestedDecision: 'reject' as const, suggestedDecisionReason: `Already waiting for review as action run #${record.duplicateOf}.` }
+      : recordVerdict(record);
+
     if (opts.config.dryRun) {
       // One structured line per would-be candidate: the dry run's entire
       // output, and what the first rollout step is read from.
@@ -159,6 +183,9 @@ export async function proposeRecords(opts: {
         }),
         fields: record.fields,
         confidence: record.confidence,
+        ...verdict,
+        scores: record.scores,
+        matchedRules: record.matchedRules,
         document: opts.document.uri ?? opts.document.externalId,
       });
       bump('dry_run');
@@ -188,24 +215,9 @@ export async function proposeRecords(opts: {
         // and a declared field nobody wrote would score as cleared on every
         // approve.
         ...(record.labelledFields?.length ? { labels: record.labelledFields } : {}),
-        // What the model thinks should happen to this card, and why, in one
-        // sentence. Distinct from `rationale` above: that says where the card
-        // came from, this says what to do with it — and for a `reject` the two
-        // are nothing alike, because the extraction can be perfect and the
-        // record still not belong in the queue.
-        //
-        // A card the model called a duplicate of a known one is a `reject`
-        // whatever it recommended, and the reason says so in core's words
-        // rather than the model's: the duplicate id is our determination, and
-        // a reviewer reading "duplicate of #412" should be reading a claim we
-        // can stand behind. Still only a recommendation — core keeps the card
-        // pending for a person and scores agreement against what they do.
-        ...(record.duplicateOf !== undefined
-          ? {
-              suggestedDecision: 'reject' as const,
-              suggestedDecisionReason: `Already waiting for review as action run #${record.duplicateOf}.`,
-            }
-          : recordVerdict(record)),
+        ...(record.scores ? { scores: record.scores } : {}),
+        ...(record.matchedRules ? { matchedRules: record.matchedRules } : {}),
+        ...verdict,
       },
     });
 
@@ -244,5 +256,5 @@ export async function proposeRecords(opts: {
     }
   }
 
-  return { counts, notes };
+  return { counts, notes, proposalCapHit };
 }

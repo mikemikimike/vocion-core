@@ -15,6 +15,9 @@ vi.mock('@/libs/Orpc', () => ({
 }));
 
 vi.mock('@/libs/I18nNavigation', () => ({
+  // The surfaces read the router for `/history`, `?new=1` and the preview's chat CTA — a stub is enough here.
+  useRouter: () => ({ push: () => {}, replace: () => {} }),
+  usePathname: () => '/dashboard/chat',
   // The dock's back-to-everything link — a plain anchor is enough for tests.
   Link: ({ href, children, ...rest }: { href: string; children: React.ReactNode } & Record<string, unknown>) => (
     <a href={href} {...rest}>{children}</a>
@@ -85,7 +88,7 @@ const RUN = {
       { kind: 'email', id: 'send-1', label: 'Day 0', subject: 'Ticket volume', body: 'draft one body' },
     ],
   },
-} as unknown as import('@/features/review/ReviewActionCard').ReviewCardRun;
+} as unknown as import('@/features/review/ReviewSurface').ReviewCardRun;
 
 describe('ChatDock', () => {
   it('claims the one entry function: a collapsed dock reopens and takes focus', async () => {
@@ -228,16 +231,18 @@ describe('ChatDock', () => {
     await expect.element(page.getByRole('slider', { name: 'Resize the conversation' })).toBeInTheDocument();
   });
 
-  it('carries the chat menu (new chat only — no agent picker, §9.10) and, unscoped, a history popover with the recent threads', async () => {
+  it('carries New chat as an icon (no agent picker, §9.10) and, unscoped, a history popover with the recent threads', async () => {
     vi.mocked(client.conversations.list).mockResolvedValue([
       { id: 7, title: 'Earlier about the queue', messageCount: 4, updatedAt: new Date().toISOString() },
     ] as never);
     localStorage.setItem(COLLAPSE_KEY, '0');
     await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" />));
 
+    await expect.element(page.getByRole('button', { name: 'New chat' })).toBeVisible();
+
     await userEvent.click(page.getByRole('button', { name: 'Chat options' }));
 
-    await expect.element(page.getByRole('menuitem', { name: /New chat/ })).toBeVisible();
+    expect(page.getByRole('menuitem', { name: /New chat/ }).elements()).toHaveLength(0);
 
     await userEvent.keyboard('{Escape}');
 
@@ -275,7 +280,7 @@ describe('ChatDock', () => {
     await userEvent.click(page.getByRole('button', { name: 'Open the conversation (⌘J)' }));
 
     await expect.element(page.getByRole('complementary', { name: 'Conversation' })).toBeVisible();
-    await expect.element(page.getByText('Everything')).toBeVisible();
+    await expect.element(page.getByText('Chat', { exact: true })).toBeVisible();
   });
 
   it('a stored choice wins over the page default, in both directions', async () => {
@@ -426,12 +431,15 @@ describe('ChatDock', () => {
     await expect.element(page.getByRole('link', { name: 'All conversations' })).not.toBeInTheDocument();
   });
 
-  it('puts the autonomy rung in the header, not in the composer', async () => {
+  it('keeps the autonomy rung inside the (+) menu — the bar is (+), the gauge, send', async () => {
     await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" defaultCollapsed={false} />));
 
-    // The chip names the current rung; the composer has one action left.
-    await expect.element(page.getByTestId('autonomy-chip')).toBeInTheDocument();
-    await expect.element(page.getByRole('radiogroup', { name: 'Autonomy' })).not.toBeInTheDocument();
+    expect(page.getByTestId('autonomy-chip').elements()).toHaveLength(0);
+
+    await userEvent.click(page.getByTestId('composer-attach'));
+
+    await expect.element(page.getByRole('option', { name: /Done for you/ })).toBeVisible();
+    await expect.element(page.getByRole('option', { name: /Ask first/ })).toBeVisible();
   });
 
   it('resumes the user\'s scoped conversation instead of the global pointer', async () => {
@@ -472,15 +480,15 @@ describe('ChatDock', () => {
 });
 
 describe('ChatDock speaks as the workspace (§9.10)', () => {
-  it('unscoped: the header is the workspace name and initial, never the lead agent, and the composer stays neutral', async () => {
+  it('unscoped: the header says Chat — never the workspace name, never the lead agent — and the composer stays neutral', async () => {
     localStorage.setItem(COLLAPSE_KEY, '0');
     const agents = [{ ...AGENTS[0]!, workspaceName: 'Revenue' }];
     await render(wrap(<ChatDock agents={agents} scopeLabel="Everything" />));
 
     await expect.element(page.getByRole('textbox')).toHaveAttribute('placeholder', 'Ask anything…');
 
-    // The workspace is the title (and its initial the mark); the lead agent's name is nowhere.
-    await vi.waitFor(() => expect(page.getByText('Revenue', { exact: true }).elements().length).toBeGreaterThan(0));
+    // "Chat" is the title; the sidebar already names the workspace, and the lead agent's name is nowhere.
+    await expect.element(page.getByText('Chat', { exact: true })).toBeVisible();
 
     expect(page.getByText('RevOps Lead').query()).toBeNull();
     expect(page.getByText(/^Direct ·/).query()).toBeNull();

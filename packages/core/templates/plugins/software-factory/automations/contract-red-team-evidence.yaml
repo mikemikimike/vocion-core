@@ -1,0 +1,56 @@
+# The review — one per pull request head, when its checks are green.
+#
+# This is the only review a change gets. It used to be three: one when the
+# worker finished, one when the PR opened, one when checks went green — three
+# runs of the same reviewer over the same diff inside three minutes, and none of
+# them recorded anything (PR #50, 2026-09-26). Green checks are the one moment
+# the diff, the trusted CI result and the QA evidence all exist, so the review
+# happens there and ends in `record_verdict` (`requireTool`).
+#
+# Fires on `pr.checks_completed` with a successful conclusion: the machine is
+# satisfied, which is exactly the moment a person is most likely to accept a
+# claim without opening it. Green checks are not evidence that a criterion
+# holds; they are evidence that the tests that exist passed.
+#
+# The structural half of this gate is already in code (`contractGap` on the
+# Work row: a finished outcome with unchecked or failed criteria says so, and
+# cannot be argued out of it). This is the judgement half — whether the
+# evidence attached actually settles the thing it is attached to.
+#
+# Loop safety: a check event from the forge, not one this run raises. Ceiling
+# kept low: a burst of green checks is more likely a symptom than a workload.
+slug: contract-red-team-evidence
+name: Green checks are not the same as a proven contract
+description: >-
+  When every check on a factory pull request has passed, the change reviewer
+  reads each acceptance criterion against the evidence attached to it: is this
+  link actually proof of this claim, or is it a passing test that happens to
+  sit nearby. Reports every criterion it cannot settle.
+status: active
+agent: change-reviewer
+when:
+  event: pr.checks_completed
+  filter:
+    conclusion: success
+  maxFiresPer10m: 4
+do:
+  checkMission: prove-the-contract
+  requireTool: record_verdict
+  prompt: >-
+    Every check passed on {{repo}}#{{number}} ({{url}}), branch {{branch}}.
+
+    Read the pull request (fetch_url reads it and its diff), the engineering
+    task that carries this prUrl, and the request it belongs to, with the
+    acceptance criteria as they were FROZEN at approval.
+
+    Scope first: what the diff does that no criterion asked for, and which
+    criteria it never touches. Then proof: for each criterion, does the evidence
+    on the task (checks, verification, screenshots) show THIS criterion holding
+    to someone who did not write it? A passing check is not evidence for a
+    criterion it does not exercise; a screenshot of the wrong state is not
+    evidence; a criterion with no link is unproven.
+
+    End by calling record_verdict with every criterion judged proven, unproven
+    or unchecked, the evidence for each proven one, and one sentence for the
+    person who merges. approve only when every criterion is proven. The server
+    counts, binds the verdict to the head and files the merge card.

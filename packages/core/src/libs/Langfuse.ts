@@ -6,6 +6,7 @@ import type { FeatureName } from './Langfuse/features';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { Langfuse } from 'langfuse';
 import { resolveLangfuseConfig } from './Langfuse/config';
+import { tokenUsageOf } from './llm/usage';
 
 /* ------------------------------------------------------------------ */
 /* Client — created on first use, never at import time                */
@@ -329,18 +330,37 @@ export function traceFor(opts: TraceFor): TraceLike {
 type GenerationLike = ReturnType<TraceLike['generation']>;
 type SpanLike = ReturnType<TraceLike['span']>;
 
+/**
+ * What one finished model turn reported, as `onTurnEnd` receives it.
+ *
+ * Every count is optional because providers disagree about which ones they
+ * fill in: only the normalised `usage_metadata` shape carries the cache
+ * numbers, and a provider with no prompt cache sends neither. `inputTokens`
+ * means the WHOLE input side, cached tokens included — readers that hand back
+ * the uncached remainder have to add the cache counts back before reporting.
+ */
+export type LangfuseTurnUsage = {
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /**
+   * Whether the call ended by asking for tools, so the turn goes on to run
+   * them and call the model again; false for a final answer. Undefined when
+   * the output carried no message to tell by. The budget guard reads it to
+   * stop a turn that has more calls coming, and let one that is done finish.
+   */
+  askedForTools?: boolean;
+};
+
 export type CreateLangfuseCallbackOptions = TraceFor & {
   /**
    * Optional per-turn usage hook. Called from `handleLLMEnd` with the
    * model + token usage so callers (e.g. BudgetService) can charge
    * budgets without intercepting the LangChain runnable directly.
    */
-  onTurnEnd?: (turn: {
-    model: string;
-    inputTokens?: number;
-    outputTokens?: number;
-    cacheReadTokens?: number;
-  }) => void | Promise<void>;
+  onTurnEnd?: (turn: LangfuseTurnUsage) => void | Promise<void>;
 };
 
 export type LangfuseCallback = {
@@ -348,12 +368,30 @@ export type LangfuseCallback = {
   trace: TraceLike;
 };
 
+/**
+ * Whether a finished model call asked for tools, read off its message's
+ * `tool_calls`; undefined when there is no message to read.
+ * @param generation - The call's first generation.
+ */
+function askedForToolsOf(generation: ChatGeneration | undefined): boolean | undefined {
+  const toolCalls = (generation?.message as { tool_calls?: unknown[] } | undefined)?.tool_calls;
+  if (!generation?.message) {
+    return undefined;
+  }
+  return Array.isArray(toolCalls) && toolCalls.length > 0;
+}
+
 export function createLangfuseCallback(
   opts: CreateLangfuseCallbackOptions,
 ): LangfuseCallback {
   const trace = traceFor(opts);
 
   const generations = new Map<string, GenerationLike>();
+  // The model each call started on, for providers whose end-of-call output
+  // does not name it (Bedrock returns no `llmOutput`). Without it the charge
+  // goes in as model "unknown", which prices at zero and never counts
+  // against a budget (#272).
+  const modelsByRun = new Map<string, string>();
   const spans = new Map<string, SpanLike>();
 
   const messagesToInput = (msgs: BaseMessage[][] | BaseMessage[]): unknown => {
@@ -366,6 +404,11 @@ export function createLangfuseCallback(
 
   class Adapter extends BaseCallbackHandler {
     override name = 'LangfuseAdapter';
+    // With a usage hook, LangChain has to wait for this callback before the
+    // graph moves on. By default it runs callbacks on a background queue, so a
+    // charge and the budget re-check after it (#272) could land after the next
+    // model call had already started, letting a turn run past its cap.
+    override awaitHandlers: boolean = opts.onTurnEnd !== undefined || process.env.LANGCHAIN_CALLBACKS_BACKGROUND === 'false';
 
     override async handleChatModelStart(
       llm: Serialized,
@@ -373,10 +416,18 @@ export function createLangfuseCallback(
       runId: string,
       _parentRunId?: string,
       extraParams?: Record<string, unknown>,
+      _tags?: string[],
+      runMetadata?: Record<string, unknown>,
     ): Promise<void> {
+      // Bedrock's Converse model leaves the model id out of its invocation
+      // params and names it only in the run metadata (`ls_model_name`); the
+      // class name (`llm.id`'s last part) is the last resort, and prices at
+      // nothing.
       const model = (extraParams?.invocation_params as { model?: string } | undefined)?.model
+        ?? (typeof runMetadata?.ls_model_name === 'string' ? runMetadata.ls_model_name : undefined)
         ?? (llm.id?.[llm.id.length - 1] as string | undefined)
         ?? 'unknown';
+      modelsByRun.set(runId, model);
       const gen = trace.generation({
         name: `chat:${model}`,
         model,
@@ -398,38 +449,67 @@ export function createLangfuseCallback(
         model?: string;
         tokenUsage?: { promptTokens?: number; completionTokens?: number };
         // Anthropic surfaces usage on llmOutput.usage with cache fields.
-        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
       };
       const usage = llmOutput.tokenUsage;
       const anthropicUsage = llmOutput.usage;
+      // Anthropic reports `input_tokens` as the UNCACHED remainder, so the two
+      // cache counts are added back before this is used as `inputTokens`.
+      // Everything downstream — `tokenCostMicroCents` above all — takes
+      // `inputTokens` to mean the whole input side and subtracts the cache
+      // counts off it again; reading the raw remainder here would subtract
+      // them twice, clamp at zero, and undercharge every cached turn.
+      const anthropicInputTokens = anthropicUsage?.input_tokens === undefined
+        ? undefined
+        : anthropicUsage.input_tokens
+          + (anthropicUsage.cache_read_input_tokens ?? 0)
+          + (anthropicUsage.cache_creation_input_tokens ?? 0);
+      // The message's own `usage_metadata` is the only shape every provider
+      // fills in — Bedrock returns no `llmOutput` at all on a non-streamed
+      // generation, so reading only the two shapes below left every Bedrock
+      // turn untraced and uncharged. Read the normalised one first and keep
+      // the others as the fallback.
+      const normalised = tokenUsageOf(firstGen?.message);
       // Langfuse v3: `usage` is deprecated; `usageDetails` is the free-
       // form numeric map their cost engine reads. Stamp the canonical
       // keys (`input`, `output`, `cache_read_input_tokens`) so Anthropic
       // prompt-caching bills correctly (~10x discount on cached input).
-      const usageDetails: Record<string, number> | undefined = usage
+      const usageDetails: Record<string, number> | undefined = normalised
         ? cleanUsageDetails({
-            input: usage.promptTokens,
-            output: usage.completionTokens,
+            input: normalised.inputTokens,
+            output: normalised.outputTokens,
+            cache_read_input_tokens: normalised.cacheReadTokens,
+            cache_creation_input_tokens: normalised.cacheWriteTokens,
           })
-        : anthropicUsage
+        : usage
           ? cleanUsageDetails({
-              input: anthropicUsage.input_tokens,
-              output: anthropicUsage.output_tokens,
-              cache_read_input_tokens: anthropicUsage.cache_read_input_tokens,
+              input: usage.promptTokens,
+              output: usage.completionTokens,
             })
-          : undefined;
+          : anthropicUsage
+            ? cleanUsageDetails({
+                input: anthropicInputTokens,
+                output: anthropicUsage.output_tokens,
+                cache_read_input_tokens: anthropicUsage.cache_read_input_tokens,
+                cache_creation_input_tokens: anthropicUsage.cache_creation_input_tokens,
+              })
+            : undefined;
       gen.end({
         output: firstGen?.text ?? output.generations,
         usageDetails,
       });
       generations.delete(runId);
+      const startedOnModel = modelsByRun.get(runId);
+      modelsByRun.delete(runId);
       if (opts.onTurnEnd) {
         try {
           await opts.onTurnEnd({
-            model: llmOutput.model ?? 'unknown',
-            inputTokens: usage?.promptTokens ?? anthropicUsage?.input_tokens,
-            outputTokens: usage?.completionTokens ?? anthropicUsage?.output_tokens,
-            cacheReadTokens: anthropicUsage?.cache_read_input_tokens,
+            model: llmOutput.model ?? startedOnModel ?? 'unknown',
+            inputTokens: normalised?.inputTokens ?? usage?.promptTokens ?? anthropicInputTokens,
+            outputTokens: normalised?.outputTokens ?? usage?.completionTokens ?? anthropicUsage?.output_tokens,
+            cacheReadTokens: normalised?.cacheReadTokens ?? anthropicUsage?.cache_read_input_tokens,
+            cacheWriteTokens: normalised?.cacheWriteTokens ?? anthropicUsage?.cache_creation_input_tokens,
+            askedForTools: askedForToolsOf(firstGen),
           });
         } catch {
           /* never let the budget hook break the agent run */
@@ -447,6 +527,7 @@ export function createLangfuseCallback(
         statusMessage: err.message,
       });
       generations.delete(runId);
+      modelsByRun.delete(runId);
     }
 
     override async handleToolStart(

@@ -18,6 +18,8 @@ vi.mock('@/libs/Orpc', () => ({
   },
 }));
 vi.mock('@/libs/I18nNavigation', () => ({
+  useRouter: () => ({ push: () => {}, replace: () => {}, refresh: () => {} }),
+  usePathname: () => '/dashboard',
   Link: ({ href, children, ...rest }: { href: string; children: React.ReactNode } & Record<string, unknown>) => (
     <a href={href} {...rest}>{children}</a>
   ),
@@ -79,7 +81,7 @@ describe('PageDock', () => {
     await open.click();
 
     await expect.element(page.getByRole('complementary', { name: 'Conversation' })).toBeVisible();
-    await expect.element(page.getByText('Everything')).toBeVisible();
+    await expect.element(page.getByText('Chat', { exact: true })).toBeVisible();
   });
 
   it('is collapsed on a single record too — the record page is full width on arrival (2026-09-16)', async () => {

@@ -76,6 +76,52 @@ describe('effective policy and the list', () => {
     expect(e).toMatchObject({ rung: 'execute-with-approval', riskTier: 'low', minConfidence: 0.85, policy: null, trustRule: null });
   });
 
+  it('reads a derived key with no rows as its action: low for a record write, high for a merge', async () => {
+    // `objects.update_meta.request` is registered under no such id. The tier
+    // comes from `objects.update_meta` behind it; without that every object
+    // type nobody wrote a rule for would read as an unknown, high-risk kind
+    // and never run on its own.
+    const write = await svc.effectivePolicy(ORG, 'objects.update_meta.request');
+
+    expect(write.riskTier).toBe('low');
+    expect(write.rung).toBe('execute-with-approval');
+
+    const merge = await svc.effectivePolicy(ORG, 'git.merge.docs');
+
+    expect(merge.riskTier).toBe('high');
+
+    // A key that prefixes no registered action is what it always was.
+    expect((await svc.effectivePolicy(ORG, 'nothing.registered.here')).riskTier).toBe('high');
+  });
+
+  it('governs a derived key with no rows of its own by the rule on its action, and lets the class override', async () => {
+    // One rule, "a merge is a person's": `git.merge` at approval. A proposal
+    // is keyed `git.merge.ui`, which has no row, so it reads the parent's.
+    await db.insert(trustRuleSchema).values({ orgId: ORG, actionId: 'git.merge', threshold: 1, enabled: 'false' });
+
+    const ui = await svc.effectivePolicy(ORG, 'git.merge.ui');
+
+    expect(ui).toMatchObject({ actionId: 'git.merge.ui', rung: 'execute-with-approval', riskTier: 'high', minConfidence: 1 });
+    expect(ui.trustRule?.actionId).toBe('git.merge');
+
+    // A class with its own rule keeps it: docs may earn its way while the
+    // parent stays at approval.
+    await db.insert(trustRuleSchema).values({ orgId: ORG, actionId: 'git.merge.docs', threshold: 0.95, enabled: 'true' });
+
+    const docs = await svc.effectivePolicy(ORG, 'git.merge.docs');
+
+    expect(docs.trustRule?.actionId).toBe('git.merge.docs');
+    expect(docs.minConfidence).toBe(0.95);
+    // And a key that prefixes no registered action still reads as itself.
+    expect((await svc.effectivePolicy(ORG, 'nothing.registered.here')).trustRule).toBeNull();
+
+    // The fallback is opt-in: a record write keeps each object type's ledger
+    // its own, so a bare objects.update_meta rule binds to no type.
+    await db.insert(trustRuleSchema).values({ orgId: ORG, actionId: 'objects.update_meta', threshold: 0.9, enabled: 'true' });
+
+    expect((await svc.effectivePolicy(ORG, 'objects.update_meta.request')).trustRule).toBeNull();
+  });
+
   it('reads an enabled trust rule with no policy row as Execute within bounds at the rule threshold', async () => {
     await db.insert(trustRuleSchema).values({ orgId: ORG, actionId: 'hubspot.update', threshold: 0.9, enabled: 'true' });
 

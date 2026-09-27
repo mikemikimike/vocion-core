@@ -15,6 +15,7 @@ import {
 import { createPlatformKeyRoute, createTokenRoute, listPlatformsRoute, listTokensRoute, revealPlatformKeyRoute, revokeTokenRoute } from './ApiTokens';
 import {
   folders as artifactFoldersRoute,
+  share as artifactShareRoute,
   exportPage as exportArtifactPageRoute,
   get as getArtifactRoute,
   version as getArtifactVersionRoute,
@@ -24,8 +25,10 @@ import {
   remove as removeArtifactRoute,
   restore as restoreArtifactVersionRoute,
   setFolder as setArtifactFolderRoute,
+  setShare as setArtifactShareRoute,
   update as updateArtifactRoute,
 } from './Artifacts';
+import { pause as pauseAutomationRoute, resume as resumeAutomationRoute } from './Automations';
 import { acknowledgeAutonomyFlagRoute, demoteAutonomyRoute, listAutonomyRoute, promoteAutonomyRoute } from './Autonomy';
 import { latestRoute as briefingsLatestRoute, regenerateRoute as briefingsRegenerateRoute } from './Briefings';
 import { get as getBudget, upsert as upsertBudget } from './Budgets';
@@ -50,10 +53,12 @@ import {
   get as getConv,
   latestForScope as latestConvForScope,
   list as listConvs,
+  recordCardDecision as recordConvCardDecision,
   remove as removeConv,
   rename as renameConv,
   search as searchConvs,
   setAutonomy as setConvAutonomy,
+  setModel as setConvModel,
   tail as tailConv,
 } from './Conversations';
 import {
@@ -68,6 +73,14 @@ import {
   onlineTearDown as onlineEvalTearDown,
   run as runEval,
 } from './Evals';
+import {
+  create as createGroupRoute,
+  overview as groupsOverviewRoute,
+  removeDirect as removeDirectGrantRoute,
+  remove as removeGroupRoute,
+  setGrant as setGroupGrantRoute,
+  setMember as setGroupMemberRoute,
+} from './Groups';
 import {
   add as addLearning,
   check as checkLearning,
@@ -98,12 +111,15 @@ import {
 } from './Missions';
 import { dismiss as dismissNavPrompt, getPrefs as getNavPrefs, setPins as setNavPins } from './Nav';
 import { get as getPlaybook, list as listPlaybooks } from './Playbooks';
+import { list as listPluginsRoute, set as setPluginRoute } from './Plugins';
 import { getRoute as getPreviewRoute } from './Preview';
 import { changePasswordRoute, getProfileRoute, updateNameRoute } from './Profile';
 import { list as listProjects, setActive as setActiveProject } from './Projects';
 import {
   actionStatusRoute,
+  approveContentRoute,
   cancel,
+  contextRoute,
   decideActionRoute,
   getWorkflowRunRoute,
   listAutoExecutedRoute,
@@ -117,10 +133,13 @@ import {
   rewriteDraftRoute,
   snoozeActionRoute,
   submitFeedback,
+  unapproveContentRoute,
+  undoActionRoute,
 } from './Review';
+import { scorecardAgentsRoute } from './Scorecard';
 import { applyConfigRoute as applyTeamReportConfigRoute, planConfigRoute as planTeamReportConfigRoute, lineageRoute as teamReportLineageRoute } from './TeamReport';
 import { list as listTeamsRoute, seedSample as seedSampleTeamsRoute } from './Teams';
-import { applyNow as applyWorkspaceNow, readPrimitive, driftStatus as workspaceDriftStatus, writeFile } from './Workspace';
+import { applyNow as applyWorkspaceNow, pause as pauseWorkspaceRoute, readPrimitive, resume as resumeWorkspaceRoute, driftDiff as workspaceDriftDiff, driftStatus as workspaceDriftStatus, pauseState as workspacePauseState, writeFile } from './Workspace';
 
 export const router = {
   adoption: {
@@ -147,7 +166,20 @@ export const router = {
     readPrimitive,
     writeFile,
     driftStatus: workspaceDriftStatus,
+    driftDiff: workspaceDriftDiff,
     applyNow: applyWorkspaceNow,
+  },
+  // The workspace's off switch. Under `workspace` rather than `context`
+  // because it is a fact about the running workspace, not about the authored
+  // files that `context.*` reads and applies.
+  workspace: {
+    pauseState: workspacePauseState,
+    pause: pauseWorkspaceRoute,
+    resume: resumeWorkspaceRoute,
+  },
+  plugins: {
+    list: listPluginsRoute,
+    set: setPluginRoute,
   },
   preview: {
     get: getPreviewRoute,
@@ -155,6 +187,10 @@ export const router = {
   playbooks: {
     list: listPlaybooks,
     get: getPlaybook,
+  },
+  automations: {
+    pause: pauseAutomationRoute,
+    resume: resumeAutomationRoute,
   },
   missions: {
     list: listMissionsRoute,
@@ -205,6 +241,14 @@ export const router = {
     revealPlatformKey: revealPlatformKeyRoute,
     revoke: revokeTokenRoute,
   },
+  groups: {
+    overview: groupsOverviewRoute,
+    create: createGroupRoute,
+    remove: removeGroupRoute,
+    setMember: setGroupMemberRoute,
+    setGrant: setGroupGrantRoute,
+    removeDirect: removeDirectGrantRoute,
+  },
   members: {
     list: listMembersRoute,
     invites: listInvitesRoute,
@@ -234,6 +278,8 @@ export const router = {
     restore: restoreArtifactVersionRoute,
     remove: removeArtifactRoute,
     exportPage: exportArtifactPageRoute,
+    share: artifactShareRoute,
+    setShare: setArtifactShareRoute,
   },
   conversations: {
     list: listConvs,
@@ -246,7 +292,9 @@ export const router = {
     search: searchConvs,
     tail: tailConv,
     feedback: feedbackConvMessage,
+    recordCardDecision: recordConvCardDecision,
     setAutonomy: setConvAutonomy,
+    setModel: setConvModel,
   },
   learnings: {
     listSteps: listLearningSteps,
@@ -285,17 +333,24 @@ export const router = {
     regenerate: briefingsRegenerateRoute,
     latest: briefingsLatestRoute,
   },
+  scorecard: {
+    agents: scorecardAgentsRoute,
+  },
   review: {
     listPendingActions: listPendingActionsRoute,
     listPendingActionTypes: listPendingActionTypesRoute,
     listAutoExecuted: listAutoExecutedRoute,
     decideAction: decideActionRoute,
+    undoAction: undoActionRoute,
     snoozeAction: snoozeActionRoute,
     regenerateAction: regenerateActionRoute,
+    approveContent: approveContentRoute,
+    unapproveContent: unapproveContentRoute,
     propose: proposeFromRecommendationRoute,
     recordSignal: recordSignalRoute,
     rewriteDraft: rewriteDraftRoute,
     actionStatus: actionStatusRoute,
+    context: contextRoute,
     submitFeedback,
     listWorkflowRuns: listWorkflowRunsRoute,
     getWorkflowRun: getWorkflowRunRoute,

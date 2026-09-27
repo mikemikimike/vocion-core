@@ -1,5 +1,6 @@
 import type { DashboardRoute } from '@/features/navigation/dashboardNav';
-import { DASHBOARD_GROUPS } from '@/features/navigation/dashboardNav';
+import { chatHotkeyLabel } from '@/features/dashboard/chat/chatHotkeys';
+import { DASHBOARD_GROUPS, routeVisible } from '@/features/navigation/dashboardNav';
 
 /**
  * Pure model for the ⌘K palette — what the dialog renders, computed away
@@ -19,7 +20,7 @@ export type PaletteRow = {
   /** Navigation target, when the row is a link. */
   url?: string;
   /** Named action, when the row runs something instead. */
-  action?: 'ask' | 'new-conversation' | 'open-rail' | 'toggle-sidebar' | 'toggle-theme' | 'docs' | 'sign-out';
+  action?: 'ask' | 'new-conversation' | 'all-conversations' | 'open-rail' | 'toggle-sidebar' | 'toggle-theme' | 'docs' | 'sign-out';
   shortcut?: string;
 };
 
@@ -32,6 +33,8 @@ export function buildPaletteGroups(input: {
   query: string;
   routes: readonly DashboardRoute[];
   isAdmin: boolean;
+  /** Plugins the workspace turned on; a plugin-owned route hides while its plugin is off. Omit = no plugin gating. */
+  enabledPlugins?: readonly string[];
   agents?: PaletteEntity[];
   teams?: PaletteEntity[];
   missions?: PaletteEntity[];
@@ -53,7 +56,7 @@ export function buildPaletteGroups(input: {
 
   for (const heading of ROUTE_GROUP_ORDER) {
     const rows = input.routes
-      .filter(r => r.group === heading && (input.isAdmin || !r.adminOnly))
+      .filter(r => r.group === heading && routeVisible(r, { isAdmin: input.isAdmin, enabledPlugins: input.enabledPlugins }))
       .map<PaletteRow>(r => ({
         value: [r.title, ...(r.keywords ?? [])].join(' '),
         label: r.title,
@@ -61,6 +64,8 @@ export function buildPaletteGroups(input: {
         hint: r.tabOf ? input.routes.find(o => o.url === r.tabOf)?.title : undefined,
         kind: 'route',
         url: r.url,
+        // The chat page has a key of its own (`chatHotkeys.ts`).
+        ...(r.url === '/dashboard/chat' ? { shortcut: chatHotkeyLabel('go-to-chat') } : {}),
       }));
     if (rows.length > 0) {
       groups.push({ heading, rows });
@@ -97,7 +102,8 @@ export function buildPaletteGroups(input: {
     heading: 'Commands',
     rows: [
       ...(q ? [] : [{ value: 'ask vocion agent', label: 'Ask Vocion', kind: 'action', action: 'ask', shortcut: '⌘J' } satisfies PaletteRow]),
-      { value: 'new conversation chat', label: 'New conversation', kind: 'action', action: 'new-conversation' },
+      { value: 'new conversation chat clear', label: 'New chat', kind: 'action', action: 'new-conversation', shortcut: chatHotkeyLabel('new-chat') },
+      { value: 'all conversations history threads list chats', label: 'All conversations', kind: 'action', action: 'all-conversations', url: '/dashboard/conversations', shortcut: chatHotkeyLabel('all-conversations') },
       { value: 'open the rail conversation', label: 'Open the rail', kind: 'action', action: 'open-rail', shortcut: '⌘J' },
       { value: 'toggle sidebar', label: 'Toggle sidebar', kind: 'action', action: 'toggle-sidebar', shortcut: '⌘B' },
       { value: 'toggle theme dark light', label: input.themeIsDark ? 'Switch to light theme' : 'Switch to dark theme', kind: 'action', action: 'toggle-theme' },
@@ -107,4 +113,34 @@ export function buildPaletteGroups(input: {
   });
 
   return groups;
+}
+
+/**
+ * How the palette ranks a row against what was typed — replaces cmdk's fuzzy
+ * score, which put "Ask Vocion: Cha" and "Search knowledge for Cha" above the
+ * Chat page for the query "Cha" (Chris, 2026-09-18: "the Chat isn't the first
+ * result to hit enter. It should be."). A page whose name starts with the
+ * query outranks everything; a word-start match next; a substring after that;
+ * the two free-text rows (Ask, Search knowledge) sit at a fixed low score so
+ * they are always there but never first when a real row matches.
+ * @param value - The row's `value` (title plus keywords).
+ * @param search - What the person typed.
+ * @returns 0 hides the row; higher sorts earlier.
+ */
+export function paletteFilter(value: string, search: string): number {
+  const q = search.trim().toLowerCase();
+  if (!q) {
+    return 1;
+  }
+  const v = value.toLowerCase();
+  if (v.startsWith('ask ') || v.startsWith('search knowledge ')) {
+    return 0.5;
+  }
+  if (v.startsWith(q)) {
+    return 1;
+  }
+  if (v.split(/\s+/).some(w => w.startsWith(q))) {
+    return 0.9;
+  }
+  return v.includes(q) ? 0.6 : 0;
 }

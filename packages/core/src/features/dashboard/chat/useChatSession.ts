@@ -1,20 +1,26 @@
 'use client';
 
 import type { TurnOutcome } from './queueReducer';
-import type { AgentOption, AgentRun, ChatAttachment, ChatMessage, ChatMessageArtifact, ContextRef, ConversationAutonomy, HitlGatePayload, IndexedDocument, StreamingPhase, TraceNode } from './types';
-import type { PageContext } from '@/services/chat/pageContext';
+import type { AgentOption, AgentRun, ChatAttachment, ChatMessage, ChatMessageArtifact, ContextRef, ConversationAutonomy, HitlGatePayload, IndexedDocument, RecommendedAction, SelfUpdateReceipt, StreamingPhase, TraceNode, TurnModel } from './types';
+import type { ModelPrefs } from '@/libs/llm/modelPrefs';
+import type { RoutingDecision } from '@/services/agents/router';
+import type { PageContext, RecordRef } from '@/services/chat/pageContext';
+import type { TurnStatus } from '@/services/chat/turnStatus';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { openPreview } from '@/features/preview/previewState';
 import { useLastViewedConversation } from '@/hooks/useLastViewedConversation';
+import { mergeSelfUpdate } from '@/libs/actions/selfUpdate';
 import { deliverableFromRefs, isArtifactTag } from '@/libs/chat/deliverable';
 import { NO_AGENTS_MESSAGE } from '@/libs/chat/redact';
+import { DEFAULT_MODEL_PREFS, readModelPrefs } from '@/libs/llm/modelPrefs';
 import { client } from '@/libs/Orpc';
 import { uploadAttachments } from './attachmentUpload';
+import { DEFAULT_AUTONOMY } from './autonomyOptions';
 import { isIntentTag } from './composerTags';
 import { readRecommendedAction } from './recommendedAction';
 import { decideResume, readSessionConversation, writeSessionConversation } from './resumeRule';
-import { defaultAgentSlug, hasWorkspaceAgents, parseSearchCommand, routeTurn, SEARCH_ONLY_SLUG, workspaceChips } from './routing';
-import { failToolNode, finalizeTrace, mergeTraceNode } from './traceReducer';
+import { agentDisplayName, defaultAgentSlug, hasWorkspaceAgents, parseSearchCommand, routeTurn, SEARCH_ONLY_SLUG, workspaceChips } from './routing';
+import { failToolNode, finalizeTrace, liveStepLabel, mergeTraceNode, noteToolProgress } from './traceReducer';
 import { useSendQueue } from './useSendQueue';
 import { describeToolCall } from './WorkTimeline';
 
@@ -96,9 +102,13 @@ const AUTONOMY_KEY = 'vocion:chat:autonomy';
 
 function readPreferredAutonomy(): ConversationAutonomy {
   try {
-    return localStorage.getItem(AUTONOMY_KEY) === 'act-within-bounds' ? 'act-within-bounds' : 'ask';
+    const stored = localStorage.getItem(AUTONOMY_KEY);
+    // Either rung the person chose stands; nothing stored means the default
+    // (done for you since 2026-09-18 — the old code read a missing value as
+    // 'ask' and every fresh thread vetoed the done-for-you policy).
+    return stored === 'ask' || stored === 'act-within-bounds' ? stored : DEFAULT_AUTONOMY;
   } catch {
-    return 'ask';
+    return DEFAULT_AUTONOMY;
   }
 }
 
@@ -119,10 +129,18 @@ type PersistedMessageRow = {
   documentsJson: unknown;
   traceJson?: unknown;
   confidence: ChatMessage['confidence'];
+  /** How the turn ended (`services/chat/turnStatus.ts`); null on a row written before that vocabulary. */
+  status?: string | null;
+  /** Why it ended that way, in the runtime's own words; null on an ordinary turn. */
+  statusReason?: string | null;
   feedbackRating?: string | null;
   feedbackNote?: string | null;
   /** Files attached to a user turn, as the conversations router resolves them. */
   attachments?: ChatAttachment[];
+  /** Artifacts the turn produced, as the conversations router resolves them — the chips. */
+  artifacts?: ChatMessageArtifact[];
+  /** Which agent spoke an assistant turn, as the runtime stamped it (backlog 009); null before the column existed. */
+  agentSlug?: string | null;
 };
 
 /**
@@ -130,8 +148,9 @@ type PersistedMessageRow = {
  * cited sources so inline `[n]` citations still resolve and the Sources
  * drawer repopulates after a reload.
  * @param rows - Persisted message rows, oldest first.
+ * @param nameOf
  */
-function hydrateTranscript(rows: PersistedMessageRow[]): { messages: ChatMessage[]; documents: IndexedDocument[] } {
+function hydrateTranscript(rows: PersistedMessageRow[], nameOf: (slug: string) => string): { messages: ChatMessage[]; documents: IndexedDocument[] } {
   const documents: IndexedDocument[] = [];
   const messages: ChatMessage[] = rows.map((row) => {
     const runsRaw = Array.isArray(row.runsJson) ? (row.runsJson as AgentRun[]) : [];
@@ -146,19 +165,42 @@ function hydrateTranscript(rows: PersistedMessageRow[]): { messages: ChatMessage
     }
     const trace = Array.isArray(row.traceJson) ? (row.traceJson as TraceNode[]) : undefined;
     const rating = row.feedbackRating === 'up' || row.feedbackRating === 'down' ? row.feedbackRating : null;
+    // The cards a turn put up come back from the row (backlog 025): a card
+    // is not a client-side ornament that a reload forgets.
+    const recommendations: RecommendedAction[] = runsRaw
+      .filter((r): r is Extract<AgentRun, { type: 'card' }> => r.type === 'card' && typeof r.label === 'string' && r.label.length > 0 && typeof r.actionId === 'string')
+      .map(r => ({ ...(r.id ? { id: r.id } : {}), actionId: r.actionId, input: r.input ?? {}, label: r.label, ...(r.runId !== undefined ? { runId: r.runId } : {}), state: (r.state as RecommendedAction['state']) ?? (r.runId !== undefined ? 'filed' : 'proposed') }));
     return {
       ...(typeof row.id === 'number' ? { id: row.id } : {}),
       role: row.role,
       content: row.content ?? '',
       ...(row.role === 'assistant' && (rating || row.feedbackNote) ? { feedback: { rating, note: row.feedbackNote ?? null } } : {}),
       ...(runs ? { runs } : {}),
+      ...(recommendations.length > 0 ? { recommendations } : {}),
       ...(docs && docs.length > 0 ? { documents: docs } : {}),
       ...(trace && trace.length > 0 ? { trace } : {}),
       ...(row.confidence ? { confidence: row.confidence } : {}),
+      // How the turn ended has to survive the reload — a fragment looks like
+      // an answer otherwise, and a refusal looks like a fault (#114).
+      ...(row.status ? { status: row.status as TurnStatus } : {}),
+      ...(row.statusReason ? { statusReason: row.statusReason } : {}),
       ...(row.attachments && row.attachments.length > 0 ? { attachments: row.attachments } : {}),
+      ...(row.artifacts && row.artifacts.length > 0 ? { artifacts: row.artifacts } : {}),
+      // Who spoke, from the row — so "via <specialist>" survives a reload and
+      // says the same thing it said live (backlog 009).
+      ...(row.role === 'assistant' && row.agentSlug ? { agentSlug: row.agentSlug, agentName: nameOf(row.agentSlug) } : {}),
     };
   });
   return { messages, documents };
+}
+
+/** The browser's IANA zone, or undefined where Intl cannot say (the server then uses the workspace's). */
+function browserTimeZone(): string | undefined {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export type UseChatSessionOptions = {
@@ -166,6 +208,8 @@ export type UseChatSessionOptions = {
   agents: AgentOption[];
   /** Pre-fills the composer without sending. */
   initialComposerValue?: string;
+  /** Files already uploaded (a share from the phone, `?attach=`) that start in the composer as chips. */
+  initialAttachments?: ChatAttachment[];
   /** Workspace-scoped empty-state chips, used while no specific agent is picked. */
   suggestions?: Array<{ label: string; prompt: string }>;
   /** Empty-state greeting: org eyebrow + "Ask <workspace>". */
@@ -225,6 +269,7 @@ export type ChatSessionEventApi = {
  * @param root0 - Hook options.
  * @param root0.agents - Agents available to pick from. The caller guarantees at least one entry.
  * @param root0.initialComposerValue - Pre-fills the composer without sending.
+ * @param root0.initialAttachments - Uploaded files that start in the composer.
  * @param root0.suggestions - Workspace-scoped empty-state chips.
  * @param root0.greeting - Empty-state greeting: org eyebrow + workspace name.
  * @param root0.scopeRef
@@ -235,6 +280,7 @@ export type ChatSessionEventApi = {
 export function useChatSession({
   agents,
   initialComposerValue,
+  initialAttachments,
   suggestions = [],
   greeting,
   scopeRef,
@@ -289,7 +335,7 @@ export function useChatSession({
   // Files attached to the next message — already uploaded, already artifacts;
   // these are the chips. `uploading` counts the batches still in flight so the
   // composer can show it and hold Send until they land.
-  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>(initialAttachments ?? []);
   const [uploading, setUploading] = useState(0);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [phase, setPhase] = useState<StreamingPhase>('idle');
@@ -334,7 +380,16 @@ export function useChatSession({
   const [recentChats, setRecentChats] = useState<Array<{ id: number; title: string }>>([]);
   // How recommended actions behave in this thread (0094). Starts from the
   // person's last choice; a resumed thread brings its own.
-  const [autonomy, setAutonomyState] = useState<ConversationAutonomy>('ask');
+  const [autonomy, setAutonomyState] = useState<ConversationAutonomy>(DEFAULT_AUTONOMY);
+  // How strong a model, how much it thinks — per thread, like autonomy.
+  const [modelPrefs, setModelPrefsState] = useState<ModelPrefs>(DEFAULT_MODEL_PREFS);
+  const modelPrefsRef = useRef(modelPrefs);
+  modelPrefsRef.current = modelPrefs;
+  // The roster, readable from effects and event handlers without re-running
+  // them: it names the agent a persisted or streamed turn was spoken by.
+  const rosterRef = useRef(agents);
+  rosterRef.current = agents;
+  const nameOfAgent = useCallback((slug: string, fallback?: string) => agentDisplayName(slug, rosterRef.current, fallback), []);
   // Records the person pointed this turn at with `@` — sent as `context_refs`
   // beside the message and cleared after the send.
   const [contextRefs, setContextRefs] = useState<ContextRef[]>([]);
@@ -482,6 +537,26 @@ export function useChatSession({
       return;
     }
     switch (evt.type) {
+      case 'routed': {
+        // The workspace chose the agent (`route: true`): attribute the turn to
+        // it the way an `@mention` does, and keep the reason on the message.
+        const routed = evt as unknown as { agent: { slug: string; name: string }; routing: RoutingDecision };
+        appendToLatestAgent(m => ({ ...m, agentSlug: routed.agent.slug, agentName: nameOfAgent(routed.agent.slug, routed.agent.name), routing: routed.routing }));
+        return;
+      }
+      case 'turn_agent': {
+        // Who speaks this turn, from the runtime — the same slug the row is
+        // stamped with, so live and reloaded transcripts agree (backlog 009).
+        const spoken = evt as unknown as { agent: { slug: string; name: string } };
+        appendToLatestAgent(m => ({ ...m, agentSlug: spoken.agent.slug, agentName: nameOfAgent(spoken.agent.slug, spoken.agent.name) }));
+        return;
+      }
+      case 'run_meta': {
+        // Which model answers this turn — the footer's fact, never a guess.
+        const meta = evt as unknown as TurnModel & { type: 'run_meta' };
+        appendToLatestAgent(m => ({ ...m, model: { model: meta.model, provider: meta.provider, strength: meta.strength ?? 'balanced', thinking: meta.thinking ?? 'off' } }));
+        return;
+      }
       case 'thinking':
         setPhase('thinking');
         setActivity('Thinking…');
@@ -508,14 +583,39 @@ export function useChatSession({
           }
           node.anchor = textRunsRef.current;
         }
-        map.set(node.id, mergeTraceNode(map.get(node.id), node));
+        const merged = mergeTraceNode(map.get(node.id), node);
+        map.set(node.id, merged);
         traceDirtyRef.current = true;
-        setActivity(node.label);
+        setActivity(liveStepLabel(merged));
+        scheduleFlush();
+        return;
+      }
+      case 'step_progress': {
+        // A long call saying where it has got to — "sheet 7 of 12". It rides
+        // the step line that is already there; it never adds a row.
+        const name = String(evt.tool ?? 'tool');
+        const note = String(evt.note ?? '').trim();
+        if (!note) {
+          return;
+        }
+        const map = pendingTraceRef.current;
+        const next = noteToolProgress([...map.values()], name, note);
+        const touched = next.find(n => n.tool === name && n.progress === note);
+        if (!touched) {
+          return;
+        }
+        map.set(touched.id, touched);
+        traceDirtyRef.current = true;
+        setActivity(liveStepLabel(touched));
         scheduleFlush();
         return;
       }
       case 'answering':
         setPhase('answering');
+        return;
+      case 'status':
+        // The server says what it is doing, in words; the line shows exactly that.
+        setActivity(String((evt as { label?: string }).label ?? '') || null);
         return;
       case 'retrieval_progress': {
         const stage = String(evt.stage ?? 'searching');
@@ -597,6 +697,14 @@ export function useChatSession({
         });
         return;
       }
+      case 'record_created': {
+        // A room or proposal the turn just made opens beside the conversation
+        // (Chris, 2026-09-18: "maybe preview should open automatically").
+        flushDeltas();
+        const made = (evt as unknown as { record: { type: RecordRef['type']; id: string } }).record;
+        openPreview({ type: made.type, id: made.id }, null);
+        return;
+      }
       case 'documents': {
         flushDeltas();
         const docs = (evt.documents as IndexedDocument[]) ?? [];
@@ -607,6 +715,38 @@ export function useChatSession({
       case 'hitl_gate': {
         flushDeltas();
         setPendingHitl(evt.gate as HitlGatePayload);
+        return;
+      }
+      case 'card': {
+        // The typed form (backlog 025): on the ledger already, on the wire
+        // now, filed later if at all — `card_update` carries the proposal id.
+        flushDeltas();
+        const c = evt.card as { id: string; title: string; kind: string; state?: RecommendedAction['state']; runId?: number; actions?: Array<{ actionId: string; input?: Record<string, unknown> }>; rationale?: string; confidence?: number; source?: { agentSlug?: string }; suggestedDecision?: RecommendedAction['suggestedDecision']; suggestedDecisionReason?: string };
+        const primary = c.actions?.[0];
+        let rec: RecommendedAction;
+        if (primary) {
+          const checked = readRecommendedAction({ actionId: primary.actionId, input: primary.input ?? {}, label: c.title, rationale: c.rationale, confidence: c.confidence, agentSlug: c.source?.agentSlug, runId: c.runId, suggestedDecision: c.suggestedDecision, suggestedDecisionReason: c.suggestedDecisionReason });
+          if (!checked.ok) {
+            console.warn(`useChatSession: dropped an invalid card — ${checked.reason}`);
+            return;
+          }
+          rec = { ...checked.rec, id: c.id, state: c.state ?? (c.runId !== undefined ? 'filed' : 'proposed') };
+        } else if (typeof c.title === 'string' && c.title.trim()) {
+          // A recommendation with nothing to press (its action was refused,
+          // finding 20): still the agent's recommendation, read not pressed.
+          rec = { id: c.id, actionId: '', input: {}, label: c.title, ...(c.rationale ? { rationale: c.rationale } : {}), ...(c.source?.agentSlug ? { agentSlug: c.source.agentSlug } : {}), state: c.state ?? 'proposed' };
+        } else {
+          return;
+        }
+        appendToLatestAgent(m => ({ ...m, recommendations: [...(m.recommendations ?? []).filter(r => r.id !== c.id), rec] }));
+        return;
+      }
+      case 'card_update': {
+        const u = evt as unknown as { cardId: string; runId?: number; state?: RecommendedAction['state'] };
+        appendToLatestAgent(m => ({
+          ...m,
+          recommendations: (m.recommendations ?? []).map(r => (r.id === u.cardId ? { ...r, ...(u.runId !== undefined ? { runId: u.runId } : {}), ...(u.state ? { state: u.state } : {}) } : r)),
+        }));
         return;
       }
       case 'recommended_action': {
@@ -678,6 +818,20 @@ export function useChatSession({
         return;
       }
 
+      case 'self_update': {
+        // The chip that says the system improved ITSELF during this turn. The
+        // same fold as the artifact chip — key by run id, so a proposal that
+        // is refreshed mid-turn leaves one entry at its latest state — except
+        // that these group into ONE chip rather than a row each.
+        const u = evt.selfUpdate as { runId?: unknown; noun?: unknown; target?: unknown; status?: unknown } | undefined;
+        if (!u || typeof u.runId !== 'number' || typeof u.noun !== 'string' || typeof u.target !== 'string') {
+          return;
+        }
+        const receipt = evt.selfUpdate as SelfUpdateReceipt;
+        appendToLatestAgent(m => ({ ...m, selfUpdates: mergeSelfUpdate(m.selfUpdates ?? [], receipt) }));
+        return;
+      }
+
       case 'done':
         flushDeltas();
         // `done` IS the terminal event (#421): the answer is complete even
@@ -710,9 +864,24 @@ export function useChatSession({
         setActivity(null);
         const message = String(evt.message ?? 'error');
         lastRunIsTextRef.current = false;
+        // The turn stops here with whatever text already arrived. Marking it
+        // now means the live transcript says the same thing the reloaded one
+        // will — the server writes the row `incomplete` from the same event
+        // (#114).
+        //
+        // This used to add a tool run called "error" instead, which lit the
+        // tool-error badge: the person read "error failed" over a turn where
+        // no tool had failed, and after the notice landed they read the same
+        // failure twice in one bubble. The run is gone; the reason travels on
+        // the message.
+        // The server says which ending this is, in the same word it will store
+        // on the row; an older runtime that does not say reads as the ending
+        // this used to assume.
+        const ending = (evt.ending as TurnStatus | undefined) ?? 'incomplete';
         appendToLatestAgent(m => ({
           ...m,
-          runs: [...(m.runs ?? []), { type: 'tool', name: 'error', state: 'error', output: message }],
+          status: ending,
+          statusReason: message,
         }));
       }
     }
@@ -801,12 +970,19 @@ export function useChatSession({
   // RESUME a mid-turn stream after refresh/drop: replay missed events, then
   // stay attached live until done. Falls back silently (404 = expired; the
   // finished turn arrives via conversation rehydrate as before).
-  const resumeStream = useCallback(async (stash: StreamStash) => {
-    pendingTraceRef.current = new Map();
-    traceDirtyRef.current = false;
-    textRunsRef.current = 0;
-    lastRunIsTextRef.current = false;
-    setMessages(prev => [...prev, { role: 'assistant', content: '', runs: [] }]);
+  // `continueLatest`: the connection dropped mid-turn in THIS page (Safari's
+  // "Load failed" — a network change, a suspended tab), so the turn's message
+  // is already on screen and the replay continues it rather than starting a
+  // new one. 2026-09-25: the server finished and stored the answer while the
+  // phone showed "This answer stopped partway through".
+  const resumeStream = useCallback(async (stash: StreamStash, opts: { continueLatest?: boolean } = {}) => {
+    if (!opts.continueLatest) {
+      pendingTraceRef.current = new Map();
+      traceDirtyRef.current = false;
+      textRunsRef.current = 0;
+      lastRunIsTextRef.current = false;
+      setMessages(prev => [...prev, { role: 'assistant', content: '', runs: [] }]);
+    }
     streamingRef.current = true;
     setPhase('thinking');
     setTurnOutcome('running');
@@ -861,9 +1037,24 @@ export function useChatSession({
       // queue that survived the reload (sessionStorage) goes out.
       setTurnOutcome('completed');
     } catch (error) {
-      // Expired/unreachable — drop the placeholder; rehydrate covers the rest.
       console.warn('useChatSession: could not re-attach to the running turn', error);
-      setMessages(prev => (prev[prev.length - 1]?.role === 'assistant' && !prev[prev.length - 1]?.content ? prev.slice(0, -1) : prev));
+      if (opts.continueLatest) {
+        // The turn's own message stays; it says the answer stopped where the
+        // connection did — the same ending as before this reconnect existed.
+        flushDeltas();
+        appendToLatestAgent(m => ({
+          ...m,
+          content: m.content || (m.runs ?? [])
+            .filter((run): run is Extract<AgentRun, { type: 'text' }> => run.type === 'text')
+            .map(run => run.text)
+            .join('\n\n'),
+          status: (m.content || (m.runs ?? []).length > 0 ? 'incomplete' : 'failed') as TurnStatus,
+          statusReason: (error as Error).message,
+        }));
+      } else {
+        // Expired/unreachable — drop the placeholder; rehydrate covers the rest.
+        setMessages(prev => (prev[prev.length - 1]?.role === 'assistant' && !prev[prev.length - 1]?.content ? prev.slice(0, -1) : prev));
+      }
       setTurnOutcome('error');
     } finally {
       streamingRef.current = false;
@@ -989,12 +1180,14 @@ export function useChatSession({
         }
         const { messages: hydrated, documents: restoredDocs } = hydrateTranscript(
           (conv.messages ?? []) as PersistedMessageRow[],
+          nameOfAgent,
         );
         if (hydrated.length > 0) {
           conversationIdRef.current = storedId;
           setConversationId(storedId);
           writeSessionConversation(slug, storedId);
           setAutonomyState(readAutonomy(conv));
+          setModelPrefsState(readModelPrefs(conv));
           setMessages(hydrated);
           if (restoredDocs.length > 0) {
             setAllDocuments(restoredDocs);
@@ -1101,15 +1294,17 @@ export function useChatSession({
     routeOnceRef.current = null;
     const routed = searchAgent ?? routeTurn(recordRefs, agents) ?? (onceSlug ? agents.find(a => a.slug === onceSlug) ?? null : null);
     const turnAgent = routed ?? agent;
-    if (routed && routed.slug !== agent.slug) {
-      appendToLatestAgent(m => ({ ...m, agentSlug: routed.slug, agentName: routed.name }));
-    }
+    // The reply is NOT attributed here from the tags: the runtime says who
+    // speaks (`turn_agent`, the first frame) and the row records it. A label
+    // stamped from a guess read "via QA" on a turn the product manager
+    // answered (backlog 009).
     if (conversationIdRef.current === null && agent.slug !== '__search__') {
       try {
         const conv = await client.conversations.create({ agentSlug: agent.slug, ...(scopeRef ? { scopeRef } : {}) });
         setActiveConversation(agent.slug, conv.id);
-        if (autonomy !== 'ask') {
-          // The person's standing choice applies to the thread it just created.
+        if (autonomy !== DEFAULT_AUTONOMY) {
+          // The person's standing choice applies to the thread it just created
+          // (the row is born at the default; only a different rung needs writing).
           client.conversations.setAutonomy({ id: conv.id, autonomy }).catch((error) => {
             console.warn('useChatSession: could not persist the autonomy setting', error);
           });
@@ -1131,12 +1326,18 @@ export function useChatSession({
         body: JSON.stringify({
           message: text,
           agent_slug: turnAgent.slug,
+          // Nobody named an agent for this turn: let the workspace choose
+          // (`services/agents/router.ts`). The reply is attributed to whoever
+          // answers, exactly as an `@mention` is; the reason rides with it.
+          ...(!routed && !isSearchOnly ? { route: true } : {}),
           // The turn's deliverable contract (0102) — a typed field, decided
           // before the turn runs, not a judgement the model makes during it.
           deliverable,
           // R4: page context travels on every surface; a scoped dock also sends
           // its scope so the server folds it in as a ref (mergeScopeRef).
           ...(pageContextRef.current ? { page_context: pageContextRef.current } : {}),
+          // The person's zone: the server judges "today" in it for this turn.
+          time_zone: browserTimeZone(),
           ...(scopeRef ? { scope_ref: scopeRef } : {}),
           ...(recordRefs.length > 0 ? { context_refs: recordRefs } : {}),
           // The files, by artifact id — the server resolves them under this
@@ -1145,6 +1346,9 @@ export function useChatSession({
           // With a conversation attached the server replays its own
           // (authoritative) history and ignores this list.
           ...(activeConversationId !== null ? { conversation_id: activeConversationId } : {}),
+          // How strong a model, how much it thinks (`libs/llm/modelPrefs.ts`).
+          model_strength: modelPrefsRef.current.strength,
+          thinking_effort: modelPrefsRef.current.effort,
           conversation_history: messages
             .slice(-6)
             .filter(m => m.content.trim().length > 0)
@@ -1222,6 +1426,14 @@ export function useChatSession({
         return;
       }
       flushDeltas();
+      // The connection died, nobody pressed Stop, and the server holds the
+      // turn: re-attach once and let it finish into the same message.
+      const reattach = !aborted ? streamStashRef.current : null;
+      if (reattach) {
+        console.warn('useChatSession: the stream dropped; re-attaching to the running turn', err);
+        void resumeStream({ ...reattach }, { continueLatest: true });
+        return;
+      }
       streamingRef.current = false;
       setPhase('idle');
       setActivity(null);
@@ -1239,9 +1451,16 @@ export function useChatSession({
           .map(run => run.text)
           .join('\n\n'),
         trace: aborted ? finalizeTrace(m.trace) : (m.trace ?? []),
+        // A turn that lost its connection is the same story as one whose run
+        // threw: unfinished, not a failed tool (#114). Stopping on purpose is
+        // neither, so an abort marks nothing.
+        // The connection died before any ending arrived from the server, so
+        // the client names one itself: text on screen means the answer stopped
+        // part-way, nothing on screen means the turn never got going. A
+        // deliberate stop is neither — `handleStop` has already marked it.
         ...(aborted
           ? {}
-          : { runs: [...(m.runs ?? []), { type: 'tool' as const, name: 'error', state: 'error' as const, output: (err as Error).message }] }),
+          : { status: (m.content || (m.runs ?? []).length > 0 ? 'incomplete' : 'failed') as TurnStatus, statusReason: (err as Error).message }),
       }));
     } finally {
       // NOTE: the stream stash is NOT cleared here — on a reload the fetch
@@ -1255,7 +1474,7 @@ export function useChatSession({
         abortRef.current = null;
       }
     }
-  }, [agent, agents, messages, pastedText, attachments, uploading, contextRefs, autonomy, handleEvent, appendToLatestAgent, flushDeltas, setActiveConversation, stampLastAssistantId]);
+  }, [agent, agents, messages, pastedText, attachments, uploading, contextRefs, autonomy, handleEvent, appendToLatestAgent, flushDeltas, setActiveConversation, stampLastAssistantId, resumeStream]);
 
   /**
    * Attach files to the next message: upload now, chip now. A refused file
@@ -1290,13 +1509,12 @@ export function useChatSession({
 
   // Abort the in-flight turn (Stop button). The reader loop throws AbortError,
   // which the catch above treats as a clean finalize (no error breadcrumb).
-  const handleStop = useCallback(() => {
+  const handleStop = useCallback(async () => {
     if (!streamingRef.current) {
       return;
     }
     streamingRef.current = false;
     stoppedControllerRef.current = abortRef.current;
-    abortRef.current?.abort();
     flushDeltas();
     // Close this turn's rows HERE rather than in the abort catch, so a
     // stop-and-send lands the tail on the turn that was stopped.
@@ -1307,13 +1525,43 @@ export function useChatSession({
         .map(run => run.text)
         .join('\n\n'),
       trace: finalizeTrace(m.trace),
+      // Marked live as well as stored, so the bubble says the same thing now
+      // as it will after a reload.
+      status: 'stopped' as const,
     }));
     setPhase('idle');
     setActivity(null);
     setTurnOutcome('stopped');
+    // Tell the server, and WAIT for it before aborting.
+    //
+    // Aborting only closes this browser's socket, which is exactly what a
+    // locked phone does — and that turn has to keep running so the person can
+    // come back to it. Stopping is a decision, so it is sent as one, and the
+    // row is stored `stopped` instead of `complete`.
+    //
+    // The wait is what makes the two agree. The run reaches its own end on its
+    // own schedule; if the stop were still in flight when it got there, the
+    // row would say `complete` while this bubble said `stopped`, and a reload
+    // would quietly rewrite what the person remembers doing. Everything above
+    // has already happened, so the screen is not waiting on this.
+    const streamId = streamStashRef.current?.streamId;
     // A stopped turn has nothing to resume.
     streamStashRef.current = null;
     writeStreamStash(null);
+    if (streamId) {
+      try {
+        await fetch('/rpc/agent/stream/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stream_id: streamId }),
+        });
+      } catch (error) {
+        // The turn still stops here, but the stored row will say `complete`
+        // and nobody will know why it looks cut short. Worth a line.
+        console.warn('useChatSession: the server was not told this turn was stopped', error);
+      }
+    }
+    abortRef.current?.abort();
   }, [flushDeltas, appendToLatestAgent]);
 
   /**
@@ -1455,6 +1703,7 @@ export function useChatSession({
       const conv = await client.conversations.get({ id });
       const { messages: hydrated, documents: restoredDocs } = hydrateTranscript(
         (conv.messages ?? []) as PersistedMessageRow[],
+        nameOfAgent,
       );
       const slug = (conv as { agentSlug?: string }).agentSlug ?? agent.slug;
       if (slug !== agent.slug) {
@@ -1466,6 +1715,7 @@ export function useChatSession({
       }
       setActiveConversation(slug, id);
       setAutonomyState(readAutonomy(conv));
+      setModelPrefsState(readModelPrefs(conv));
       setMessages(hydrated);
       setAllDocuments(restoredDocs);
       setPendingHitl(null);
@@ -1495,6 +1745,17 @@ export function useChatSession({
     if (id !== null) {
       client.conversations.setAutonomy({ id, autonomy: next }).catch((error) => {
         console.warn('useChatSession: could not persist the autonomy setting', error);
+      });
+    }
+  }, []);
+
+  /** Change how strong a model answers this thread and how much it thinks — persisted on the conversation when one exists. */
+  const setModelPrefs = useCallback((next: ModelPrefs) => {
+    setModelPrefsState(next);
+    const id = conversationIdRef.current;
+    if (id !== null) {
+      client.conversations.setModel({ id, strength: next.strength, effort: next.effort }).catch((error) => {
+        console.warn('useChatSession: could not persist the model setting', error);
       });
     }
   }, []);
@@ -1633,6 +1894,9 @@ export function useChatSession({
     /** How recommended actions behave in this thread (0094). */
     autonomy,
     setAutonomy,
+    /** How strong a model answers this thread and how much it thinks (`libs/llm/modelPrefs.ts`). */
+    modelPrefs,
+    setModelPrefs,
     /** Thumb + note on an assistant turn, by persisted message id. */
     handleFeedback,
     /** Records the next message is about (`@` tags). */
@@ -1649,10 +1913,11 @@ export function useChatSession({
 }
 
 /**
- * The autonomy rung a persisted conversation carries, defaulting to `ask`.
+ * The autonomy rung a persisted conversation carries; a row that says nothing
+ * usable is at the default.
  * @param conv - A conversation row as the router returns it.
  */
 function readAutonomy(conv: unknown): ConversationAutonomy {
   const a = (conv as { autonomy?: unknown } | null)?.autonomy;
-  return a === 'act-within-bounds' ? 'act-within-bounds' : 'ask';
+  return a === 'ask' || a === 'act-within-bounds' ? a : DEFAULT_AUTONOMY;
 }

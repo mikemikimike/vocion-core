@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/libs/DB');
 vi.mock('@/services/adoption/track', () => ({ track: vi.fn(async () => {}) }));
 vi.mock('@/services/FeedbackWorkerService', () => ({ enqueue: vi.fn(async () => ({ id: 1 })) }));
+vi.mock('@/services/EventService', () => ({ ASK_DECIDED: 'ask.decided', emitEvent: vi.fn(async () => ({ eventId: 1, deduped: false, triggered: [] })) }));
 
 const { db } = await import('@/libs/DB');
 const { askSchema } = await import('@/models/Schema');
 const svc = await import('@/services/AskService');
 const { track } = await import('@/services/adoption/track');
 const { enqueue } = await import('@/services/FeedbackWorkerService');
+const { emitEvent } = await import('@/services/EventService');
 
 const ORG = 'org_ask_test';
 const OTHER_ORG = 'org_ask_other';
@@ -118,6 +120,41 @@ describe('listAsks', () => {
 });
 
 describe('decideAsk', () => {
+  it('announces the decision as an `ask.decided` event an automation can subscribe to — scalars to filter on, and the records it was about', async () => {
+    const { ask } = await svc.upsertAsk({
+      orgId: ORG,
+      ask: { kind: 'recommendation', title: 'Build #41?', agentSlug: 'product-manager', teamSlug: 'software-factory', groupKey: 'software-factory:batch/2026-09-21', sourceRef: 'software-factory:recommendation/41', objectRefs: svc.normaliseObjectRefs([{ type: 'request', id: 41 }]), options: svc.normaliseOptions([{ id: 'build', label: 'Build it', recommended: true }, 'Decline']) },
+    });
+
+    const decided = await svc.decideAsk({ orgId: ORG, id: ask.id, decision: 'build', decidedBy: 'user_chris' });
+
+    // Fire-and-forget: the decision is written and returned first, the event follows.
+    await vi.waitFor(() => expect(emitEvent).toHaveBeenCalledTimes(1));
+
+    expect(emitEvent).toHaveBeenCalledWith({
+      orgId: ORG,
+      type: 'ask.decided',
+      payload: {
+        askId: ask.id,
+        kind: 'recommendation',
+        status: 'done',
+        decision: 'build',
+        followUp: false,
+        agentSlug: 'product-manager',
+        teamSlug: 'software-factory',
+        groupKey: 'software-factory:batch/2026-09-21',
+        sourceRef: 'software-factory:recommendation/41',
+        // The one non-scalar: what the answer is about, for the subscriber
+        // that writes it back onto the request.
+        objectRefs: [{ type: 'request', id: '41' }],
+        decidedBy: 'user_chris',
+        decidedAt: decided.decidedAt!.toISOString(),
+      },
+      dedupeKey: `ask.decided:${ask.id}`,
+      invokedBy: 'user_chris',
+    });
+  });
+
   it('maps approve / reject / done, an option id, and other onto status + decision', async () => {
     const mk = async (options: string[] = []) => (await svc.upsertAsk({ orgId: ORG, ask: { kind: 'approval', title: 'q', options: svc.normaliseOptions(options) } })).ask.id;
 
@@ -141,6 +178,15 @@ describe('decideAsk', () => {
     expect(await svc.decideAsk({ orgId: ORG, id: merge, decision: 'other', note: 'merged by hand', decidedBy: 'u' })).toMatchObject({ decision: 'other', followUp: false });
   });
 
+  it('files the same open question once, refreshed rather than doubled', async () => {
+    const first = await svc.upsertAsk({ orgId: ORG, ask: { kind: 'approval', title: 'Approve build: e2e runner', body: 'v1' } });
+    const again = await svc.upsertAsk({ orgId: ORG, ask: { kind: 'approval', title: ' approve build: E2E runner ', body: 'v2' } });
+
+    expect(again.created).toBe(false);
+    expect(again.ask.id).toBe(first.ask.id);
+    expect(again.ask.body).toBe('v2');
+  });
+
   it('refuses an unknown decision, a second decision, and another org', async () => {
     const id = (await svc.upsertAsk({ orgId: ORG, ask: { kind: 'gate', title: 'q', options: svc.normaliseOptions(['Resume']) } })).ask.id;
 
@@ -159,7 +205,7 @@ describe('decideAsk', () => {
     expect(vi.mocked(track)).toHaveBeenCalledWith(
       { orgId: ORG, userId: 'user_chris' },
       'ask.decided',
-      expect.objectContaining({ agentSlug: 'ceo', resource: ['ask', id], meta: { kind: 'recommendation', status: 'rejected' } }),
+      expect.objectContaining({ agentSlug: 'ceo', resource: ['ask', id], meta: { kind: 'recommendation', status: 'rejected', objectRefs: [] } }),
     );
     expect(vi.mocked(enqueue)).toHaveBeenCalledWith(expect.objectContaining({
       orgId: ORG,

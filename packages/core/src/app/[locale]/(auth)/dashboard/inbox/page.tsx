@@ -5,6 +5,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { InboxControls } from '@/features/dashboard/inbox/InboxControls';
 import { InboxList } from '@/features/dashboard/inbox/InboxList';
 import { contextLine } from '@/features/dashboard/inbox/inboxMeta';
+import { defaultSortFor } from '@/features/dashboard/inbox/searchParams';
 import { TitleBar } from '@/features/dashboard/TitleBar';
 import { clerkAuth as auth } from '@/libs/Auth';
 import { INBOX_SORTS, INBOX_TABS, isInboxKind, listInbox } from '@/services/InboxService';
@@ -44,7 +45,7 @@ export default async function InboxPage(props: {
   }
 
   const tab = ((INBOX_TABS as readonly string[]).includes(sp.tab ?? '') ? sp.tab : 'open') as InboxTab;
-  const sort = ((INBOX_SORTS as readonly string[]).includes(sp.sort ?? '') ? sp.sort : tab === 'decided' ? 'newest' : 'oldest') as InboxSort;
+  const sort = ((INBOX_SORTS as readonly string[]).includes(sp.sort ?? '') ? sp.sort : defaultSortFor(tab)) as InboxSort;
   const kinds = list(sp.kind).filter(isInboxKind) as InboxKind[];
   const actionKinds = list(sp.actionKind);
   const agents = list(sp.agents);
@@ -72,10 +73,10 @@ export default async function InboxPage(props: {
               description={filtered
                 ? 'Clear the search or a filter to see the rest.'
                 : tab === 'open'
-                  ? 'Proposals, rulings, approvals, merges, credentials, recommendations and stopped runs land here as the team works. Nothing is waiting right now.'
+                  ? 'Recommendations, rulings, approvals, merges, credentials, choices and stopped runs land here as the team works. Nothing is waiting right now.'
                   : tab === 'snoozed'
-                    ? 'Proposals you snooze wait here until their time comes.'
-                    : 'Answered asks, decided proposals and adopted rules will be listed here, newest first.'}
+                    ? 'Recommendations you snooze wait here until their time comes.'
+                    : 'Answered asks, decided recommendations and adopted rules will be listed here, newest first.'}
               action={filtered ? { label: 'Clear filters', href: tab === 'open' ? '/dashboard/inbox' : `/dashboard/inbox?tab=${tab}` } : { label: 'See what the team did', href: '/dashboard/activity' }}
             />
           )

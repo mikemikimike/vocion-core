@@ -1,4 +1,5 @@
 import type { ChatInbound, ChatSurfaceAdapter } from '@/libs/surfaces/types';
+import { eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/libs/DB');
@@ -127,6 +128,19 @@ describe('handleInbound', () => {
     expect(adapter.replies[1]!.text).toBe('history=2');
   });
 
+  it('stores the reply as a finished turn, so a Slack answer is not a row nobody can read (#114)', async () => {
+    await svc.createBinding({ orgId: ORG, surface: 'slack', teamId: 'T1', channelId: 'C1', agentSlug: 'revenue-lead' });
+    const adapter = fakeAdapter();
+
+    const out = await svc.handleInbound(adapter, inbound, { runAgent: vi.fn(async () => ({ response: 'up 12%', traceId: 't', toolCalls: [] })) as never, preflight: vi.fn(async () => ({ ok: true as const })) });
+
+    const rows = await db.select().from(conversationMessageSchema).where(eq(conversationMessageSchema.conversationId, out.outcome === 'replied' ? out.conversationId : -1));
+    const assistant = rows.find(r => r.role === 'assistant');
+
+    expect(assistant?.content).toBe('up 12%');
+    expect(assistant?.status).toBe('complete');
+  });
+
   it('replies as the binding persona when it has one, on the agent path and the budget path alike', async () => {
     await svc.createBinding({ orgId: ORG, surface: 'slack', teamId: 'T1', channelId: 'C1', agentSlug: 'revenue-lead', displayName: 'Sterling Banks', iconUrl: 'https://www.vocion.ai/personas/sterling.png' });
     const adapter = fakeAdapter();
@@ -136,7 +150,7 @@ describe('handleInbound', () => {
 
     expect(adapter.replies[0]).toEqual({ channelId: 'C1', threadRef: '100.1', ...persona, text: 'up 12%' });
 
-    await svc.handleInbound(adapter, inbound, { runAgent: vi.fn() as never, preflight: vi.fn(async () => ({ ok: false as const, reason: 'hard_cents_exceeded' as const, limit: 100, current: 150 })) });
+    await svc.handleInbound(adapter, inbound, { runAgent: vi.fn() as never, preflight: vi.fn(async () => ({ ok: false as const, reason: 'hard_cents_exceeded' as const, scope: 'agent' as const, agentSlug: 'support', limit: 100, current: 150, limitFrom: 'own' as const })) });
 
     expect(adapter.replies[1]).toMatchObject(persona);
   });
@@ -175,7 +189,7 @@ describe('handleInbound', () => {
     await svc.createBinding({ orgId: ORG, surface: 'slack', teamId: 'T1', channelId: 'C1', agentSlug: 'revenue-lead' });
     const adapter = fakeAdapter();
     const runAgent = vi.fn();
-    const out = await svc.handleInbound(adapter, inbound, { runAgent: runAgent as never, preflight: vi.fn(async () => ({ ok: false as const, reason: 'hard_cents_exceeded' as const, limit: 100, current: 150 })) });
+    const out = await svc.handleInbound(adapter, inbound, { runAgent: runAgent as never, preflight: vi.fn(async () => ({ ok: false as const, reason: 'hard_cents_exceeded' as const, scope: 'agent' as const, agentSlug: 'support', limit: 100, current: 150, limitFrom: 'own' as const })) });
 
     expect(out).toEqual({ outcome: 'over_budget', agentSlug: 'revenue-lead' });
     expect(runAgent).not.toHaveBeenCalled();

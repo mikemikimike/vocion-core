@@ -17,11 +17,12 @@ import { tool } from '@langchain/core/tools';
 import { and, desc, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '@/libs/DB';
+import { formatDateTime } from '@/libs/time/zone';
 import { agentSchema, briefingSchema, teamSchema } from '@/models/Schema';
 import { PublishBriefingInputSchema } from '@/services/briefings/agentInput';
 import { renderedSections } from '@/services/briefings/document';
 import { TEAM_BRIEF_INSTRUCTION, WORKSPACE_BRIEF_INSTRUCTION } from '@/services/briefings/instructions';
-import { publishBriefingDocument } from '@/services/briefings/store';
+import { newestBriefing, publishBriefingDocument } from '@/services/briefings/store';
 import { BriefingContractError } from '@/services/briefings/validate';
 import { isFromToday, renderBriefingForAgent } from './briefingCitation';
 
@@ -69,6 +70,8 @@ export function publishBriefingTool(ctx: RuntimeContext) {
           teamSlug: scope,
           agentSlug: ctx.agentSlug ?? null,
           userId: ctx.userId ?? null,
+          // The workspace's (or the person's) day names the brief, not the server's.
+          timeZone: ctx.timeZone,
         });
         const sections = renderedSections(doc).join(', ');
         const notes = dropped.length > 0 ? `\nThe contract trimmed some of it: ${dropped.map(d => d.message).join('; ')}.` : '';
@@ -128,7 +131,13 @@ export function getBriefingTool(ctx: RuntimeContext) {
       if (!brief) {
         return `No ${label} briefing published yet. Call refresh_briefing to generate one.`;
       }
-      return renderBriefingForAgent(ctx, brief, label);
+      // A stale brief in this scope must not hide a fresh one next door.
+      const newest = await newestBriefing(ctx.orgId);
+      const newer = newest && newest.id !== brief.id && newest.createdAt > brief.createdAt ? newest : null;
+      const note = newer
+        ? `\n\nNOTE: a NEWER briefing exists — #${newer.id} "${newer.title}" (${newer.teamSlug ? `team ${newer.teamSlug}` : 'workspace rollup'}, published ${formatDateTime(newer.createdAt, ctx.timeZone ?? 'UTC')}). Read it with get_briefing team:"${newer.teamSlug ?? 'rollup'}" before treating the one above as the current picture.`
+        : '';
+      return renderBriefingForAgent(ctx, brief, label) + note;
     },
     {
       name: 'get_briefing',
@@ -144,7 +153,7 @@ export function refreshBriefingTool(ctx: RuntimeContext) {
       const { teamSlug, leadSlug } = await callerTeam(ctx);
       const scope = teamSlug ?? null;
       const brief = await latestBriefing(ctx.orgId, scope);
-      if (brief && isFromToday(brief.createdAt)) {
+      if (brief && isFromToday(brief.createdAt, new Date(), ctx.timeZone)) {
         return `Today's ${teamSlug ? `${teamSlug} ` : 'rollup '}briefing ("${brief.title}") is already current — no refresh needed.`;
       }
       const runner = leadSlug ?? ctx.agentSlug;

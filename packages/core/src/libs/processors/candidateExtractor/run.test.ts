@@ -148,7 +148,7 @@ function context(over: Record<string, unknown> = {}) {
     sourceId: 1,
     sourceSlug: 'bellwater-hall',
     document,
-    outcome: { status: 'created' as const, documentId: 4242, chunks: 3 },
+    outcome: { status: 'created' as const, documentId: 4242, chunks: 3, contentHash: 'fixture-hash' },
     config,
     budget: createSyncBudget(),
     syncContext: { cache: new Map<string, unknown>() },
@@ -168,6 +168,27 @@ describe('candidate extractor, one document end to end', () => {
     for (const slug of ['event-candidate', 'venue-candidate']) {
       await db.insert(businessObjectTypeSchema).values({ orgId: ORG, slug, label: slug, schema: {} });
     }
+  });
+
+  it('sends the structured data on its own when the page text does not carry it whole', async () => {
+    invoke.mockResolvedValue(answer());
+
+    await run(context());
+
+    const human = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
+
+    expect(human).toContain('<jsonld>');
+  });
+
+  it('does not send the structured data twice when the page text already carries it whole', async () => {
+    invoke.mockResolvedValue(answer());
+
+    await run(context({ document: { ...document, metadata: { ...document.metadata, jsonLdInText: true } } }));
+
+    const human = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
+
+    expect(human).not.toContain('<jsonld>');
+    expect(human).toContain('Open Mic Night, every Thursday');
   });
 
   it('returns a counts shape the run report can add up', async () => {
@@ -326,6 +347,83 @@ describe('candidate extractor, one document end to end', () => {
     expect(input.imageUrl).toBe('https://cdn.venue.test/poster.png');
   });
 
+  it('hands the feed URL to the gate, so a link returned as a path still lands', async () => {
+    // The third hand-off: the connector resolved its declaration, the model
+    // reads the raw entry and answers with the path. Without `baseUrl` on the
+    // options the two spellings never meet and the link is dropped silently.
+    const entry = {
+      externalId: 'https://venue.test/events.json#evt-1',
+      uri: 'https://venue.test/events.json#evt-1',
+      title: 'Poster Night',
+      content: '{"fullUrl":"/e/poster-night","title":"Poster Night"}',
+      metadata: {
+        contentType: 'application/json',
+        feedUrl: 'https://venue.test/events.json',
+        publishedUrls: ['https://venue.test/e/poster-night'],
+      },
+    };
+    invoke.mockResolvedValue({
+      content: JSON.stringify({
+        records: [{
+          fields: { title: 'Poster Night', startDate: day(7), venueName: 'Bellwater Hall' },
+          confidence: 0.9,
+          suggestedDecision: 'approve',
+          suggestedDecisionReason: 'A public listing with its own date and venue.',
+          sourceUrl: '/e/poster-night',
+        }],
+      }),
+      usage_metadata: { input_tokens: 900, output_tokens: 120 },
+    });
+
+    await run(context({ document: entry }));
+
+    const runs = await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG));
+    const card = runs.find(row => (row.input as { title?: string }).title === 'Poster Night');
+
+    expect((card?.input as { sourceUrl?: string }).sourceUrl).toBe('https://venue.test/e/poster-night');
+  });
+
+  it('puts the image the document published for itself on the one card it produced', async () => {
+    // The other hand-off this file exists to cover. The connector has kept the
+    // og:image since `pageMetadata.ts` was written and nothing downstream read
+    // it, so the gate dropped every one a model returned and a document that
+    // stated no image per record produced a card with no picture at all.
+    const page = {
+      externalId: 'https://bellwaterhall.example/e/open-mic',
+      uri: 'https://bellwaterhall.example/e/open-mic',
+      title: 'Open Mic Night',
+      // The shape `extractFromHtml` returns: the document's own image is the
+      // first line of the text, which is why the model is not sent it twice.
+      content: [
+        'Image: https://bellwaterhall.example/og-card.png',
+        'Open Mic Night at Bellwater Hall, Riverton. Every Thursday, 8pm.',
+      ].join('\n\n'),
+      metadata: { ogImage: 'https://bellwaterhall.example/og-card.png' },
+    };
+    invoke.mockResolvedValue({
+      content: JSON.stringify({
+        records: [{
+          fields: { title: 'Open Mic Night', startDate: day(7), venueName: 'Bellwater Hall', categories: ['Music'] },
+          confidence: 0.9,
+          suggestedDecision: 'approve',
+          suggestedDecisionReason: 'A public listing with its own date and venue.',
+        }],
+      }),
+      usage_metadata: { input_tokens: 700, output_tokens: 90 },
+    });
+
+    await run(context({ document: page }));
+
+    const runs = await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG));
+    const card = runs.find(row => (row.input as { title?: string }).title === 'Open Mic Night');
+    const input = card?.input as { imageUrl?: string; extractionNotes?: string };
+
+    expect(input.imageUrl).toBe('https://bellwaterhall.example/og-card.png');
+    // Said on the card, so a reviewer can see the picture is the document's
+    // own rather than one stated for this record.
+    expect(input.extractionNotes).toContain('the document published for itself');
+  });
+
   it('reports a skip instead of throwing when the model never answers', async () => {
     invoke.mockResolvedValue({ content: 'I could not read that page.' });
 
@@ -333,7 +431,30 @@ describe('candidate extractor, one document end to end', () => {
 
     expect(result).toMatchObject({ produced: 0, skipped: 1 });
     expect(result.counts).toMatchObject({ model_invalid: 1, model_calls: 2 });
+    expect(result.retry).toBeUndefined();
     expect(await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG))).toHaveLength(0);
+  });
+
+  it('stops before the model call when the proposal budget is already spent, and asks to be run again', async () => {
+    invoke.mockResolvedValue(answer());
+
+    const result = await run(context({ budget: createSyncBudget({ limits: { maxProposalsPerSync: 0 } }) }));
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(result.retry).toEqual({ reason: expect.stringContaining('proposal budget'), countsAsTry: false });
+  });
+
+  it('asks to be run again when the provider refused the call, without using a try', async () => {
+    const refused = Object.assign(new Error('Too many tokens per day, please wait before trying again.'), {
+      $metadata: { httpStatusCode: 429 },
+    });
+    invoke.mockRejectedValue(refused);
+
+    const result = await run(context());
+
+    expect(result).toMatchObject({ produced: 0, skipped: 1 });
+    expect(result.retry).toEqual({ reason: expect.stringContaining('model_throttled'), countsAsTry: false });
+    expect(result.counts).toMatchObject({ model_throttled: 1 });
   });
 
   it('spends one model call per document, whatever the document holds', async () => {

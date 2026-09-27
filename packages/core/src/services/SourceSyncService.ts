@@ -30,7 +30,7 @@
  * (`services/temporal/activities/sourceSync.ts`) rather than the RPC route.
  */
 
-import type { IngestDoc, IngestResult } from './IngestionService';
+import type { IngestDoc, IngestResult, ProcessorRunMark } from './IngestionService';
 import type { SyncBudget, SyncBudgetLimits } from '@/libs/processors/budget';
 import type { RegisteredProcessor } from '@/libs/processors/registry';
 import type { ProcessorRunsOn, ProcessorSyncContext } from '@/libs/processors/types';
@@ -39,14 +39,16 @@ import { and, eq, inArray, lt, ne, or, sql } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { createSyncBudget } from '@/libs/processors/budget';
 import { getProcessor, listProcessorSlugs } from '@/libs/processors/registry';
-import { DEFAULT_RUNS_ON } from '@/libs/processors/types';
+import { DEFAULT_RUNS_ON, MAX_PROCESSOR_ATTEMPTS } from '@/libs/processors/types';
 import { processorRefOf } from '@/libs/sources/processor';
 import { getConnector } from '@/libs/sources/registry';
 import { knowledgeChunkSchema, knowledgeDocumentSchema, knowledgeSourceSchema, sourceSyncCheckpointSchema } from '@/models/Schema';
+import { BudgetExceededError } from '@/services/BudgetService';
 import {
   deleteDocumentsGoneFromSource,
   ensureSource,
   ingestDocument,
+  markProcessorRun,
   markSourceSynced,
 } from './IngestionService';
 import { getCredentialsForConnector } from './SourceCredentialService';
@@ -865,8 +867,28 @@ export async function runSync(opts: {
     if (!processor || !processorBudget) {
       return;
     }
+    const retrying = outcome.status === 'unchanged'
+      && outcome.processorDue
+      && outcome.processorAttempts < MAX_PROCESSOR_ATTEMPTS;
+    const mark = async (step: ProcessorRunMark): Promise<void> => {
+      let attempts: number;
+      try {
+        attempts = await markProcessorRun(outcome.documentId, step);
+      } catch (markError) {
+        log('warn', 'could not record the document processor run', {
+          sourceId: opts.sourceId,
+          orgId: opts.orgId,
+          externalId: doc.externalId,
+          error: markError instanceof Error ? markError.message : String(markError),
+        });
+        return;
+      }
+      if (step.kind === 'failed' && attempts === MAX_PROCESSOR_ATTEMPTS) {
+        bumpProcessorCount('processorRetriesExhausted');
+      }
+    };
     try {
-      if (!processor.runsOn.has(outcome.status)) {
+      if (!processor.runsOn.has(outcome.status) && !retrying) {
         return;
       }
       if (!outcome.documentId) {
@@ -876,8 +898,13 @@ export async function runSync(opts: {
         return;
       }
       if (processorBudget.outOfTime()) {
+        await mark({ kind: 'deferred', error: 'the sync ran out of time before this document', claimed: false });
         return;
       }
+      if (retrying && !processor.runsOn.has(outcome.status)) {
+        bumpProcessorCount('processorRetries');
+      }
+      await mark({ kind: 'started' });
       const { run } = await processor.load();
       const budgetMs = processorTimeoutMs(processor.documentTimeoutMs);
       const timeout = AbortSignal.timeout(budgetMs);
@@ -914,8 +941,16 @@ export async function runSync(opts: {
           bumpProcessorCount(`extract.${key}`, value);
         }
       }
+      if (!processed.retry) {
+        await mark({ kind: 'finished', contentHash: outcome.contentHash });
+      } else if (processed.retry.countsAsTry) {
+        await mark({ kind: 'failed', error: processed.retry.reason });
+      } else {
+        await mark({ kind: 'deferred', error: processed.retry.reason, claimed: true });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      await mark({ kind: 'failed', error: message });
       bumpProcessorCount('processorErrors');
       result.firstProcessorError ??= message;
       recordFailure('processor', message, doc.externalId);
@@ -953,6 +988,19 @@ export async function runSync(opts: {
   // from saving a document. Any of these means we did not get a full picture of
   // what the source holds, so we must not delete anything on the strength of it.
   let connectorFailureCount = 0;
+
+  // The first budget refusal a document hit, if any.
+  //
+  // Every other document failure is counted and stepped over — one malformed
+  // file must not stop a sync. A hard spend cap is the opposite: the next
+  // document would be refused for the same reason, and the one after that, so
+  // carrying on only burns through the connector's pages producing a run that
+  // is one long error list. Recorded here and re-thrown from the loop below,
+  // which stops the run through the ordinary failure path: in-flight documents
+  // finish, the checkpoint records `failed` with this message, and the
+  // watermark stays put so a re-run after the cap is raised picks up where this
+  // one stopped.
+  let budgetRefusal: Error | null = null;
 
   /**
    * Start ingesting one document, and keep track of it until it finishes.
@@ -1015,6 +1063,9 @@ export async function runSync(opts: {
         result.errors += 1;
         seenButNotSavedExternalIds.add(doc.externalId);
         result.firstError ??= error instanceof Error ? error.message : String(error);
+        if (error instanceof BudgetExceededError) {
+          budgetRefusal ??= error;
+        }
         // The counter alone loses the reason. Log it — a run full of rate-limit
         // failures and a run full of malformed documents need different fixes.
         log('warn', 'could not save a document during sync', {
@@ -1059,6 +1110,11 @@ export async function runSync(opts: {
       // An edit to this source stops the run here rather than letting it write
       // documents the new settings no longer ask for.
       await stopIfSuperseded();
+      // A spend cap refused a document. Stop the run rather than asking the
+      // connector for another page that would be refused the same way.
+      if (budgetRefusal) {
+        throw budgetRefusal;
+      }
       if (handledExternalIds.has(doc.externalId)) {
         // Already ingested this document in this run — see handledExternalIds.
         reportProgress({
@@ -1171,6 +1227,32 @@ export async function runSync(opts: {
     if (connectorSlug === 'hubspot' && ((config.objectType as string | undefined) ?? 'contacts') === 'contacts') {
       const { watchForHandoffTriggers } = await import('@/services/HandoffTriggerService');
       await watchForHandoffTriggers(opts.orgId, log);
+    }
+    // The data rooms grow from what just landed: a recording or thread that
+    // clearly belongs to a room is filed with its score (undoable on the
+    // room), a deal that reached Proposal stage gets its room. Same
+    // never-fail-the-sync rule; `VOCION_DATA_ROOM_AUTOFILE=0` switches it off.
+    // …and only for a workspace that turned the data-rooms plugin on: with it
+    // off there is no room to grow and no page to show the filing.
+    const { pluginEnabled } = await import('@/services/PluginService');
+    if (process.env.VOCION_DATA_ROOM_AUTOFILE !== '0' && await pluginEnabled(opts.orgId, 'data-rooms').catch(() => false)) {
+      try {
+        const { collectAfterSync } = await import('@/services/dataRooms/collector');
+        await collectAfterSync(opts.orgId, {
+          sourceId: opts.sourceId,
+          sourceSlug: row.slug,
+          connector: connectorSlug,
+          incremental: !!opts.incremental,
+          created: result.created,
+          updated: result.updated,
+          unchanged: result.unchanged,
+          tombstoned: result.tombstoned,
+          errors: result.errors,
+          completedAt: cutoff.toISOString(),
+        });
+      } catch (err) {
+        log('error', 'data room collection failed after the sync', { sourceId: opts.sourceId, error: err instanceof Error ? err.message : String(err) });
+      }
     }
     return result;
   } catch (err) {
@@ -1381,6 +1463,25 @@ export async function documentCountsForOrg(orgId: string): Promise<Record<number
   const rows = await db
     .select({ sourceId: knowledgeDocumentSchema.sourceId, count: sql<number>`count(*)::int` })
     .from(knowledgeDocumentSchema)
+    .where(eq(knowledgeDocumentSchema.orgId, orgId))
+    .groupBy(knowledgeDocumentSchema.sourceId);
+  const map: Record<number, number> = {};
+  for (const r of rows) {
+    map[r.sourceId] = Number(r.count);
+  }
+  return map;
+}
+
+/**
+ * Chunks per source — the size a connector actually occupies in retrieval,
+ * which a document count alone does not say (one PDF can be 400 chunks).
+ * @param orgId - Org whose sources to count for.
+ */
+export async function chunkCountsForOrg(orgId: string): Promise<Record<number, number>> {
+  const rows = await db
+    .select({ sourceId: knowledgeDocumentSchema.sourceId, count: sql<number>`count(${knowledgeChunkSchema.id})::int` })
+    .from(knowledgeChunkSchema)
+    .innerJoin(knowledgeDocumentSchema, eq(knowledgeChunkSchema.documentId, knowledgeDocumentSchema.id))
     .where(eq(knowledgeDocumentSchema.orgId, orgId))
     .groupBy(knowledgeDocumentSchema.sourceId);
   const map: Record<number, number> = {};

@@ -89,6 +89,55 @@ describe('useChatSession', () => {
     expect(result.current.autonomy).toBe('act-within-bounds');
   });
 
+  it('carries the incomplete mark over on reload, so a turn that failed part-way still reads as failed (#114)', async () => {
+    vi.mocked(client.chatWidget.getState).mockResolvedValue({ agentSlug: 'orchestrator', conversationId: 7, updatedAt: new Date(), railWidth: null, railOpen: null });
+    sessionStorage.setItem('vocion:chat:session:orchestrator', '7');
+    vi.mocked(client.conversations.get).mockResolvedValue({
+      id: 7,
+      orgId: 'org_1',
+      agentSlug: 'orchestrator',
+      title: 'Cut off',
+      messageCount: 3,
+      messages: [
+        { id: 1, conversationId: 7, role: 'user', content: 'how many deals closed?', runsJson: null, createdAt: new Date() },
+        { id: 2, conversationId: 7, role: 'assistant', content: 'Four closed last month, worth', runsJson: null, createdAt: new Date(), status: 'incomplete' },
+        { id: 3, conversationId: 7, role: 'assistant', content: 'Four closed last month, worth $216K.', runsJson: null, createdAt: new Date(), status: null },
+      ],
+    } as never);
+
+    const { result } = await renderHook(() => useChatSession({ agents: AGENTS }));
+
+    await vi.waitFor(() => expect(result.current.messages).toHaveLength(3));
+
+    expect(result.current.messages[1]).toMatchObject({ id: 2, status: 'incomplete' });
+    expect(result.current.messages[2]!.status).toBeUndefined();
+  });
+
+  it('renders the cards a turn put up from the row after a reload, with their filed proposal (backlog 025)', async () => {
+    vi.mocked(client.chatWidget.getState).mockResolvedValue({ agentSlug: 'orchestrator', conversationId: 8, updatedAt: new Date(), railWidth: null, railOpen: null });
+    sessionStorage.setItem('vocion:chat:session:orchestrator', '8');
+    vi.mocked(client.conversations.get).mockResolvedValue({
+      id: 8,
+      orgId: 'org_1',
+      agentSlug: 'orchestrator',
+      title: 'Filed',
+      messageCount: 2,
+      messages: [
+        { id: 1, conversationId: 8, role: 'user', content: 'seven customers lost uploads', runsJson: null, createdAt: new Date() },
+        { id: 2, conversationId: 8, role: 'assistant', content: 'Filing it now.', runsJson: [
+          { type: 'text', text: 'Filing it now.' },
+          { type: 'card', id: 'card_1', kind: 'action', label: 'File this as a request', actionId: 'objects.propose_candidate', input: { objectType: 'request' }, runId: 3691, state: 'filed' },
+        ], createdAt: new Date(), status: 'complete' },
+      ],
+    } as never);
+
+    const { result } = await renderHook(() => useChatSession({ agents: AGENTS }));
+
+    await vi.waitFor(() => expect(result.current.messages).toHaveLength(2));
+
+    expect(result.current.messages[1]?.recommendations).toEqual([{ id: 'card_1', actionId: 'objects.propose_candidate', input: { objectType: 'request' }, label: 'File this as a request', runId: 3691, state: 'filed' }]);
+  });
+
   it('resumes the thread the URL names (`?conversation=<id>`) even on a fresh session', async () => {
     vi.mocked(client.chatWidget.getState).mockResolvedValue(null);
     vi.mocked(client.conversations.get).mockResolvedValue({
@@ -153,7 +202,10 @@ describe('useChatSession', () => {
   it('`/search <query>` routes one turn to the retrieval-only path and sends the bare query (§9.10)', async () => {
     vi.mocked(client.chatWidget.getState).mockResolvedValue(null);
     vi.mocked(client.conversations.create).mockResolvedValue({ id: 3, agentSlug: 'orchestrator' } as never);
-    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response('data: {"type":"done","response":"ok"}\n\n', { headers: { 'content-type': 'text/event-stream' } }));
+    // The runtime says who spoke (backlog 009): the virtual search entry is
+    // on the client roster only, so the server sends the slug as its name and
+    // the transcript names it from the roster.
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response('data: {"type":"turn_agent","agent":{"slug":"__search__","name":"__search__"}}\n\ndata: {"type":"done","response":"ok"}\n\n', { headers: { 'content-type': 'text/event-stream' } }));
     vi.stubGlobal('fetch', fetchMock);
     const agents = [...AGENTS, { slug: '__search__', name: 'Search only', icon: 'search' as const, placeholder: 'Search…' }];
 
@@ -170,7 +222,7 @@ describe('useChatSession', () => {
     expect(body.message).toBe('northwind governance');
     // The conversation stays with the workspace agent.
     expect(result.current.agent.slug).toBe('orchestrator');
-    expect(result.current.messages[1]).toMatchObject({ role: 'assistant', agentName: 'Search only' });
+    expect(result.current.messages[1]).toMatchObject({ role: 'assistant', agentSlug: '__search__', agentName: 'Search only' });
   });
 
   it('handleNewChat clears the view and persists a null conversation pointer', async () => {
@@ -433,5 +485,127 @@ describe('useChatSession', () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]).toMatchObject({ name: 'recommend_action' });
     expect((failed[0] as { output?: string }).output).toMatch(/named no action/);
+  });
+
+  /**
+   * A run that dies mid-answer leaves text on screen (#114). The live
+   * transcript has to say so there and then, or the same turn reads one way
+   * now and another way after a reload, when the persisted row's `incomplete`
+   * arrives.
+   */
+  it('marks the turn incomplete when the stream reports an error mid-answer', async () => {
+    vi.mocked(client.chatWidget.getState).mockResolvedValue(null);
+    vi.mocked(client.conversations.create).mockResolvedValue({ id: 41 } as never);
+    const encoder = new TextEncoder();
+    const frames = [
+      'data: {"type":"response_delta","delta":"Four deals closed last month, worth"}\n\n',
+      'data: {"type":"error","message":"model connection reset"}\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const f of frames) {
+            controller.enqueue(encoder.encode(f));
+          }
+          controller.close();
+        },
+      }),
+    }));
+
+    const { result } = await renderHook(() => useChatSession({ agents: AGENTS }));
+    await vi.waitFor(() => expect(result.current.booted).toBe(true));
+    await result.current.sendMessage('how many deals closed?');
+
+    await vi.waitFor(() => expect(result.current.messages).toHaveLength(2));
+    const assistant = result.current.messages[1]!;
+
+    expect(assistant.status).toBe('incomplete');
+    expect(assistant.content).toContain('Four deals closed last month, worth');
+    expect(assistant.statusReason).toBe('model connection reset');
+    // A dropped stream is not a failed tool: no breadcrumb claiming one is,
+    // which is what used to light the tool-error badge beside the notice.
+    expect((assistant.runs ?? []).filter(r => r.type === 'tool' && r.state === 'error')).toHaveLength(0);
+  });
+
+  /**
+   * Not every ending is a fault (#114). A turn the workspace declined needs
+   * different words from one that broke, and the server says which is which on
+   * the error event so the live bubble and the reloaded one agree.
+   */
+  it('marks a declined turn refused, taking the server at its word', async () => {
+    vi.mocked(client.chatWidget.getState).mockResolvedValue(null);
+    vi.mocked(client.conversations.create).mockResolvedValue({ id: 43 } as never);
+    const encoder = new TextEncoder();
+    const frames = [
+      'data: {"type":"error","message":"Budget exceeded for \\"revenue-lead\\" (monthly: 5100/5000).","ending":"refused"}\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const f of frames) {
+            controller.enqueue(encoder.encode(f));
+          }
+          controller.close();
+        },
+      }),
+    }));
+
+    const { result } = await renderHook(() => useChatSession({ agents: AGENTS }));
+    await vi.waitFor(() => expect(result.current.booted).toBe(true));
+    await result.current.sendMessage('how many deals closed?');
+
+    await vi.waitFor(() => expect(result.current.messages).toHaveLength(2));
+
+    expect(result.current.messages[1]!.status).toBe('refused');
+  });
+
+  /**
+   * Stopping is a decision, and the server cannot see it: an aborted fetch is
+   * what a locked phone looks like too, and that turn has to keep running. So
+   * the client says so out loud, and marks the bubble the same way the stored
+   * row will read (#114).
+   */
+  it('tells the server the turn was stopped, and marks the bubble as stopped', async () => {
+    vi.mocked(client.chatWidget.getState).mockResolvedValue(null);
+    vi.mocked(client.conversations.create).mockResolvedValue({ id: 44 } as never);
+    const encoder = new TextEncoder();
+    const held: { controller: ReadableStreamDefaultController<Uint8Array> | null } = { controller: null };
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (typeof url === 'string' && url.includes('/stop')) {
+        return { ok: true, json: async () => ({ marked: true }) };
+      }
+      return {
+        ok: true,
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            held.controller = controller;
+            controller.enqueue(encoder.encode('data: {"type":"stream_meta","streamId":"stream-42"}\n\n'));
+            controller.enqueue(encoder.encode('data: {"type":"response_delta","delta":"Northwind renews in March and"}\n\n'));
+          },
+        }),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = await renderHook(() => useChatSession({ agents: AGENTS }));
+    await vi.waitFor(() => expect(result.current.booted).toBe(true));
+    void result.current.sendMessage('summarise the account');
+    await vi.waitFor(() => expect(result.current.messages).toHaveLength(2));
+    // Wait for the first tokens: stopping before the turn has said anything
+    // would be testing a different moment than the one that matters.
+    await vi.waitFor(() => expect(result.current.messages[1]!.runs?.length ?? 0).toBeGreaterThan(0));
+
+    result.current.handleStop();
+    held.controller?.close();
+
+    await vi.waitFor(() => {
+      const stop = fetchMock.mock.calls.find(call => String(call[0]).includes('/rpc/agent/stream/stop'));
+
+      expect(stop).toBeDefined();
+      expect(JSON.parse((stop![1] as { body: string }).body)).toEqual({ stream_id: 'stream-42' });
+    });
+    await vi.waitFor(() => expect(result.current.messages[1]!.status).toBe('stopped'));
   });
 });

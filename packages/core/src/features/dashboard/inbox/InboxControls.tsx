@@ -4,14 +4,14 @@ import type { Chip } from '@/components/patterns';
 import type { TokenOption } from '@/components/ui/token-select';
 import type { InboxFacets, InboxKind, InboxSort, InboxTab } from '@/services/InboxService';
 import { useTranslations } from 'next-intl';
-import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { ChipRow, FilterBar } from '@/components/patterns';
+import { usePathname, useRouter } from '@/libs/I18nNavigation';
 import { humaniseActionId } from '@/services/inbox/describeActionRun';
 import { INBOX_KINDS } from '@/services/inbox/kinds';
-
 import { INBOX_KIND_META } from './inboxMeta';
-import { mergeSearch } from './searchParams';
+import { defaultSortFor, mergeSearch } from './searchParams';
 
 const SORTS: readonly InboxSort[] = ['oldest', 'newest', 'value', 'confidence'];
 
@@ -96,7 +96,7 @@ export function InboxControls({ tab, q, sort, kinds, actionKinds, agents, facets
   // dead. Chris, 2026-09-17: *"maybe default to newest first?"* The oldest age
   // is still stated in the header line, so the backlog does not become
   // invisible — it just stops being the only thing you can see.
-  const defaultSort: InboxSort = 'newest';
+  const defaultSort: InboxSort = defaultSortFor(tab);
 
   const kindChips: Chip[] = [
     { key: 'all', label: t('all'), count: total, active: kinds.length === 0, pinned: true, onToggle: () => go({ kind: null }) },
@@ -121,7 +121,7 @@ export function InboxControls({ tab, q, sort, kinds, actionKinds, agents, facets
    * Namespaced by dimension so a selection can be split back into the three
    * URL params it came from. `FilterBar` neither knows nor cares what the
    * prefixes mean — which is what lets the same bar serve Search, the
-   * Discovery ledger and Personalization without learning their vocabularies.
+   * Discovery calls and Personalization without learning their vocabularies.
    */
   const tokenOptions: TokenOption[] = [
     ...INBOX_KINDS.filter(k => counts[k] > 0 || kinds.includes(k)).map(k => ({

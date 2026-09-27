@@ -6,7 +6,10 @@
  * lock-step. New runtime, same events.
  */
 
+import type { SelfUpdateReceipt } from '@/libs/actions/selfUpdate';
 import type { SuggestedDecision } from '@/libs/actions/suggestedDecision';
+
+export type { SelfUpdateReceipt };
 
 /* ------------------------------------------------------------------ */
 /* Event shape — what the SSE adapter emits over the wire             */
@@ -90,7 +93,7 @@ export type RecommendedActionPayload = {
 export type ArtifactPayload = {
   id: number;
   conversationId: number | null;
-  kind: 'table' | 'markdown' | 'chart' | 'record' | 'link' | 'file' | 'sequence' | 'document';
+  kind: 'table' | 'markdown' | 'chart' | 'record' | 'link' | 'file' | 'sequence' | 'document' | 'mission' | 'playbook';
   title: string;
   spec: Record<string, unknown>;
   url?: string | null;
@@ -110,6 +113,9 @@ export type ArtifactPayload = {
   version: number;
   authorKind: 'agent' | 'human' | 'system';
   authorId: string | null;
+  /** Who a share opens for (`libs/share/audience.ts`). Absent on payloads built before sharing existed. */
+  shareAudience?: 'me' | 'workspace' | 'anyone';
+  shareOwnerId?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -172,8 +178,20 @@ export type TraceNodeEvent = {
   resultDetail?: string;
   /** Incremental text for `reason`/`progress` nodes; the renderer appends. */
   delta?: string;
+  /**
+   * Where a long call has got to, as a plain phrase — `sheet 7 of 12`. Shown
+   * on the running step line after its label, never as a second surface.
+   * Cleared when the step lands.
+   */
+  progress?: string;
   /** Output summary — a count or short synopsis. Never a raw dump. */
   result?: string;
+  /**
+   * Both tenses of the step's name, once known (`libs/chat/stepLabels.ts`):
+   * `label` is the one for the current status; a renderer that has the pair
+   * re-derives it when the status changes.
+   */
+  labels?: { running: string; done: string };
   /** For skills / drafts / delegates. */
   confidence?: number;
   /** Sources this node surfaced — bubbles up to the message-level "Grounded in". */
@@ -205,11 +223,21 @@ export type AgentEvent
     | { type: 'subagent_start'; name: string }
     | { type: 'subagent_end'; name: string }
     | { type: 'answering' }
+    /** What the turn is doing right now, in words, for the live status line ("Writing the decision cards"). */
+    | { type: 'status'; label: string }
     | { type: 'response_delta'; delta: string }
     | { type: 'documents'; documents: SearchDocument[] }
     | { type: 'retrieval_progress'; stage: 'started' | 'candidates' | 'fused' | 'reranking' | 'complete'; meta?: Record<string, number | string> }
     | { type: 'skill_result'; skillResult: SkillResultEventPayload }
     | { type: 'recommended_action'; recommendation: RecommendedActionPayload }
+    /**
+     * A card in front of the person (backlog 025) — the typed form every
+     * producer's recommendation becomes at the route. `card_update` moves
+     * its state (filed with a proposal id, decided, deferred) without
+     * re-rendering the turn.
+     */
+    | { type: 'card'; card: import('@/libs/cards/card').Card }
+    | { type: 'card_update'; cardId: string; state?: import('@/libs/cards/card').CardState; runId?: number; ref?: { type: string; id: number }; decision?: { action: string; at: string; by?: string } }
     /**
      * An artifact was created or changed (0095/0101). The pane beside the
      * conversation opens or switches to it and the message gets a chip.
@@ -223,6 +251,16 @@ export type AgentEvent
      */
     | { type: 'artifact'; artifact: ArtifactPayload; pending?: boolean; delta?: string }
     | TraceNodeEvent
+    /**
+     * The system improved ITSELF during this turn — a wiki page, a mission's
+     * notes, a playbook, an agent's own instructions, a remembered rule, a
+     * capability. Rendered as one quiet chip under the turn that did it, with
+     * Undo on each entry; several in a turn group into that one chip rather
+     * than stacking. The payload is built by
+     * `libs/actions/selfUpdate.ts#selfUpdateReceipt`, so the chip, the
+     * Activity row and the review toast say the same words about the run.
+     */
+    | { type: 'self_update'; selfUpdate: SelfUpdateReceipt }
     | { type: 'hitl_gate'; gate: HitlGatePayload }
     /**
      * One tool call failed, reported by the BYOA artifact. Unlike `error` the
@@ -238,20 +276,64 @@ export type AgentEvent
      */
     | { type: 'tool_error'; tool: string; message: string; status?: number }
     /**
+     * A long tool call saying where it has got to: `render_document` is on
+     * sheet 7 of 12, `red_team_document` is reading 7 sheets. One step line,
+     * more information on it — "'working…' isn't much info" (Chris, twice,
+     * 2026-09-18).
+     *
+     * It carries no node id because a tool does not know its own: the client
+     * attaches the note to the in-flight step with this tool name, exactly
+     * the way `tool_error` closes one (`noteToolProgress` in
+     * `features/dashboard/chat/traceReducer.ts`). Advisory — a dropped or
+     * duplicated note only changes what the line said for a second, and the
+     * step's own start/done events remain the record.
+     *
+     * Only emit it from a loop that REALLY runs: a note is a fact about the
+     * work, not an animation.
+     */
+    | { type: 'step_progress'; tool: string; note: string }
+    /**
      * Approved learnings were mounted for this turn. Silent by design: the
      * chat transcript ignores it; the adoption surfaces (Phase 2 growing-
      * memory panel) are its consumers. `paths` lists the mounted memory
      * files (`/learnings/…`, later `/memories/…`).
      */
     | { type: 'memories_mounted'; paths: string[] }
+    /** Which model answers this turn, and how hard it thinks — shown on the turn (`libs/llm/modelPrefs.ts`). */
+    /** A tool made a record the person will want to open — a data room, a proposal. The client shows a chip and peeks it; the run links it in the answer. */
+    /** The model is writing a tool call — its name is known before the call completes; a long argument (a whole document) otherwise reads as 'Working'. */
+    | { type: 'composing'; tool: string }
+    | { type: 'record_created'; record: import('@/services/chat/pageContext').RecordRef }
+    | { type: 'run_meta'; model: string; provider: string; strength: 'fast' | 'balanced' | 'deep'; thinking: 'off' | 'low' | 'medium' | 'high' }
+    /**
+     * The workspace chose the agent for this turn because nobody named one
+     * (`services/agents/router.ts`). First frame of such a turn: the client
+     * attributes the reply to the chosen agent ("via Wiki researcher") and
+     * the decision — candidates, pick, reason — is on the message row.
+     */
+    | { type: 'routed'; routing: import('./router').RoutingDecision; agent: { slug: string; name: string } }
+    /**
+     * Who speaks this turn — the agent the runtime is about to run, whether a
+     * person named it, the workspace chose it, or it is the conversation's
+     * own. Sent on every turn, before the first token, and stamped on the
+     * assistant row as `agent_slug`, so the live transcript and the reloaded
+     * one attribute the turn from the same fact (backlog 009).
+     */
+    | { type: 'turn_agent'; agent: { slug: string; name: string } }
     | { type: 'done'; response: string; traceId?: string }
-    | { type: 'error'; message: string }
+    /**
+     * The turn ended badly. `ending` says HOW, in the same words the row will
+     * be stored with (`services/chat/turnStatus.ts`) — so the live transcript
+     * and the reloaded one say the same thing. Absent from a runtime that
+     * predates the vocabulary, which reads as `incomplete`.
+     */
+    | { type: 'error'; message: string; ending?: import('@/services/chat/turnStatus').TurnStatus }
     /**
      * Runtime-internal (BYOA artifact → core provider): per-model-turn
      * token usage for budget charging. Consumed by the runtime provider,
      * never forwarded to the browser.
      */
-    | { type: 'usage'; model: string; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number };
+    | { type: 'usage'; model: string; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number };
 
 /* ------------------------------------------------------------------ */
 /* Runtime context — what tool factories close over                    */
@@ -287,9 +369,17 @@ export type RuntimeContext = {
   /**
    * Where the person is in the app for THIS turn (page, record, selection,
    * @-mentions) — read by the `page_context` tool. Set per request in
-   * `bindRequestEmit`; undefined for schedules, MCP and API callers.
+   * `compileAgentForRequest`; undefined for schedules, MCP and API callers.
    */
   pageContext?: import('@/services/chat/pageContext').PageContext;
+  /**
+   * The zone THIS turn's dates are judged in: the person's browser zone when
+   * a turn carries one, else the workspace's (`defaultTimeZone`). Set per
+   * request in `compileAgentForRequest`; the tools read it at call time.
+   */
+  timeZone?: string;
+  /** The workspace's zone (`project.time_zone`), resolved once at graph build. */
+  defaultTimeZone?: string;
   /** Which harness runs the loop — stamped on tool_call rows. */
   provider?: 'local' | 'agentcore' | 'runtime';
   /** Langfuse trace id of the current turn — links tool_call rows to cost/latency. */
@@ -302,6 +392,12 @@ export type RuntimeContext = {
   delegations?: Map<string, string>;
   /** Object type slugs this agent can read. */
   objectTypeSlugs: string[];
+  /**
+   * Plugins the workspace has on (`project.enabled_plugins`), resolved once at
+   * graph build. Plugin-owned tool sets (wiki, data rooms) are present only
+   * when their plugin is; `list_capabilities` reads it to say what is off.
+   */
+  enabledPlugins?: string[];
   /** Per-agent retrieval tuning. */
   searchConfig: SearchConfig;
   /**
@@ -314,12 +410,18 @@ export type RuntimeContext = {
     provider?: 'local' | 'agentcore' | 'runtime';
     interrupts?: string[];
     maxTokens?: number;
+    /** Graph steps one turn may take; unset keeps each provider's own backstop. See `stepLimit.ts`. */
+    maxSteps?: number;
     excludeTools?: string[];
     /** Granted-only tools this agent receives (gated tools are absent unless named here). */
     grantTools?: string[];
     model?: string;
+    /** Cache this agent's prompt prefix at the vendor; unset means the process default (on). See `libs/llm/promptCache.ts`. */
+    promptCache?: boolean;
     /** Run the zero-card backstop pass after turns that emit no recommend_action (see workspace schema doc). */
     recommendActionBackstop?: boolean;
+    /** Action kinds this agent earns trust for on its own ledger (`<kind>.<agent-slug>`); see the workspace schema. */
+    ownLedger?: string[];
   };
   /**
    * Side-channel for emitting structured events the LLM stream can't
@@ -331,7 +433,8 @@ export type RuntimeContext = {
    * Per-turn global citation counter. `search_knowledge` allocates a
    * contiguous block for each call so the `[n]` numbers the model sees (and
    * is instructed to cite inline) stay unique + stable across multiple
-   * searches in one turn. Reset per request in `bindRequestEmit`.
+   * searches in one turn. Starts at zero in each request's own context
+   * (`compileAgentForRequest`), so one turn's numbers are only ever its own.
    */
   citationSeq: { current: number };
 };

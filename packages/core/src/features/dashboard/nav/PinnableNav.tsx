@@ -2,8 +2,9 @@
 
 import type { PinnableItem } from './navPins';
 import { ChevronRight, GripVertical, Pin, PinOff } from 'lucide-react';
-import { usePathname } from 'next/navigation';
+
 import { useState } from 'react';
+import { PendingIcon } from '@/components/patterns/PendingIcon';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -13,8 +14,7 @@ import {
 import { SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarMenu, SidebarMenuAction, SidebarMenuBadge, SidebarMenuButton, SidebarMenuItem, SidebarMenuSub, SidebarMenuSubButton, SidebarMenuSubItem } from '@/components/ui/sidebar';
 import { useSidebar } from '@/components/ui/useSidebar';
 import { isNavItemActive } from '@/features/dashboard/isNavItemActive';
-import { NavPendingIcon } from '@/features/dashboard/NavPendingIcon';
-import { Link } from '@/libs/I18nNavigation';
+import { Link, usePathname } from '@/libs/I18nNavigation';
 import { splitOverflow } from './navPins';
 
 const formatBadge = (n: number) => (n > 99 ? '99+' : String(n));
@@ -51,6 +51,8 @@ export function PinnableNav(props: {
   unpinLabel: string;
   reorderable?: boolean;
 }) {
+  // `isMobile` comes from the sidebar's own context: at this width the
+  // sidebar IS a sheet, which is exactly when a flyout has nowhere to fly to.
   const { toggleSidebar, isMobile } = useSidebar();
   const pathname = usePathname();
   const [dragging, setDragging] = useState<string | null>(null);
@@ -100,7 +102,7 @@ export function PinnableNav(props: {
                   {props.reorderable
                     ? <GripVertical className="hidden text-muted-foreground/40 group-hover/menu-item:block" aria-hidden />
                     : null}
-                  <NavPendingIcon icon={item.icon} />
+                  <PendingIcon icon={item.icon} />
                   <span>{item.title}</span>
                 </Link>
               </SidebarMenuButton>
@@ -111,15 +113,17 @@ export function PinnableNav(props: {
                     </SidebarMenuBadge>
                   )
                 : null}
-              <SidebarMenuAction
-                showOnHover
-                title={pinTitle(item.url)}
-                aria-label={`${pinTitle(item.url)}: ${item.title}`}
-                onClick={() => props.onTogglePin(item.url)}
-                className="text-muted-foreground hover:text-foreground"
-              >
-                {pinIcon(item.url)}
-              </SidebarMenuAction>
+              {item.pinnable !== false && (
+                <SidebarMenuAction
+                  showOnHover
+                  title={pinTitle(item.url)}
+                  aria-label={`${pinTitle(item.url)}: ${item.title}`}
+                  onClick={() => props.onTogglePin(item.url)}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  {pinIcon(item.url)}
+                </SidebarMenuAction>
+              )}
               {/* Tabs of a combined page — only while you are on it. */}
               {item.tabs && item.tabs.length > 0 && [item, ...item.tabs].some(i => isNavItemActive(pathname, i.url)) && (
                 <SidebarMenuSub>
@@ -155,7 +159,18 @@ export function PinnableNav(props: {
                     <span>{props.moreLabel}</span>
                   </SidebarMenuButton>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent side="right" align="start" className="w-64 shadow-(--shadow-pop)">
+                {/* On a phone the sidebar is a sheet that already fills most
+                    of the screen, so a 16rem menu opening to its RIGHT is
+                    clipped by the viewport — its items were unreadable and
+                    barely tappable. It drops BELOW the trigger there, inside
+                    the sheet, and never exceeds the screen at any width.
+                    `collisionPadding` keeps it off the edges when it flips. */}
+                <DropdownMenuContent
+                  side={isMobile ? 'bottom' : 'right'}
+                  align="start"
+                  collisionPadding={12}
+                  className="w-[min(16rem,calc(100vw-2rem))] shadow-(--shadow-pop)"
+                >
                   {more.map(item => (
                     <DropdownMenuItem key={item.url} asChild className="group/more flex items-center gap-2 pr-1">
                       <div>

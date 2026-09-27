@@ -54,6 +54,35 @@ function run(records: ReturnType<typeof record>[], config = configWith(), over: 
 }
 
 describe('candidate extractor validation', () => {
+  it('blesses a link the document published as a path', () => {
+    // A JSON feed states an entry's own page relatively. The connector resolves
+    // it before declaring it, because the gate compares exactly, but the model
+    // reads the raw entry and hands the path straight back.
+    const out = run([record({ sourceUrl: '/events/unruly-allies' })], configWith(), {
+      publishedUrls: ['https://www.vtciderlab.com/events/unruly-allies'],
+      baseUrl: 'https://www.vtciderlab.com/events?format=json-pretty',
+    });
+
+    expect(out.records[0]?.sourceUrl).toBe('https://www.vtciderlab.com/events/unruly-allies');
+  });
+
+  it('still refuses a path the document never published', () => {
+    const out = run([record({ sourceUrl: '/events/invented-by-the-model' })], configWith(), {
+      publishedUrls: ['https://www.vtciderlab.com/events/unruly-allies'],
+      baseUrl: 'https://www.vtciderlab.com/events?format=json-pretty',
+    });
+
+    expect(out.records[0]?.sourceUrl).toBeUndefined();
+  });
+
+  it('keeps refusing a path when the document gave no base to resolve against', () => {
+    const out = run([record({ sourceUrl: '/events/unruly-allies' })], configWith(), {
+      publishedUrls: ['https://www.vtciderlab.com/events/unruly-allies'],
+    });
+
+    expect(out.records[0]?.sourceUrl).toBeUndefined();
+  });
+
   it('fills in the source defaults before it checks the identity', () => {
     const config = configWith({ defaults: { venueName: 'Bellwater Hall', venueCity: 'Riverton' } });
 
@@ -152,10 +181,13 @@ describe('candidate extractor validation', () => {
     expect(out.records[0]?.imageUrl).toBe('https://cdn.venue.test/poster.png');
   });
 
-  it('accepts a folded URL however the model rejoined it', () => {
+  it('accepts a folded URL however the model rejoined it, and stores the document\'s spelling', () => {
     // The connector declares the URL joined back up, but the model is shown the
     // document as written, folds and all. Comparing literally would drop
     // exactly the long URLs a fold exists for, so both sides lose whitespace.
+    // What is kept is the declared string, never the model's: the stored value
+    // becomes the href on a reviewer's card, and a newline in it is a dead
+    // link that passed the gate.
     const declared = 'https://venue.test/e/a-title-long-enough-that-the-feed-folded-it';
 
     for (const asModelReturnedIt of [
@@ -165,8 +197,33 @@ describe('candidate extractor validation', () => {
     ]) {
       const out = run([record({ sourceUrl: asModelReturnedIt })], configWith(), { publishedUrls: [declared] });
 
-      expect(out.records[0]?.sourceUrl).toBe(asModelReturnedIt);
+      expect(out.records[0]?.sourceUrl).toBe(declared);
     }
+  });
+
+  it('rewrites an image URL to the document\'s spelling too', () => {
+    const declared = 'https://cdn.venue.test/posters/a-very-long-poster-name-that-folded.png';
+
+    const out = run(
+      [record({ sourceUrl: declared, imageUrl: `https://cdn.venue.test/posters/a-very-long-poster\n -name-that-folded.png` })],
+      configWith(),
+      { publishedUrls: [declared] },
+    );
+
+    expect(out.records[0]?.imageUrl).toBe(declared);
+  });
+
+  it('stores a URL without whitespace even when the document published it with some', () => {
+    // RFC 3986 has no whitespace in a URL, so a space in a declared value is an
+    // artifact of how the feed wrote the line down. Storing the document's
+    // spelling verbatim would hand a reviewer an unclickable link, and letting
+    // the last of two declarations that match win would pick which one by
+    // accident of order.
+    const out = run([record({ sourceUrl: 'https://venue.test/e/a-show' })], configWith(), {
+      publishedUrls: ['https://venue.test/e/a-show', 'https://venue.test/e/a-sh ow'],
+    });
+
+    expect(out.records[0]?.sourceUrl).toBe('https://venue.test/e/a-show');
   });
 
   it('ignores a declared list that is not a list of strings', () => {
@@ -187,6 +244,78 @@ describe('candidate extractor validation', () => {
 
     expect(out.records).toHaveLength(1);
     expect(out.records[0]?.sourceUrl).toBeUndefined();
+  });
+
+  it('accepts the image the document published for itself, which is in no link list', () => {
+    // A <meta> image is not an <a href>, so `collectLinks` never sees it and
+    // the gate used to drop every one a model read off the document's own
+    // text, the text `extractFromHtml` opens with that very URL.
+    const out = run([record({ imageUrl: 'https://bellwaterhall.example/og-card.png' })], configWith(), {
+      ogImage: 'https://bellwaterhall.example/og-card.png',
+    });
+
+    expect(out.records[0]?.imageUrl).toBe('https://bellwaterhall.example/og-card.png');
+    expect(out.records[0]?.issues).toEqual([]);
+  });
+
+  it('fills a missing image from the document\'s own, when the document described one record', () => {
+    const out = run([record()], configWith(), { ogImage: 'https://bellwaterhall.example/og-card.png' });
+
+    expect(out.records[0]?.imageUrl).toBe('https://bellwaterhall.example/og-card.png');
+    expect(out.records[0]?.issues.join(' ')).toContain('the document published for itself');
+    expect(out.counts.image_from_document).toBe(1);
+  });
+
+  it('leaves a document that published no image of its own exactly as it was', () => {
+    const out = run([record()]);
+
+    expect(out.records[0]?.imageUrl).toBeUndefined();
+    expect(out.records[0]?.issues).toEqual([]);
+    expect(out.counts.image_from_document).toBeUndefined();
+  });
+
+  it('does not stamp the document\'s image on each record of a document that listed several', () => {
+    // An og:image describes the DOCUMENT. Where the document lists many
+    // records the image is the page's, and putting it on each one would state
+    // on every card something the document never said about any of them.
+    const out = run([record(), record({ fields: { title: 'Late Show' } })], configWith(), {
+      ogImage: 'https://bellwaterhall.example/og-card.png',
+    });
+
+    expect(out.records.map(kept => kept.imageUrl)).toEqual([undefined, undefined]);
+    expect(out.counts.image_from_document).toBeUndefined();
+  });
+
+  it('leaves an image the model read for the record rather than overwriting it', () => {
+    const out = run([record({ imageUrl: 'https://cdn.bellwaterhall.example/open-mic.jpg' })], configWith(), {
+      links: [{ url: 'https://cdn.bellwaterhall.example/open-mic.jpg', text: 'poster' }],
+      ogImage: 'https://bellwaterhall.example/og-card.png',
+    });
+
+    expect(out.records[0]?.imageUrl).toBe('https://cdn.bellwaterhall.example/open-mic.jpg');
+    expect(out.counts.image_from_document).toBeUndefined();
+  });
+
+  it('still drops an invented image, and fills the gap with the one the document published', () => {
+    // The gate is not softened by having an og:image to fall back on: the
+    // invented URL goes and is reported, and what lands is a value the
+    // document itself stated.
+    const out = run([record({ imageUrl: 'https://evil.example/pwn.png' })], configWith(), {
+      ogImage: 'https://bellwaterhall.example/og-card.png',
+    });
+
+    expect(out.records[0]?.imageUrl).toBe('https://bellwaterhall.example/og-card.png');
+    expect(out.records[0]?.issues.join(' ')).toContain('the image URL was not published by the document');
+  });
+
+  it('ignores a declared image that is not a string', () => {
+    // Cast out of a jsonb column, so the type is a claim. A number here would
+    // throw inside the gate and take the whole document with it.
+    for (const wrong of [42, null, { url: 'x' }, ['https://bellwaterhall.example/og-card.png']]) {
+      const out = run([record()], configWith(), { ogImage: wrong });
+
+      expect(out.records[0]?.imageUrl).toBeUndefined();
+    }
   });
 
   it('collapses two records the document listed twice', () => {
@@ -238,5 +367,88 @@ describe('candidate extractor validation', () => {
 
     expect(calendarToday('America/New_York', at)).toBe('2026-11-10');
     expect(calendarToday(undefined, at)).toBe('2026-11-11');
+  });
+});
+
+describe('scores and cited rules', () => {
+  const RULES = [
+    { id: 'event-extraction#ws-no-cure-claims', text: 'Listings may not promise medical outcomes.' },
+    { id: 'event-extraction#rtestkey01', text: 'Reject records that only advertise a sale.' },
+  ];
+
+  it('keeps a configured score in range and drops the rest', () => {
+    const scored = configWith({ scores: [{ name: 'fit', describe: 'How well it fits the audience.' }] });
+    const out = run([record({ scores: { fit: 0.7, mood: 0.9 } }), record({ scores: { fit: 1.4 } })], scored);
+
+    expect(out.records[0]?.scores).toEqual({ fit: 0.7 });
+    expect(out.records[0]?.issues.join(' ')).toContain('mood dropped');
+    expect(out.records[1]?.scores).toBeUndefined();
+    expect(out.counts['skipped.score_invalid']).toBe(2);
+  });
+
+  it('drops every score when the config names none', () => {
+    const out = run([record({ scores: { fit: 0.7 } })]);
+
+    expect(out.records[0]?.scores).toBeUndefined();
+  });
+
+  it('resolves a cited rule however the model echoed its id, with the text the call carried', () => {
+    const out = run([record({
+      suggestedDecision: 'reject',
+      matchedRules: [
+        { id: 'event-extraction #ws-no-cure-claims', title: 'No cure claims', evidence: 'Doors at 7' },
+        { id: '#rtestkey01' },
+      ],
+    })], configWith(), { rules: RULES });
+
+    expect(out.records[0]?.matchedRules).toEqual([
+      { id: 'event-extraction#ws-no-cure-claims', title: 'No cure claims', text: 'Listings may not promise medical outcomes.', evidence: 'Doors at 7' },
+      { id: 'event-extraction#rtestkey01', text: 'Reject records that only advertise a sale.' },
+    ]);
+  });
+
+  it('drops a rule the call never carried, and evidence the page does not contain', () => {
+    const out = run([record({
+      matchedRules: [
+        { id: 'event-extraction#ws-invented' },
+        { id: 'event-extraction#ws-no-cure-claims', evidence: 'guaranteed cure' },
+      ],
+    })], configWith(), { rules: RULES });
+
+    expect(out.records[0]?.matchedRules).toEqual([{ id: 'event-extraction#ws-no-cure-claims', text: 'Listings may not promise medical outcomes.' }]);
+    expect(out.counts['skipped.rule_not_in_list']).toBe(1);
+    expect(out.counts['skipped.evidence_not_in_document']).toBe(1);
+    expect(out.records[0]?.issues.join(' ')).toContain('not in the document');
+  });
+
+  it('finds evidence in the structured data the prompt showed', () => {
+    const out = run([record({
+      matchedRules: [{ id: 'event-extraction#ws-no-cure-claims', evidence: 'A guaranteed cure' }],
+    })], configWith(), { rules: RULES, jsonLd: [{ '@type': 'Thing', 'description': 'A guaranteed cure, every Thursday.' }] });
+
+    expect(out.records[0]?.matchedRules?.[0]?.evidence).toBe('A guaranteed cure');
+  });
+
+  it('cites a rule once, and records nothing when no citation survives', () => {
+    const out = run([
+      record({ matchedRules: [{ id: 'event-extraction #ws-no-cure-claims' }, { id: '#ws-no-cure-claims' }] }),
+      record({ fields: { startDate: '2026-11-19' }, matchedRules: [{ id: 'event-extraction#ws-invented' }] }),
+    ], configWith(), { rules: RULES });
+
+    expect(out.records[0]?.matchedRules).toEqual([{ id: 'event-extraction#ws-no-cure-claims', text: 'Listings may not promise medical outcomes.' }]);
+    expect(out.records[1]?.matchedRules).toBeUndefined();
+  });
+
+  it('keeps an empty list as checked, and an omitted one as not recorded', () => {
+    const out = run([record({ matchedRules: [] }), record({ fields: { startDate: '2026-11-19' } })], configWith(), { rules: RULES });
+
+    expect(out.records[0]?.matchedRules).toEqual([]);
+    expect(out.records[1]?.matchedRules).toBeUndefined();
+  });
+
+  it('records no rules when the call carried none', () => {
+    const out = run([record({ matchedRules: [{ id: 'event-extraction#ws-no-cure-claims' }] })]);
+
+    expect(out.records[0]?.matchedRules).toBeUndefined();
   });
 });

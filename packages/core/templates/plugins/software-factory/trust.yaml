@@ -1,0 +1,94 @@
+# The trust ladder for the factory, over the eight actions core registers
+# (`libs/actions/factory.ts`). Every rule ships DISABLED except the branch
+# push: a plugin cannot know who owns a merge in someone else's deployment,
+# and Vocion refuses to let one be unowned. The workspace turns a rung on by
+# slug with `extends: core`.
+#
+# The shape: a branch is reversible and visible, so a worker pushes one on
+# its own. A merge is the production deploy on most repositories, so it is a
+# person's, however small the diff. Telling an asker or announcing a release
+# reaches a real person, so a person releases it. Provisioning, anything on a
+# cloud account and a credential are the floor.
+rules:
+  # Starting a build spends money on a model and hands a repository to a
+  # worker: the product owner's tap on the card, every time. Undo cancels it
+  # until a worker claims it.
+  # A product decision on a request — defer, out of scope, answered, a
+  # recommendation approved or rejected — is the product owner's. An agent may
+  # recommend it on a card; it never writes it on its own.
+  - action: objects.update_meta.request.decision
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  - action: factory.dispatch_task
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  # The factory's own retry of an attempt QA sent back, carrying the verdict.
+  # Its own key so a workspace can let it run done-for-you (Undo cancels it
+  # until a worker claims it) while a first build stays a person's tap. An
+  # attempt that was itself a retry is never retried again.
+  - action: factory.dispatch_task.retry
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  - action: git.push_branch
+    autoApproveAbove: 0.7
+    enabled: true
+    rung: execute-within-bounds
+    risk: low
+  - action: git.merge
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: high
+  # Telling the asker is two different things, and the ladder should be able
+  # to tell them apart (review, 2026-09-24): a routine, evidenced completion
+  # ("shipped in v1.8, here is the release") may earn its way out under a
+  # policy the product owner turns on; a decline, an incident update or
+  # anything that touches a promise is read by a person every time. The PM
+  # names the kind on the proposal (notify.requester.<kind>); a kind with no
+  # rule of its own reads the parent's.
+  - action: notify.requester
+    autoApproveAbove: 0.95
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  - action: notify.requester.completion
+    autoApproveAbove: 0.9
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  - action: notify.requester.sensitive
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: high
+  - action: release.announce
+    autoApproveAbove: 0.95
+    enabled: false
+    rung: execute-with-approval
+    risk: medium
+  - action: deploy.release
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: high
+  - action: deploy.provision
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: high
+  - action: aws.mutate
+    autoApproveAbove: 1
+    enabled: false
+    rung: execute-with-approval
+    risk: high
+  - action: credentials.write
+    autoApproveAbove: 1
+    enabled: false
+    rung: recommend
+    risk: high

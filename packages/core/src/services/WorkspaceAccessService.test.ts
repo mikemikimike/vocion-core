@@ -1,0 +1,337 @@
+/**
+ * Who reaches which workspace, against PGlite.
+ *
+ * These are the cases that decide whether per-person workspaces are safe to
+ * build on. The ones that matter most are the refusals: a colleague must not
+ * reach a personal workspace, and neither must an account admin, because a
+ * personal workspace holds that person's own mail and "admin" is not consent.
+ * Both failures are silent — nothing throws, someone simply sees an inbox that
+ * is not theirs.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/libs/DB');
+
+const { db } = await import('@/libs/DB');
+const {
+  accountMembershipSchema,
+  groupProjectGrantSchema,
+  projectMemberSchema,
+  projectSchema,
+  tenantAccountSchema,
+  userGroupMemberSchema,
+  userGroupSchema,
+  userSchema,
+} = await import('@/models/Schema');
+const { accessibleProjects, effectiveRole, reachForAccount, strongerRole } = await import('@/services/WorkspaceAccessService');
+
+const ACCOUNT = 'acct-northwind';
+const OTHER_ACCOUNT = 'acct-kestrel';
+
+const ALEX = 'usr-alex'; // sales, in the revenue group
+const BRIT = 'usr-brit'; // delivery, in the delivery group
+const CASS = 'usr-cass'; // account admin
+const DREW = 'usr-drew'; // in no group at all
+
+const REVENUE = 'proj-revenue';
+const DELIVERY = 'proj-delivery';
+const FACTORY = 'proj-factory';
+const ALEX_PERSONAL = 'proj-personal-alex';
+const BRIT_PERSONAL = 'proj-personal-brit';
+
+async function seed() {
+  await db.insert(tenantAccountSchema).values([
+    { id: ACCOUNT, name: 'Northwind', slug: 'northwind' },
+    { id: OTHER_ACCOUNT, name: 'Kestrel Capital', slug: 'kestrel' },
+  ]);
+
+  await db.insert(userSchema).values([
+    { id: ALEX, email: 'alex@northwind.example' },
+    { id: BRIT, email: 'brit@northwind.example' },
+    { id: CASS, email: 'cass@northwind.example' },
+    { id: DREW, email: 'drew@northwind.example' },
+  ]);
+
+  await db.insert(accountMembershipSchema).values([
+    { accountId: ACCOUNT, userId: ALEX, role: 'member' },
+    { accountId: ACCOUNT, userId: BRIT, role: 'member' },
+    { accountId: ACCOUNT, userId: CASS, role: 'admin' },
+    { accountId: ACCOUNT, userId: DREW, role: 'member' },
+  ]);
+
+  await db.insert(projectSchema).values([
+    { id: REVENUE, accountId: ACCOUNT, slug: 'revenue', name: 'Revenue Team' },
+    { id: DELIVERY, accountId: ACCOUNT, slug: 'delivery-stack', name: 'Delivery Stack' },
+    { id: FACTORY, accountId: ACCOUNT, slug: 'factory', name: 'Factory' },
+    { id: ALEX_PERSONAL, accountId: ACCOUNT, slug: 'personal-alex', name: 'Alex', kind: 'personal', ownerUserId: ALEX },
+    { id: BRIT_PERSONAL, accountId: ACCOUNT, slug: 'personal-brit', name: 'Brit', kind: 'personal', ownerUserId: BRIT },
+  ]);
+
+  await db.insert(userGroupSchema).values([
+    { id: 'grp-revenue', accountId: ACCOUNT, slug: 'revenue-team', name: 'Revenue Team' },
+    { id: 'grp-delivery', accountId: ACCOUNT, slug: 'delivery-team', name: 'Delivery Team' },
+  ]);
+  await db.insert(userGroupMemberSchema).values([
+    { groupId: 'grp-revenue', userId: ALEX },
+    { groupId: 'grp-delivery', userId: BRIT },
+  ]);
+  await db.insert(groupProjectGrantSchema).values([
+    { groupId: 'grp-revenue', projectId: REVENUE, role: 'member' },
+    { groupId: 'grp-delivery', projectId: DELIVERY, role: 'member' },
+    { groupId: 'grp-delivery', projectId: FACTORY, role: 'admin' },
+  ]);
+}
+
+const idsFor = async (userId: string) => (await accessibleProjects(userId)).map(a => a.projectId).sort();
+
+describe('workspace access', () => {
+  beforeEach(async () => {
+    await db.delete(groupProjectGrantSchema);
+    await db.delete(userGroupMemberSchema);
+    await db.delete(userGroupSchema);
+    await db.delete(projectMemberSchema);
+    await db.delete(projectSchema);
+    await db.delete(accountMembershipSchema);
+    await db.delete(userSchema);
+    await db.delete(tenantAccountSchema);
+    await seed();
+  });
+
+  describe('group grants', () => {
+    it('gives a salesperson the revenue workspace and their own, and nothing else', async () => {
+      expect(await idsFor(ALEX)).toEqual([ALEX_PERSONAL, REVENUE].sort());
+    });
+
+    it('gives a delivery engineer both delivery workspaces at the granted roles', async () => {
+      expect(await idsFor(BRIT)).toEqual([BRIT_PERSONAL, DELIVERY, FACTORY].sort());
+      expect(await effectiveRole(BRIT, DELIVERY)).toBe('member');
+      expect(await effectiveRole(BRIT, FACTORY)).toBe('admin');
+    });
+
+    it('refuses the other team\'s workspace', async () => {
+      expect(await effectiveRole(ALEX, DELIVERY)).toBeNull();
+      expect(await effectiveRole(BRIT, REVENUE)).toBeNull();
+    });
+
+    it('takes effect immediately when someone leaves a group', async () => {
+      // The grant is resolved at read time, not expanded into rows, so there is
+      // nothing to re-expand before this is true.
+      await db.delete(userGroupMemberSchema);
+
+      expect(await effectiveRole(ALEX, REVENUE)).toBeNull();
+    });
+  });
+
+  describe('personal workspaces', () => {
+    it('lets the owner in as admin', async () => {
+      expect(await effectiveRole(ALEX, ALEX_PERSONAL)).toBe('admin');
+    });
+
+    it('refuses a colleague', async () => {
+      expect(await effectiveRole(BRIT, ALEX_PERSONAL)).toBeNull();
+      expect(await idsFor(BRIT)).not.toContain(ALEX_PERSONAL);
+    });
+
+    it('refuses an ACCOUNT ADMIN', async () => {
+      // The one that would be easiest to get wrong, and the one whose failure
+      // is least visible. Admin runs the deployment; it does not open someone
+      // else's mail.
+      expect(await effectiveRole(CASS, ALEX_PERSONAL)).toBeNull();
+      expect(await idsFor(CASS)).not.toContain(ALEX_PERSONAL);
+    });
+
+    it('ignores a direct grant written against someone else\'s personal workspace', async () => {
+      // The service layer refuses to write this row. If one exists anyway, it
+      // must be inert rather than effective.
+      await db.insert(projectMemberSchema).values({ projectId: ALEX_PERSONAL, userId: BRIT, role: 'admin' });
+
+      expect(await effectiveRole(BRIT, ALEX_PERSONAL)).toBeNull();
+      expect(await idsFor(BRIT)).not.toContain(ALEX_PERSONAL);
+    });
+  });
+
+  describe('account admins', () => {
+    it('run every shared workspace', async () => {
+      expect(await idsFor(CASS)).toEqual([DELIVERY, FACTORY, REVENUE].sort());
+      expect(await effectiveRole(CASS, REVENUE)).toBe('admin');
+    });
+  });
+
+  describe('a person with no grants', () => {
+    it('reaches nothing at all', async () => {
+      expect(await idsFor(DREW)).toEqual([]);
+      expect(await effectiveRole(DREW, REVENUE)).toBeNull();
+    });
+
+    it('is told nothing exists, rather than that it is forbidden', async () => {
+      // Same answer for "no access" and "no such workspace". On a deployment
+      // where workspaces are named after people, the difference is a
+      // disclosure.
+      expect(await effectiveRole(DREW, REVENUE)).toBe(await effectiveRole(DREW, 'proj-does-not-exist'));
+    });
+  });
+
+  describe('direct grants', () => {
+    it('stack with group grants, strongest winning', async () => {
+      await db.insert(projectMemberSchema).values({ projectId: REVENUE, userId: ALEX, role: 'admin' });
+
+      expect(await effectiveRole(ALEX, REVENUE)).toBe('admin');
+    });
+
+    it('do not weaken a stronger group grant', async () => {
+      await db.delete(groupProjectGrantSchema);
+      await db.insert(groupProjectGrantSchema).values({ groupId: 'grp-revenue', projectId: REVENUE, role: 'admin' });
+      await db.insert(projectMemberSchema).values({ projectId: REVENUE, userId: ALEX, role: 'member' });
+
+      expect(await effectiveRole(ALEX, REVENUE)).toBe('admin');
+    });
+  });
+
+  describe('account isolation', () => {
+    it('never reaches a project on another account', async () => {
+      await db.insert(projectSchema).values({ id: 'proj-foreign', accountId: OTHER_ACCOUNT, slug: 'foreign', name: 'Foreign' });
+      await db.insert(userGroupSchema).values({ id: 'grp-x', accountId: ACCOUNT, slug: 'x', name: 'X' });
+      await db.insert(userGroupMemberSchema).values({ groupId: 'grp-x', userId: ALEX });
+      await db.insert(groupProjectGrantSchema).values({ groupId: 'grp-x', projectId: 'proj-foreign', role: 'admin' });
+
+      expect(await effectiveRole(ALEX, 'proj-foreign')).toBeNull();
+      expect(await idsFor(ALEX)).not.toContain('proj-foreign');
+    });
+
+    it('gives a person with no membership nothing', async () => {
+      expect(await accessibleProjects('usr-nobody')).toEqual([]);
+      expect(await effectiveRole('usr-nobody', REVENUE)).toBeNull();
+    });
+  });
+
+  describe('reachForAccount', () => {
+    const sortKey = (a: { projectId: string }, b: { projectId: string }) => a.projectId.localeCompare(b.projectId);
+
+    it('answers identically to asking one person at a time', async () => {
+      // The members screen reads the whole roster at once; the resolver that
+      // gates a request reads one person. If these two ever disagree, the
+      // screen is describing access nobody actually has.
+      const everyone = [ALEX, BRIT, CASS, DREW];
+      const batched = await reachForAccount(ACCOUNT, everyone);
+
+      for (const userId of everyone) {
+        const one = (await accessibleProjects(userId)).sort(sortKey);
+
+        expect([...batched.get(userId)!].sort(sortKey)).toEqual(one);
+      }
+    });
+
+    it('agrees once direct grants and personal workspaces are in play too', async () => {
+      await db.insert(projectMemberSchema).values([
+        { projectId: DELIVERY, userId: ALEX, role: 'admin' },
+        { projectId: REVENUE, userId: DREW, role: 'member' },
+      ]);
+
+      const batched = await reachForAccount(ACCOUNT, [ALEX, DREW]);
+
+      expect([...batched.get(ALEX)!].sort(sortKey)).toEqual((await accessibleProjects(ALEX)).sort(sortKey));
+      expect([...batched.get(DREW)!].sort(sortKey)).toEqual((await accessibleProjects(DREW)).sort(sortKey));
+    });
+
+    it('gives someone who is not on the account nothing, rather than omitting them', async () => {
+      const batched = await reachForAccount(ACCOUNT, [ALEX, 'usr-nobody']);
+
+      expect(batched.get('usr-nobody')).toEqual([]);
+      expect(batched.has('usr-nobody')).toBe(true);
+    });
+
+    it('asks for nobody without touching the database', async () => {
+      expect(await reachForAccount(ACCOUNT, [])).toEqual(new Map());
+    });
+
+    it('costs the same number of reads however many people are on the account', async () => {
+      // The defect this replaced: `accessOverview` called `accessibleProjects`
+      // inside a per-person loop, so the members screen got slower every time
+      // someone joined. The count must not move with the roster.
+      const spy = vi.spyOn(db, 'select');
+
+      spy.mockClear();
+      await reachForAccount(ACCOUNT, [ALEX, BRIT]);
+      const forTwo = spy.mock.calls.length;
+
+      spy.mockClear();
+      await reachForAccount(ACCOUNT, [ALEX, BRIT, CASS, DREW]);
+      const forFour = spy.mock.calls.length;
+
+      spy.mockRestore();
+
+      expect(forFour).toBe(forTwo);
+      expect(forFour).toBe(4);
+    });
+  });
+
+  describe('strongerRole', () => {
+    it('ranks admin above member', () => {
+      expect(strongerRole('member', 'admin')).toBe('admin');
+      expect(strongerRole('admin', 'member')).toBe('admin');
+      expect(strongerRole('member', 'member')).toBe('member');
+    });
+
+    it('treats null as no access at all', () => {
+      expect(strongerRole(null, 'member')).toBe('member');
+      expect(strongerRole('member', null)).toBe('member');
+      expect(strongerRole(null, null)).toBeNull();
+    });
+  });
+});
+
+/**
+ * `Schema.ts` declares the two roles a second time (it stays free of service
+ * imports) and the DDL pins them a third time with a CHECK. These assert the
+ * database and the code agree, so a role the grant model accepts can never be
+ * one the constraint rejects, or the reverse.
+ */
+describe('role vocabulary', () => {
+  const ROLES = ['admin', 'member'] as const;
+
+  it('accepts every role the resolver can return', async () => {
+    for (const role of ROLES) {
+      await db.insert(projectMemberSchema).values({ projectId: REVENUE, userId: DREW, role });
+
+      expect(await effectiveRole(DREW, REVENUE)).toBe(role);
+
+      await db.delete(projectMemberSchema);
+    }
+  });
+
+  it('rejects a role outside that set', async () => {
+    await expect(
+      db.insert(projectMemberSchema).values({
+        projectId: REVENUE,
+        userId: DREW,
+
+        role: 'superuser' as any,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a project_member source outside direct/owner', async () => {
+    await expect(
+      db.insert(projectMemberSchema).values({
+        projectId: REVENUE,
+        userId: DREW,
+        role: 'member',
+
+        source: 'group' as any,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a project kind outside shared/personal', async () => {
+    await expect(
+      db.insert(projectSchema).values({
+        id: 'proj-bad-kind',
+        accountId: ACCOUNT,
+        slug: 'bad',
+        name: 'Bad',
+
+        kind: 'archived' as any,
+      }),
+    ).rejects.toThrow();
+  });
+});

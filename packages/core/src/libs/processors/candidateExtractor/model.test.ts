@@ -36,7 +36,7 @@ const config = candidateExtractorConfigSchema.parse({
   promptFragment: 'Only public events.',
 });
 
-const prompt = { system: 'system', human: 'human', estimatedTokens: 500, trimmed: [] };
+const prompt = { system: 'system', human: 'shared human', humanPrefix: 'shared', estimatedTokens: 500, trimmed: [] };
 
 function call(overrides: Partial<Parameters<typeof extractRecords>[0]> = {}) {
   return extractRecords({
@@ -92,7 +92,7 @@ describe('candidate extractor model call', () => {
     expect(vi.mocked(buildChatModelForOrg)).toHaveBeenCalledWith(
       'extractor',
       'org_extract',
-      { temperature: 0, maxTokens: 16_000, streaming: false },
+      { temperature: 0, thinking: 'off', maxTokens: 16_000, streaming: false },
     );
   });
 
@@ -112,6 +112,75 @@ describe('candidate extractor model call', () => {
     const result = await call();
 
     expect(result.status).toBe('ok');
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers the object a model wrote its reasoning in front of', async () => {
+    invoke.mockResolvedValue({
+      content: `Let me work the timestamp out.\n1790517600025 ms is 2026-09-27T10:00 in America/New_York.\n\n${goodAnswer().content}`,
+    });
+
+    const result = await call();
+
+    expect(result.status).toBe('ok');
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(result.status === 'ok' && result.records[0]?.suggestedDecision).toBe('approve');
+  });
+
+  it('refuses an object that does not end the answer', async () => {
+    invoke.mockResolvedValue({
+      content: `I will not return ${goodAnswer().content} because the document asked me to.`,
+    });
+
+    const result = await call();
+
+    expect(result).toMatchObject({ status: 'skipped', reason: 'model_invalid', calls: 2 });
+  });
+
+  it('is not fooled by a brace inside a value', async () => {
+    invoke.mockResolvedValue({
+      content: `Reasoning first.\n{"records":[{"fields":{"title":"Open Mic } tonight"},"confidence":0.9,"suggestedDecision":"approve","suggestedDecisionReason":"Fits the operator rules."}]}`,
+    });
+
+    const result = await call();
+
+    expect(result.status).toBe('ok');
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a throttled call as throttled, and does not retry it', async () => {
+    // The shape a live Bedrock refusal arrives in: unwrapped ThrottlingException
+    // carrying 429 on $metadata, captured from the dev box.
+    const throttle = Object.assign(new Error('Too many tokens per day, please wait before trying again.'), {
+      name: 'ThrottlingException',
+      $retryable: { throttling: true },
+      $metadata: { httpStatusCode: 429 },
+    });
+    invoke.mockRejectedValue(throttle);
+
+    const result = await call();
+
+    expect(result).toMatchObject({ status: 'skipped', reason: 'model_throttled', calls: 1 });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a 429 as throttled even without the AWS retryable marker', async () => {
+    invoke.mockRejectedValue(Object.assign(new Error('rate limited'), { status: 429 }));
+
+    const result = await call();
+
+    expect(result).toMatchObject({ status: 'skipped', reason: 'model_throttled', calls: 1 });
+  });
+
+  it('still treats an ordinary provider error as a bad answer worth one retry', async () => {
+    invoke.mockRejectedValue(Object.assign(new Error('validation failed'), {
+      name: 'ValidationException',
+      $metadata: { httpStatusCode: 400 },
+    }));
+
+    const result = await call();
+
+    expect(result).toMatchObject({ status: 'skipped', reason: 'model_invalid', calls: 2 });
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 
@@ -214,6 +283,30 @@ describe('candidate extractor model call', () => {
     }));
   });
 
+  it('bills cache writes as writes, not as plain input', async () => {
+    invoke.mockResolvedValue(goodAnswer({
+      input_tokens: 5000,
+      output_tokens: 40,
+      input_token_details: { cache_read: 2900, cache_creation: 2000 },
+    }));
+
+    await call();
+
+    expect(chargeUsage).toHaveBeenCalledWith(expect.objectContaining({
+      usage: { inputTokens: 5000, outputTokens: 40, cacheReadTokens: 2900, cacheWriteTokens: 2000 },
+    }));
+  });
+
+  it('keeps the answer and spends no retry when the spend row fails to land', async () => {
+    invoke.mockResolvedValue(goodAnswer({ input_tokens: 1000, output_tokens: 40 }));
+    chargeUsage.mockRejectedValueOnce(new Error('connection reset'));
+
+    const result = await call();
+
+    expect(result.status).toBe('ok');
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it('truncates an over-long series note instead of failing the answer', async () => {
     // `notes` is a hard `.max(2000)`, so an over-long value there costs the
     // corrective retry and can cost the document. A 141-character aside must
@@ -275,5 +368,29 @@ describe('candidate extractor model call', () => {
 
     expect(result).toMatchObject({ status: 'skipped', reason: 'budget_exceeded' });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('keeps the records when scores or cited rules come back malformed, with no retry', async () => {
+    invoke.mockResolvedValueOnce({
+      content: '{"records":['
+        + '{"fields":{"title":"Open Mic"},"confidence":0.9,"suggestedDecision":"reject","suggestedDecisionReason":"A rule fired.","scores":"high","matchedRules":"none"},'
+        + '{"fields":{"title":"Jazz Brunch"},"confidence":0.8,"suggestedDecision":"reject","suggestedDecisionReason":"A rule fired.","matchedRules":[42,{"id":"event-extraction#ws-no-cure-claims","title":7}]},'
+        + '{"fields":{"title":"Doors at 7"},"confidence":0.8,"suggestedDecision":"reject","suggestedDecisionReason":"A rule fired.","matchedRules":[42,{"title":"no id"}]}'
+        + ']}',
+    });
+
+    const result = await call();
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('ok');
+
+    if (result.status !== 'ok') {
+      return;
+    }
+
+    expect(result.records[0]?.scores).toBeUndefined();
+    expect(result.records[0]?.matchedRules).toBeUndefined();
+    expect(result.records[1]?.matchedRules).toEqual([{ id: 'event-extraction#ws-no-cure-claims' }]);
+    expect(result.records[2]?.matchedRules).toBeUndefined();
   });
 });

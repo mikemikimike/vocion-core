@@ -13,6 +13,7 @@
  */
 
 import type { ConversationRun, ConversationTraceNode } from '@/services/ConversationService';
+import { stepLabelFor } from '@/libs/chat/stepLabels';
 
 export type CollectedDoc = { document_id: string; semantic_identifier: string; link: string; source_type: string; blurb: string; citationIndex?: number; foundBy?: string };
 
@@ -64,7 +65,11 @@ export class RunCollector {
       tool: node.tool ?? prev?.tool,
       args: node.args ?? prev?.args,
       detail: node.detail ?? prev?.detail,
+      labels: node.labels ?? prev?.labels,
     };
+    if (merged.labels && merged.status !== 'error') {
+      merged.label = stepLabelFor(merged.labels, merged.status as 'start' | 'progress' | 'done');
+    }
     delete (merged as { delta?: string }).delta;
     delete (merged as { type?: string }).type;
     this.trace.set(id, merged);
@@ -90,6 +95,51 @@ export class RunCollector {
   onToolStart(name: string, input: Record<string, unknown>): void {
     this.flushText();
     this.runs.push({ type: 'tool', name, input });
+  }
+
+  onCard(card: { id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string }): void {
+    // Written once: the route tees a card when it is first seen AND again
+    // when the auto-filed copy is written to the stream (finding 18).
+    if (this.hasCard(card.label, card.actionId)) {
+      if (card.runId !== undefined) {
+        this.onCardFiled(card.label, card.actionId, card.runId);
+      }
+      return;
+    }
+    this.flushText();
+    this.runs.push({ type: 'card', ...(card.id ? { id: card.id } : {}), ...(card.kind ? { kind: card.kind } : {}), label: card.label, actionId: card.actionId, input: card.input, runId: card.runId, ...(card.state ? { state: card.state } : {}) });
+  }
+
+  /**
+   * Is this card already on the ledger?
+   * @param label
+   * @param actionId
+   */
+  hasCard(label: string, actionId: string): boolean {
+    return this.runs.some(r => r.type === 'card' && r.label === label && r.actionId === actionId);
+  }
+
+  /**
+   * The card was filed as a proposal after it was written down: stamp the id.
+   * @param label
+   * @param actionId
+   * @param runId
+   * @param outcome
+   * @param outcome.state
+   * @param outcome.ref
+   * @param outcome.ref.type
+   * @param outcome.ref.id
+   */
+  onCardFiled(label: string, actionId: string, runId: number, outcome: { state?: string; ref?: { type: string; id: number } } = {}): void {
+    for (const r of this.runs) {
+      if (r.type === 'card' && r.label === label && r.actionId === actionId) {
+        r.runId = runId;
+        r.state = outcome.state ?? 'filed';
+        if (outcome.ref) {
+          r.ref = outcome.ref;
+        }
+      }
+    }
   }
 
   onToolEnd(name: string, output: string): void {

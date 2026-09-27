@@ -1,0 +1,59 @@
+name: Software factory
+description: >-
+  Turns requests into released changes, with a person on every merge. Four
+  seats, one team: PM (the product manager — reads the request, decides in
+  scope or not, writes the plan and the task contract, keeps the loop moving,
+  authorizes nothing), Design (the designer — what it will look like before a
+  person decides, what it looks like after it ships), Eng (the engineer — the
+  change, in its own checkout) and QA (the reviewer — the verdict against the
+  contract and the evidence). Graded on what was accepted and who is still
+  waiting, never on how many workers ran.
+goal: Every request is a released change or an honest written answer within a week, and a person can run the loop from a phone.
+lead: product-manager
+# TWO OWNERS, TWO DECISIONS (review, 2026-09-24). The workspace's
+# `accountableUser` is the PRODUCT OWNER: they approve the commitment — the
+# build card, with its contract, cost and risk. This team's `accountableUser`
+# is the ENGINEERING OWNER: they approve the merge, which on most repositories
+# is the deploy. A plugin cannot know who either is in someone else's
+# deployment, so no default is shipped here; the workspace sets the team's on
+# this file with `extends: core`. Where one person holds both (a one-person
+# shop), they set both to themselves and the cards still say which hat is
+# being asked for. A routine completion reply may go out under a policy the
+# product owner turns on (`notify.requester.completion` in trust.yaml); a
+# decline or an incident update is read by a person every time.
+#
+# THE SEATS. The team schema has no discipline field and the org chart shows
+# an agent's name and icon, so each agent carries its seat in its `eyebrow`
+# ("Software factory · QA") and in the first word of its description.
+#
+#   PM      product-manager   triage, in scope or not, the plan, the contract,
+#                             what to build next; the team's lead; never merges
+#   Design  designer          the mockup before a decision, the after-shot
+#                             before a close; never builds
+#   Eng     task-engineer     the change in an isolated checkout, the checks,
+#                             the pull request; no merge authority
+#   QA      change-reviewer   the verdict against the contract and the
+#                             verification artifacts; never merges
+measures:
+  # The outcome. A task counts as accepted when a PERSON decided its merge ask
+  # with anything but a reject — human-confirmed, because "accepted" is a
+  # judgement and no count of runs can stand in for it.
+  - key: tasks_accepted
+    label: Tasks accepted
+    dimension: outcome
+    target: 4
+    baseline: 0
+    unit: tasks
+    window: 7d
+    source: {kind: human-confirmed, askKinds: [merge]}
+  # The seven-day promise the close-the-gap mission carries, as a flow count
+  # rather than a level: requests that were shipped or honestly answered inside
+  # a week. Agent-reported, and the report says so.
+  - key: answered_within_seven_days
+    label: Requests answered within seven days
+    dimension: quality
+    target: 4
+    baseline: 1
+    unit: requests
+    window: 7d
+    source: {kind: agent-reported, counts: answeredWithinSevenDays}

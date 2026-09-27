@@ -12,6 +12,9 @@
  *     listing, when someone already knows the site has one
  *   - `crawl: { startUrl, maxDepth?, maxPages?, include?, exclude? }`,
  *     same-origin BFS with optional path filters
+ *   - `ignore: string[]`, CSS selectors for the parts of a page that are not
+ *     the page (a rotating sidebar, a script restamped on every request),
+ *     removed before its text, JSON-LD and links are read
  *
  * With `crawl` and no `feedUrl`, the connector picks the SMALLEST complete
  * source it can find, per listing seed: a feed if the listing advertises one,
@@ -63,11 +66,55 @@ const crawlSchema = z.object({
   exclude: z.array(z.string()).optional(),
 });
 
+const IGNORE_MAX_SELECTORS = 20;
+const IGNORE_SELECTOR_MAX_CHARS = 200;
+
+/**
+ * Why a string cannot be an `ignore` selector, or null when it can. cheerio
+ * reads a string holding `<` as markup and removes nothing, a trailing
+ * combinator matches every child of what it names, a leading one matches
+ * nothing, and a selector that matches the page's own skeleton would remove
+ * the whole page. The rest is compiled against a one-paragraph page, where a
+ * selector cheerio cannot read throws.
+ * @param selector - one trimmed entry from the config.
+ */
+function ignoreSelectorProblem(selector: string): string | null {
+  if (!selector) {
+    return null;
+  }
+  if (selector.includes('<')) {
+    return 'holds `<`, which cheerio reads as markup, not as a selector';
+  }
+  if (/[>+~,]$/.test(selector)) {
+    return 'ends in a combinator, which would match far more than it names';
+  }
+  if (/^[>+~]/.test(selector)) {
+    return 'starts with a combinator and matches nothing';
+  }
+  try {
+    if (load('<p></p>')(selector).is('html, head, body')) {
+      return 'matches html, head or body, which is the whole page';
+    }
+  } catch (err) {
+    return `is not a CSS selector cheerio can read (${(err as Error).message})`;
+  }
+  return null;
+}
+
+const ignoreSelectorSchema = z.string().trim().min(1).max(IGNORE_SELECTOR_MAX_CHARS).superRefine((selector, ctx) => {
+  const problem = ignoreSelectorProblem(selector);
+  if (problem) {
+    ctx.addIssue({ code: 'custom', message: `ignore selector "${selector}" ${problem}` });
+  }
+});
+
 const webConfigSchema = z.object({
   urls: z.array(z.string().url()).optional(),
   urlsFrom: urlsFromSchema.optional(),
   feedUrl: z.string().url().optional(),
   crawl: crawlSchema.optional(),
+  /** CSS selectors for the parts of a page that are not the page, removed before anything is read. HTML pages only. */
+  ignore: z.array(ignoreSelectorSchema).max(IGNORE_MAX_SELECTORS).optional(),
 }).refine(c => c.urls?.length || c.urlsFrom || c.crawl, {
   message: 'Provide `urls`, `urlsFrom` or `crawl`.',
 });
@@ -96,6 +143,7 @@ export const webConnector: SourceConnector<typeof webConfigSchema> = {
   configSchema: webConfigSchema,
   async* sync(ctx: SourceContext): AsyncIterable<IngestDoc> {
     const cfg = webConfigSchema.parse(ctx.config);
+    const ignore = cfg.ignore ?? [];
 
     const listed = [...(cfg.urls ?? [])];
     if (cfg.urlsFrom) {
@@ -114,7 +162,7 @@ export const webConnector: SourceConnector<typeof webConfigSchema> = {
       }
       runNote(ctx, urls[0], `source: ${urls.length} listed URL${urls.length === 1 ? '' : 's'}`);
       for (const url of urls) {
-        yield* fetchDocs(url, ctx);
+        yield* fetchDocs(url, ctx, ignore);
       }
       return;
     }
@@ -124,7 +172,7 @@ export const webConnector: SourceConnector<typeof webConfigSchema> = {
     if (cfg.feedUrl) {
       const url = httpUrl(cfg.feedUrl);
       runNote(ctx, url, 'source: configured feed');
-      yield* fetchDocs(url, ctx);
+      yield* fetchDocs(url, ctx, ignore);
       return;
     }
 
@@ -146,7 +194,7 @@ export const webConnector: SourceConnector<typeof webConfigSchema> = {
     // seeds each allowed their own 60 pages is 300 requests, every run.
     const pages: PageBudget = { attempted: 0 };
     for (const seed of seeds) {
-      yield* smallestSource(seed, cfg.crawl, ctx, pages);
+      yield* smallestSource(seed, cfg.crawl, ctx, pages, ignore);
     }
   },
 };
@@ -178,6 +226,7 @@ type PageBudget = { attempted: number };
  * @param cfg - the crawl config, whose `startUrl` is only the default seed.
  * @param ctx - the sync context.
  * @param pages - the sync's shared page budget, spent across every seed.
+ * @param ignore - the source's `ignore` selectors, applied to every page read.
  * @yields {IngestDoc} one document per page or per event, from whichever source won.
  */
 async function* smallestSource(
@@ -185,6 +234,7 @@ async function* smallestSource(
   cfg: CrawlConfig,
   ctx: SourceContext,
   pages: PageBudget,
+  ignore: readonly string[],
 ): AsyncIterable<IngestDoc> {
   if (pages.attempted >= cfg.maxPages) {
     runNote(ctx, seedUrl, `source: page budget spent (${cfg.maxPages} pages), seed not read`);
@@ -193,13 +243,13 @@ async function* smallestSource(
   // Counted before the fetch, and NOT counted again by `crawl`: the listing is
   // one request whoever ends up reading it.
   pages.attempted += 1;
-  const listing = await fetchPage(httpUrl(seedUrl), ctx);
+  const listing = await fetchPage(httpUrl(seedUrl), ctx, { ignore });
   if (!listing) {
     return;
   }
 
   for (const candidate of discoverFeeds(listing, ctx)) {
-    const docs = await readFeed(candidate, ctx);
+    const docs = await readFeed(candidate, ctx, ignore);
     if (!docs) {
       continue;
     }
@@ -211,7 +261,7 @@ async function* smallestSource(
   const jsonLdNote = hasEventJsonLd(listing) ? '; listing carries Event JSON-LD' : '';
   runNote(ctx, listing.url, `source: listing + depth-${cfg.maxDepth} crawl${jsonLdNote}`);
   // The listing body is handed to the crawl so the seed is not fetched twice.
-  yield* crawl(cfg, ctx, listing, pages);
+  yield* crawl(cfg, ctx, listing, pages, ignore);
 }
 
 /**
@@ -220,9 +270,10 @@ async function* smallestSource(
  * site that never had a feed costs the run nothing.
  * @param candidate - the feed URL and the kind the page claimed it is.
  * @param ctx - the sync context.
+ * @param ignore - the source's `ignore` selectors, for a feed that turns out to be a page.
  */
-async function readFeed(candidate: FeedCandidate, ctx: SourceContext): Promise<IngestDoc[] | null> {
-  const page = await fetchPage(candidate.url, ctx, { probe: true, timeoutMs: PROBE_TIMEOUT_MS });
+async function readFeed(candidate: FeedCandidate, ctx: SourceContext, ignore: readonly string[]): Promise<IngestDoc[] | null> {
+  const page = await fetchPage(candidate.url, ctx, { ignore, probe: true, timeoutMs: PROBE_TIMEOUT_MS });
   if (!page) {
     return null;
   }
@@ -372,7 +423,7 @@ function usableUrl(raw: unknown, urlKey: string): string | undefined {
   // protocol test is the whole point, since zod's `.url()` waves `file://` and
   // `javascript:` through.
   const url = httpUrl(value.trim());
-  return isFetchableUrl(url) ? url : undefined;
+  return isHttpUrl(url) ? url : undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,8 +431,10 @@ function usableUrl(raw: unknown, urlKey: string): string | undefined {
 /* ------------------------------------------------------------------ */
 
 type FetchedPage = {
-  /** The URL actually fetched, after the `webcal:` rewrite. */
+  /** The URL requested, after the `webcal:` rewrite. */
   url: string;
+  /** Where a redirect that stayed on the site landed, else `url`. Read by navigation and the feed scope, never by text or ids. */
+  base: string;
   raw: string;
   contentType: string;
   isHtml: boolean;
@@ -402,23 +455,24 @@ type FetchedPage = {
  * URL would quietly break deletion on an otherwise healthy source.
  * @param url - the URL to fetch; `webcal:` is rewritten to `https:` first.
  * @param ctx - the sync context.
- * @param opts - discovery options.
+ * @param opts - what this source ignores, and the discovery options.
+ * @param opts.ignore - the source's `ignore` selectors, removed from an HTML body before it is read.
  * @param opts.probe - report failures as `skipped` rather than `error`.
  * @param opts.timeoutMs - a shorter leash than the default page timeout.
  */
 async function fetchPage(
   url: string,
   ctx: SourceContext,
-  opts?: { probe?: boolean; timeoutMs?: number },
+  opts: { ignore: readonly string[]; probe?: boolean; timeoutMs?: number },
 ): Promise<FetchedPage | null> {
   const target = httpUrl(url);
   const report = (message: string): void => {
-    ctx.onProgress?.({ kind: opts?.probe ? 'skipped' : 'error', uri: target, message });
+    ctx.onProgress?.({ kind: opts.probe ? 'skipped' : 'error', uri: target, message });
   };
   try {
     const res = await fetch(target, {
       headers: { 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(opts?.timeoutMs ?? PAGE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? PAGE_TIMEOUT_MS),
     });
     if (!res.ok) {
       report(`HTTP ${res.status}`);
@@ -438,10 +492,12 @@ async function fetchPage(
       return null;
     }
     const raw = await res.text();
-    const extracted = isHtml ? extractFromHtml(raw, target) : { title: undefined, content: raw, structure: undefined };
+    const base = res.redirected && HTTP_URL_RE.test(res.url) ? sameSiteUrl(target, res.url) : target;
+    const extracted = isHtml ? extractFromHtml(raw, target, opts.ignore) : { title: undefined, content: raw, structure: undefined };
     const lastModifiedHeader = res.headers.get('last-modified');
     return {
       url: target,
+      base,
       raw,
       contentType,
       isHtml,
@@ -455,6 +511,14 @@ async function fetchPage(
     report((err as Error).message);
     return null;
   }
+}
+
+function sameSiteUrl(requestedUrl: string, landedUrl: string): string {
+  const requested = new URL(requestedUrl);
+  const landed = new URL(landedUrl);
+  const site = (url: URL): string => url.hostname.replace(/^www\./, '');
+  const upgradedAtMost = landed.protocol === requested.protocol || (requested.protocol === 'http:' && landed.protocol === 'https:');
+  return upgradedAtMost && landed.port === requested.port && site(landed) === site(requested) ? landedUrl : requestedUrl;
 }
 
 /**
@@ -489,10 +553,11 @@ function docsFromPage(page: FetchedPage, ctx: SourceContext): IngestDoc[] {
  * Fetch one URL and yield whatever it holds.
  * @param url - the URL to fetch.
  * @param ctx - the sync context.
+ * @param ignore - the source's `ignore` selectors, applied when the body is a page.
  * @yields {IngestDoc} one document per page, or one per event when the body is a feed.
  */
-async function* fetchDocs(url: string, ctx: SourceContext): AsyncIterable<IngestDoc> {
-  const page = await fetchPage(url, ctx);
+async function* fetchDocs(url: string, ctx: SourceContext, ignore: readonly string[]): AsyncIterable<IngestDoc> {
+  const page = await fetchPage(url, ctx, { ignore });
   if (!page) {
     return;
   }
@@ -519,18 +584,36 @@ function splitFeed(page: FetchedPage): IngestDoc[] | null {
   if (page.raw.includes('BEGIN:VEVENT')) {
     return splitIcs(page);
   }
-  const items = topLevelJsonArray(page);
+  const items = feedEntries(page);
   return items ? splitJsonArray(page, items) : null;
 }
 
 /**
+ * The one VEVENT property RFC 5545 defines as when the file was written rather
+ * than as anything about the event, so it is the one property a conformant
+ * exporter is free to change on a request that changed nothing.
+ *
+ * It is dropped before the block becomes document text because that text is
+ * what the ingest hashes to decide a document changed. Exporters that stamp it
+ * per export therefore hand every event a new hash on every fetch, and a
+ * pipeline that runs a model per changed document pays for every one of them to
+ * be read again and return what it returned yesterday. Nothing downstream reads
+ * it. `LAST-MODIFIED` and `SEQUENCE` stay: both say something about the event,
+ * and an exporter that moves those is reporting an edit.
+ */
+const ICS_EXPORT_STAMP = 'DTSTAMP';
+
+/**
  * Split an ICS body on `BEGIN:VEVENT` … `END:VEVENT`.
  *
- * A text split and nothing more: no TZID arithmetic, no RRULE expansion. The
- * only fields unfolded are the ones a later stage reads as a value rather than
- * as text, because a fold would cut those in half: UID, the split key, and the
- * URL properties the extractor's provenance gate compares against. A recurring event stays one document
- * unless the feed itself writes separate components with RECURRENCE-ID.
+ * A text split and nothing more: no TZID arithmetic, no RRULE expansion. Every
+ * property read as a value is unfolded, because RFC 5545 makes a fold a fact
+ * about the line rather than about the value, so reading one without unfolding
+ * simply truncates it. A recurring event stays one document unless the feed
+ * itself writes separate components with RECURRENCE-ID.
+ *
+ * The component is kept verbatim but for `ICS_EXPORT_STAMP`, which says when
+ * the file was written and would otherwise make a re-export read as an edit.
  * @param page - the fetched feed.
  */
 function splitIcs(page: FetchedPage): IngestDoc[] | null {
@@ -572,12 +655,12 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
       return null;
     }
     seen.add(externalId);
-    const published = icsPublishedUrls(block);
+    const published = icsPublishedUrls(block, page.url);
     docs.push({
       externalId,
       uri: externalId,
       title: icsValue(block, 'SUMMARY') || uid,
-      content: block.join('\n'),
+      content: withoutIcsProperty(block, ICS_EXPORT_STAMP).join('\n'),
       // Feed-wide headers say nothing about one event inside it.
       etag: null,
       lastModifiedAt: null,
@@ -603,11 +686,25 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
 const PUBLISHED_URL_CAP = 50;
 const PUBLISHED_URL_CHAR_CAP = 2048;
 
-/** Properties whose value is a URL the entry publishes about itself. */
-const ICS_URL_PROPERTIES = ['URL', 'ATTACH'] as const;
+/**
+ * Properties whose value is a URL the entry publishes about itself: its page,
+ * its attachments, and RFC 7986's `IMAGE`.
+ */
+const ICS_URL_PROPERTIES = ['URL', 'ATTACH', 'IMAGE'] as const;
 
 /**
- * The URLs a VEVENT publishes about itself: its own page, and its attachments.
+ * An exporter's own property for the event's picture, for platforms that ignore
+ * `ATTACH` and `IMAGE` (`X-TKF-FEATURED-IMAGE`, `X-WP-IMAGES-URL`). Anchored so
+ * a property about an image, such as a credit or alt text, is not read as one.
+ */
+const ICS_VENDOR_IMAGE_RE = /^X-[A-Z0-9-]*IMAGES?(?:-UR[LI])?$/;
+
+/** A relative reference written as a path, never a bare word like `None`. */
+const ICS_RELATIVE_PATH_RE = /^\.{0,2}\//;
+
+/**
+ * The URLs a VEVENT publishes about itself: its own page, its attachments, its
+ * image, and any picture an exporter writes under its own `X-` image property.
  *
  * A document's URLs are how the extractor tells a link the page really carried
  * from one a model invented. For an HTML page that list is the parsed links;
@@ -628,22 +725,33 @@ const ICS_URL_PROPERTIES = ['URL', 'ATTACH'] as const;
  * past 140 characters, so a conformant feed splits its own event URL across
  * lines; read without unfolding it would arrive truncated.
  *
- * A relative value is dropped rather than resolved here. A calendar entry is
- * the one feed shape that travels: a VEVENT can be syndicated far from the
- * host that wrote it, so the feed URL is not reliably its base, and guessing
- * one is how a wrong link gets published. A JSON entry does not travel that
- * way, which is why `declaredUrls` does resolve.
+ * A relative value is resolved only for an event the feed's own host wrote. A
+ * calendar entry is the one feed shape that travels: a VEVENT can be syndicated
+ * far from the host that wrote it, so the feed URL is not always its base, and
+ * guessing one is how a wrong link gets published. The event's own absolute
+ * `URL` settles it: on the feed's origin, the event is native and a relative
+ * attachment means what the standard says, a path on that host; anywhere
+ * else, or absent, the relative value is dropped as before.
  * @param block - the VEVENT block's lines, as written in the feed.
+ * @param feedUrl - the URL the feed was fetched from.
  */
-function icsPublishedUrls(block: string[]): string[] {
+function icsPublishedUrls(block: string[], feedUrl: string): string[] {
+  const vendorImages = new Set(icsLines(block).map(line => line.property).filter(name => ICS_VENDOR_IMAGE_RE.test(name)));
+  // Every occurrence, not the first: `ATTACH` repeats per RFC 5545, and a feed
+  // that ships inline base64 bytes on the first line and the poster URL on the
+  // second would otherwise lose the poster entirely.
+  const values = [...ICS_URL_PROPERTIES, ...vendorImages].flatMap(name => icsPublishedValues(block, name));
+  const base = icsNativeBase(block, feedUrl);
   const out: string[] = [];
-  for (const name of ICS_URL_PROPERTIES) {
-    // Every occurrence, not the first: `ATTACH` repeats per RFC 5545, and a
-    // feed that ships inline base64 bytes on the first line and the poster URL
-    // on the second would otherwise lose the poster entirely.
-    for (const value of icsValues(block, name)) {
-      if (isFetchableUrl(value)) {
-        out.push(value);
+  for (const value of values) {
+    if (isFetchableUrl(value)) {
+      out.push(value);
+      continue;
+    }
+    if (base && ICS_RELATIVE_PATH_RE.test(value)) {
+      const resolved = absoluteUrl(value, base);
+      if (resolved && isFetchableUrl(resolved)) {
+        out.push(resolved);
       }
     }
   }
@@ -651,18 +759,57 @@ function icsPublishedUrls(block: string[]): string[] {
 }
 
 /**
- * Whether a value is a URL something downstream could actually fetch.
+ * The feed URL, when the event says it was written on the feed's own origin.
+ * @param block - the VEVENT block's lines, as written in the feed.
+ * @param feedUrl - the URL the feed was fetched from.
+ */
+function icsNativeBase(block: string[], feedUrl: string): string | undefined {
+  const feedOrigin = originOf(feedUrl);
+  if (!feedOrigin) {
+    return undefined;
+  }
+  const native = icsPublishedValues(block, 'URL').some(value => isFetchableUrl(value) && originOf(value) === feedOrigin);
+  return native ? feedUrl : undefined;
+}
+
+/**
+ * The origin of a URL, or undefined when it is not one.
+ * @param value - an absolute URL.
+ */
+function originOf(value: string): string | undefined {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a value has the shape of a URL over http or https.
  *
  * Both halves are needed and neither is enough: zod's `.url()` waves `file://`
  * and `javascript:` through, while the protocol regex alone accepts
- * `https:not a url`. Named for what it tests, the shape, and deliberately not
- * for what `publishedUrls` means, which is a claim about provenance.
+ * `https:not a url`.
+ * @param value - the raw value.
+ */
+function isHttpUrl(value: string): boolean {
+  return HTTP_URL_RE.test(value) && z.string().url().safeParse(value).success;
+}
+
+/**
+ * Whether a value is a URL something downstream could actually fetch: the shape
+ * test, plus the length a feed entry is allowed to declare.
+ *
+ * Named for what it tests and deliberately not for what `publishedUrls` means,
+ * which is a claim about provenance. The cap is kept here rather than in
+ * `isHttpUrl` because it answers "what may this feed write into one metadata
+ * row", which is a question only the feed paths ask. The URL-registry connector
+ * reads a list a person configured and has no such budget, so a cap applied
+ * there would silently drop a long entry nobody asked us to bound.
  * @param value - the raw value.
  */
 function isFetchableUrl(value: string): boolean {
-  return value.length <= PUBLISHED_URL_CHAR_CAP
-    && HTTP_URL_RE.test(value)
-    && z.string().url().safeParse(value).success;
+  return value.length <= PUBLISHED_URL_CHAR_CAP && isHttpUrl(value);
 }
 
 /**
@@ -679,95 +826,221 @@ function isFetchableUrl(value: string): boolean {
  * the first colon. Skipping it instead would leave that component with no UID,
  * and `splitIcs` answers a missing UID by abandoning the split for every event
  * in the feed.
+ *
+ * That fallback is a guess, and it says so. `ATTACH;FILENAME="unclosed:https://…`
+ * splits into a value that reads exactly like a URL the event published, which
+ * is the forgery the quote-aware scan exists to prevent. Marking the guess lets
+ * each reader price it: a guessed `UID` is a usable key and costs nothing,
+ * while a guessed URL is a provenance claim nobody made, so `icsPublishedValues`
+ * refuses it.
  * @param line - one content line, as written in the feed.
  */
-function icsValueColon(line: string): number {
+function icsValueColon(line: string): { colon: number; guessed: boolean } {
   let quoted = false;
   for (let i = 0; i < line.length; i += 1) {
     const ch = line[i];
     if (ch === '"') {
       quoted = !quoted;
     } else if (ch === ':' && !quoted) {
-      return i;
+      return { colon: i, guessed: false };
     }
   }
-  return quoted ? line.indexOf(':') : -1;
+  return quoted ? { colon: line.indexOf(':'), guessed: true } : { colon: -1, guessed: false };
 }
 
 /** A line that continues the one above it, per RFC 5545 folding. */
 const ICS_FOLD_RE = /^[ \t]/;
 
 /**
- * Every occurrence of one property in a VEVENT block, unfolded.
- *
- * `icsValue` answers with the first match, which is right for `UID` and
- * `SUMMARY` because RFC 5545 allows one of each. `ATTACH` may repeat, so a
- * caller that wants attachments has to read them all or it silently keeps
- * whichever the feed happened to write first.
- *
- * Unfolding is unconditional because RFC 5545 section 3.1 makes a fold an
- * artifact of how the line was written down, never part of the value: a value
- * read without unfolding is simply truncated, whether it is a URL or a title.
- *
- * Properties of a nested component are not the event's own. A `VEVENT` carries
- * its alarms inside it and an alarm has its own `ATTACH`, so a reader that did
- * not track depth would declare an alarm's sound file as a URL the event
- * published, and the extractor's gate would then let a model return it as the
- * event's image. Depth is clamped at zero so one stray `END:` cannot silently
- * drop every property after it.
- * @param lines - the block's lines, starting at its own `BEGIN:`.
- * @param name - the property name, uppercase.
+ * One occurrence of a property, unfolded, with what the scanner knows about
+ * it: whether the event itself wrote it rather than a component nested inside
+ * it, and whether the split between its name and its value had to be guessed.
  */
-function icsValues(lines: string[], name: string): string[] {
-  const out: string[] = [];
-  // The block opens with its own `BEGIN:VEVENT`, so the event's properties sit
-  // at depth 1 and anything deeper belongs to a component inside it.
-  let depth = 0;
+type IcsProperty = { value: string; own: boolean; guessed: boolean };
+
+/**
+ * Where one property sits in the block: the line that names it and the span it
+ * occupies, its folded continuations included, `end` exclusive.
+ */
+type IcsLine = { property: string; colon: number; guessed: boolean; start: number; end: number };
+
+/**
+ * Split a block into its properties without reading any of them.
+ *
+ * One scan, because two callers need the same answer about where a property
+ * begins and ends: the value reader below, and the filter that drops a
+ * property before the block is hashed.
+ *
+ * A line with no colon to split on is left out entirely, so a caller that
+ * removes lines never removes one it could not parse. `guessed` covers the
+ * weaker case, a line whose quotes never closed: the name is still read from
+ * the text before the first `;`, which is why dropping such a line is safe
+ * while believing its value is not.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ */
+function icsLines(lines: string[]): IcsLine[] {
+  const out: IcsLine[] = [];
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]!;
     if (ICS_FOLD_RE.test(line)) {
       continue;
     }
-    const colon = icsValueColon(line);
+    const { colon, guessed } = icsValueColon(line);
     if (colon < 0) {
       continue;
     }
-    const property = line.slice(0, colon).split(';')[0]!.toUpperCase();
-    if (property === 'BEGIN') {
-      depth += 1;
-      continue;
+    let end = i + 1;
+    while (end < lines.length && ICS_FOLD_RE.test(lines[end]!)) {
+      end += 1;
     }
-    if (property === 'END') {
-      depth = Math.max(0, depth - 1);
-      continue;
-    }
-    if (depth !== 1 || property !== name) {
-      continue;
-    }
-    let value = line.slice(colon + 1);
-    for (let j = i + 1; j < lines.length && ICS_FOLD_RE.test(lines[j]!); j += 1) {
-      value += lines[j]!.slice(1);
-    }
-    out.push(value.trim());
+    out.push({ property: line.slice(0, colon).split(';')[0]!.toUpperCase(), colon, guessed, start: i, end });
   }
   return out;
 }
 
 /**
- * Read one property out of a VEVENT block.
+ * The block without one property, continuations and all.
+ *
+ * Matching is on the name alone, so `DTSTAMP;X-VENDOR=1:` and a lowercase
+ * `dtstamp:` go the same way as the plain form, which is what RFC 5545 means
+ * by a case-insensitive name carrying parameters.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ * @param name - the property name, uppercase.
+ */
+function withoutIcsProperty(lines: string[], name: string): string[] {
+  const drop = new Set<number>();
+  for (const span of icsLines(lines)) {
+    if (span.property !== name) {
+      continue;
+    }
+    for (let i = span.start; i < span.end; i += 1) {
+      drop.add(i);
+    }
+  }
+  return drop.size === 0 ? lines : lines.filter((_, i) => !drop.has(i));
+}
+
+/**
+ * Every occurrence of one property in a VEVENT block, unfolded, each marked
+ * with whether it is the event's own.
+ *
+ * Unfolding is unconditional because RFC 5545 section 3.1 makes a fold an
+ * artifact of how the line was written down, never part of the value: a value
+ * read without unfolding is simply truncated, whether it is a URL or a title.
+ *
+ * Ownership is tracked by name, not by counting: `END:` closes a component
+ * only when it names the one still open. A feed that writes a stray `END:` in
+ * the middle of a VEVENT would otherwise leave the counter permanently off by
+ * one, and every property after it would read as somebody else's, including
+ * `UID`, which `splitIcs` answers by abandoning the split for the whole file.
+ * Trading one wrong image for every document of a source is not a trade worth
+ * making, so a mismatched `END:` is ignored rather than believed.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ * @param name - the property name, uppercase.
+ */
+function icsProperties(lines: string[], name: string): IcsProperty[] {
+  const out: IcsProperty[] = [];
+  // The block opens with its own `BEGIN:VEVENT`, so while only that is open the
+  // properties are the event's; anything deeper belongs to a component inside.
+  const open: string[] = [];
+  for (const { property, colon, guessed, start, end } of icsLines(lines)) {
+    const line = lines[start]!;
+    if (property === 'BEGIN') {
+      open.push(line.slice(colon + 1).trim().toUpperCase());
+      continue;
+    }
+    if (property === 'END') {
+      if (open[open.length - 1] === line.slice(colon + 1).trim().toUpperCase()) {
+        open.pop();
+      }
+      continue;
+    }
+    if (property !== name) {
+      continue;
+    }
+    let value = line.slice(colon + 1);
+    for (let j = start + 1; j < end; j += 1) {
+      value += lines[j]!.slice(1);
+    }
+    out.push({ value: value.trim(), own: open.length === 1, guessed });
+  }
+  return out;
+}
+
+/**
+ * Every occurrence of one property that the event itself certainly published.
+ *
+ * Two exclusions, both about not putting words in a document's mouth. A
+ * `VEVENT` carries its alarms inside it and an alarm has its own `ATTACH`, so a
+ * reader that ignored nesting would declare an alarm's sound file as a URL the
+ * event published. And a line whose quotes never closed was split by guesswork,
+ * which can manufacture a string that reads like a URL out of a filename
+ * parameter; the extractor's gate would then bless a link nobody published.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ * @param name - the property name, uppercase.
+ */
+function icsPublishedValues(lines: string[], name: string): string[] {
+  return icsProperties(lines, name).filter(p => p.own && !p.guessed).map(p => p.value);
+}
+
+/**
+ * Read one property out of a VEVENT block: the event's own where it has one,
+ * and otherwise the first found at any depth.
+ *
+ * Both halves are load-bearing, and each covers the other's failure. Preferring
+ * the event's own matters because a nested component may carry the same
+ * property name: RFC 9074 gives a `VALARM` its own `UID`, and an `ACTION:EMAIL`
+ * alarm carries a `SUMMARY` that is the mail subject, so a feed writing its
+ * alarm above the event's own lines would otherwise key and title the document
+ * from the alarm. Falling back to any depth matters because a block whose
+ * components do not balance still has a `UID` we would rather find than lose
+ * every document of the source over, which is what `splitIcs` does when the key
+ * comes back empty.
  * @param lines - the block's lines, starting at its own `BEGIN:`.
  * @param name - the property name, uppercase.
  */
 function icsValue(lines: string[], name: string): string {
-  return icsValues(lines, name)[0] ?? '';
+  const found = icsProperties(lines, name);
+  return (found.find(p => p.own) ?? found[0])?.value ?? '';
 }
 
 /**
- * The body as a top-level JSON array, when that is what it is.
- * @param page - the fetched page.
+ * Keys a JSON feed is known to keep its entries under, most trusted first.
+ *
+ * A tie-breaker, not the rule. Naming one CMS's vocabulary as *the* place to
+ * look would put a concretion in shared core; what actually identifies a feed's
+ * entries is their shape, and this list only decides which of two equally
+ * entry-shaped keys a publisher meant. `upcoming` earns its place at the front
+ * because a Squarespace collection publishes it beside `past` and both are real
+ * arrays of real entries, so shape alone cannot separate them.
  */
-/** Where a JSON feed that wraps its entries in an object tends to keep them. */
 const FEED_ARRAY_PATHS = ['upcoming', 'items', 'events', 'data'] as const;
+
+/**
+ * The value, when it is a list of entries rather than a list of anything else.
+ *
+ * Entries are objects. A bare array of strings is a page's navigation labels or
+ * a registry of URLs, and splitting one gives a document whose whole content is
+ * `"Home"`, hashed for an id, embedded, and sent to the model, which can only
+ * answer that there is no event in it. Emptiness is not entry-shaped either: a
+ * feed with nothing in it today is a feed to leave whole, not one to split into
+ * no documents at all.
+ * @param value - a candidate array from the body.
+ */
+function entryArray(value: unknown): unknown[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  // Anything that is not an object is a hole and is dropped: a null, a number,
+  // a stray label. What decides the array is whether any entry survives that,
+  // so a list of nothing but strings is a navigation menu and no feed at all,
+  // while a good list with one hole in it still splits. Demanding that every
+  // element be an entry would let one hole cost the split for the whole source,
+  // which puts it back on a single whole-file document, and only the first
+  // `PAGE_CHAR_CAP` characters of that ever reach a model.
+  const entries = value.filter(isRecord);
+  return entries.length > 0 ? entries : null;
+}
 
 /**
  * The entries of a JSON feed, whether the body is the array or wraps one.
@@ -780,13 +1053,21 @@ const FEED_ARRAY_PATHS = ['upcoming', 'items', 'events', 'data'] as const;
  * settings and never an event. `looksLikeFeed` already admits such a body, so
  * refusing to split it was the connector disagreeing with itself.
  *
- * Only the first populated key is taken. A listing that publishes `upcoming`
- * beside `past` means the second one on purpose, and `splitJsonArray` abandons
- * the whole file on a repeated id, which a recurring entry present in both
- * would cause.
+ * Which key holds them is decided by shape: any key whose value is a non-empty
+ * array of objects is a candidate, and a body that names none of the known keys
+ * is still split on whatever key its entries are under. `FEED_ARRAY_PATHS` only
+ * settles which of several candidates was meant, which is what keeps a vendor's
+ * vocabulary from deciding anything on its own: a sibling `past` array loses
+ * without ever being named, because `upcoming` is the more trusted of two
+ * equals.
+ *
+ * Deliberately NOT built on `arrayFromBody`: that helper answers a different
+ * question for the URL-registry connector and carries a `urls` fallback of its
+ * own, which would quietly outrank every key here and split a feed on its link
+ * registry instead of its events.
  * @param page - the fetched feed.
  */
-function topLevelJsonArray(page: FetchedPage): unknown[] | null {
+function feedEntries(page: FetchedPage): unknown[] | null {
   if (!page.contentType.includes('json')) {
     return null;
   }
@@ -796,44 +1077,188 @@ function topLevelJsonArray(page: FetchedPage): unknown[] | null {
   } catch {
     return null;
   }
+  const bare = entryArray(parsed);
+  if (bare || !isRecord(parsed)) {
+    return bare;
+  }
   for (const path of FEED_ARRAY_PATHS) {
-    const found = arrayFromBody(parsed, path);
-    if (found?.length) {
-      return found;
+    const entries = entryArray(parsed[path]);
+    if (entries) {
+      return entries;
     }
   }
-  return Array.isArray(parsed) ? parsed : null;
+  // A known key present but empty is the feed answering "nothing today", not
+  // failing to answer, so the file stays whole rather than falling through to a
+  // sibling. Otherwise the day a listing's last entry ages out, every document
+  // of the source is swapped for whatever the archive key holds and swapped
+  // back when the next one is published: two tombstone-and-re-embed cycles,
+  // plus a model call per stale entry, since the pipeline only learns an entry
+  // is stale after a model has read it.
+  if (FEED_ARRAY_PATHS.some(path => Array.isArray(parsed[path]) && parsed[path].length === 0)) {
+    return null;
+  }
+  const first = Object.keys(parsed).find(key => entryArray(parsed[key]));
+  return first === undefined ? null : entryArray(parsed[first]);
 }
 
 /**
- * Split a top-level JSON array into one document per item, keyed by the
- * item's own identifier where it has one and by a hash of the item where it
- * does not, never by its position in the array.
+ * Sentinels for the two kinds of break we add on purpose, so the whitespace
+ * pass can flatten the newlines that merely came from the source markup
+ * without flattening ours. They are private-use code points, which no real
+ * page has any business containing, and they are scrubbed out of the input
+ * first so neither a page nor a feed entry can smuggle one in.
+ */
+const PARAGRAPH_MARK = '';
+const LINE_MARK = '';
+const OWN_MARKS = /[]/g;
+const PARAGRAPH_MARK_RE = / ? ?/g;
+const LINE_MARK_RE = / ? ?/g;
+
+/** Counters a feed moves on every view, never an edit (Localist's view and attendance counts). */
+const ITEM_VOLATILE_FIELDS: ReadonlySet<string> = new Set(['detail_views', 'num_attending']);
+
+/** A string carrying markup rather than describing one. */
+const MARKUP_RE = /<[a-z!/][^>]*>/i;
+
+/**
+ * The window a millisecond timestamp falls in, 2001 to 2033. Narrow on purpose:
+ * it is what keeps a price, a count or an identifier from being read as a date
+ * however its key is spelled.
+ */
+const EPOCH_MS_MIN = 1_000_000_000_000;
+const EPOCH_MS_MAX = 2_000_000_000_000;
+
+/**
+ * The last word of a key that means the value is a moment in time.
+ *
+ * A word, not a suffix, because a suffix test on `at` or `on` also matches
+ * `format`, `season`, `location` and `lat`. `publishOn`, `created_at`,
+ * `startDate` and `endTime` all end on one of these; `duration` and `version`
+ * end on none.
+ */
+const TIME_WORDS = new Set(['at', 'on', 'date', 'time', 'timestamp']);
+
+/**
+ * Whether a key names a moment rather than a number.
+ * @param key - the key the value sat under.
+ */
+function namesATime(key: string): boolean {
+  const words = key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[\s_\-.]+/);
+  return TIME_WORDS.has(words[words.length - 1] ?? '');
+}
+
+/**
+ * The text a markup string says, breaks kept.
+ *
+ * `body` is read rather than the root so a fragment that opens with a
+ * head-level tag does not fold that tag's text into the entry's prose, and the
+ * page's own break marks are scrubbed first so a feed cannot inject them.
+ * @param value - a string containing markup.
+ */
+function textFromMarkup(value: string): string {
+  const $ = load(value.replace(OWN_MARKS, ' '));
+  $('script,style,noscript').remove();
+  markBreaks($);
+  return collapse($('body').text());
+}
+
+/**
+ * One line of what a markup string says.
+ * @param value - a string that may contain markup.
+ */
+function plainText(value: string): string {
+  return MARKUP_RE.test(value) ? flatten(textFromMarkup(value)) : value;
+}
+
+/**
+ * The entry as it reads: markup reduced to the text it renders, a millisecond
+ * timestamp written as the instant it names, view counters left out.
+ *
+ * Applied to the text a document carries, never to the values its identity is
+ * read from. A feed's markup is the same prose rewritten by whatever built the
+ * page that morning — a stylesheet hash inside an attribute, an asset version,
+ * a wrapper class — so hashing it verbatim reports an edit on a request that
+ * changed nothing, and a pipeline that runs a model per changed document pays
+ * for every one. The rendered text is what actually changed or did not. It is
+ * also what a reader, human or model, was going to read anyway: an epoch
+ * integer is a date nobody can check, and the markup is several times the size
+ * of the words inside it.
+ * @param value - any JSON value from the entry.
+ * @param key - the key it sat under, where it had one.
+ */
+function readable(value: unknown, key?: string): unknown {
+  if (typeof value === 'string') {
+    return MARKUP_RE.test(value) ? textFromMarkup(value) : value;
+  }
+  if (typeof value === 'number') {
+    const isInstant = key !== undefined
+      && namesATime(key)
+      && Number.isInteger(value)
+      && value >= EPOCH_MS_MIN
+      && value <= EPOCH_MS_MAX;
+    return isInstant ? new Date(value).toISOString() : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => readable(entry, key));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value)
+      .filter(([k]) => !ITEM_VOLATILE_FIELDS.has(k))
+      .map(([k, v]) => [k, readable(v, k)]));
+  }
+  return value;
+}
+
+/**
+ * Split a feed's entries into one document each, keyed by the entry's own
+ * identifier where it has one and by a hash of the entry where it does not,
+ * never by its position in the array.
  * @param page - the fetched feed.
- * @param items - the parsed top-level array.
+ * @param items - the entries, as `feedEntries` found them.
  */
 function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null {
   if (!items.length) {
-    // An empty array is a feed with nothing in it today, not a feed to split.
-    // The whole file stays one document so the source keeps a document to own.
+    // Unreachable from the one caller, because `feedEntries` answers only with
+    // null or a non-empty list. Kept rather than dropped because of what
+    // breaking that invariant would cost: falling through would return an empty
+    // array, which is a connector yielding zero documents, which tombstones
+    // everything the source owns. Answering null costs one whole-file document.
     return null;
   }
   const docs: IngestDoc[] = [];
   const seen = new Set<string>();
-  for (const item of items) {
+  // An envelope's inner key is used only where it is unique in this feed: a
+  // repeat with no occurrence to tell it apart keeps the content hash, since a
+  // collision would abandon the split for the whole file.
+  const enveloped = items.map(item => (declaredKey(item) === undefined ? envelopedKey(item) : undefined));
+  const envelopedCount = new Map<string, number>();
+  for (const key of enveloped) {
+    if (key) {
+      envelopedCount.set(key, (envelopedCount.get(key) ?? 0) + 1);
+    }
+  }
+  for (const [index, item] of items.entries()) {
+    // The entry as written is what identity is read from: keying on the
+    // readable form would re-key every document of a feed that publishes no id
+    // of its own, and a moved key is not an update, it is a tombstone and a
+    // new document that costs another model call.
     const body = JSON.stringify(item) ?? 'null';
-    const key = declaredKey(item) ?? createHash('sha256').update(body).digest('hex').slice(0, 16);
+    const inner = enveloped[index];
+    const key = declaredKey(item)
+      ?? (inner && envelopedCount.get(inner) === 1 ? inner : undefined)
+      ?? createHash('sha256').update(body).digest('hex').slice(0, 16);
     const externalId = `${page.url}#${key}`;
     if (seen.has(externalId)) {
       return null;
     }
     seen.add(externalId);
     const published = declaredUrls(item, page.url);
+    const declared = declaredTitle(item);
     docs.push({
       externalId,
       uri: externalId,
-      title: declaredTitle(item) ?? key,
-      content: body,
+      title: declared === undefined ? key : plainText(declared),
+      content: JSON.stringify(readable(item)) ?? body,
       etag: null,
       lastModifiedAt: null,
       metadata: {
@@ -848,6 +1273,9 @@ function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null
 
 /** Keys a JSON feed item might state its own identity with, in order of trust. */
 const ITEM_KEY_FIELDS = ['@id', 'id', 'slug'] as const;
+
+/** Where an entry names which occurrence of a recurring record it is (Localist's `event_instances`). */
+const ITEM_OCCURRENCE_FIELDS = ['event_instances'] as const;
 /** Keys a JSON feed item might state its own name with, in order of trust. */
 const ITEM_TITLE_FIELDS = ['name', 'title', 'summary'] as const;
 /**
@@ -857,8 +1285,83 @@ const ITEM_TITLE_FIELDS = ['name', 'title', 'summary'] as const;
  * reason this list resolves relative values: `fullUrl` is a path, `/events/x`,
  * and the gate it feeds compares exactly, so an unresolved path can never
  * match what a model read and would drop the link it exists to keep.
+ *
+ * `imageUrl` is here because it is the extractor's own field name: an entry
+ * that publishes its poster under the very key the pipeline reads it back out
+ * of would otherwise lose it, which is the defect this whole list exists for.
+ *
+ * `localist_url` and `photo_url` are Localist's.
  */
-const ITEM_URL_FIELDS = ['url', 'link', 'fullUrl', 'image', 'thumbnail', 'assetUrl'] as const;
+const ITEM_URL_FIELDS = [
+  'url',
+  'link',
+  'fullUrl',
+  'localist_url',
+  'image',
+  'imageUrl',
+  'thumbnail',
+  'assetUrl',
+  'photo_url',
+] as const;
+
+/**
+ * A value with no `/`, `.` or `:` cannot be a link, whatever key it sits under.
+ * Localist writes the string "None" into `url`; resolving a bare word against
+ * the feed invents an address the document never published.
+ */
+const UNLINKABLE_VALUE_RE = /^[^/.:]*$/;
+
+/**
+ * The record an entry's links live on, unwrapping a single-key envelope.
+ *
+ * Read by `declaredUrls`, and by `envelopedKey` for an entry with no key of
+ * its own.
+ *
+ * The inner record has to carry a title, which is what separates an entry from
+ * a nested value: `{"image": {"url": …, "id": …}}` has an id and is still not
+ * an entry, and declaring its url would claim provenance one level down.
+ * @param item - one entry from the array.
+ */
+function entryFields(item: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(item)) {
+    return undefined;
+  }
+  const keys = Object.keys(item);
+  if (keys.length !== 1) {
+    return item;
+  }
+  const inner = item[keys[0]!];
+  if (!isRecord(inner)) {
+    return item;
+  }
+  return ITEM_TITLE_FIELDS.some(f => typeof inner[f] === 'string') ? inner : item;
+}
+
+/**
+ * The key of an entry wrapped in a one-key envelope: the inner record's id,
+ * with the id of the occurrence it lists when it names one, since a recurring
+ * record repeats its id on every occurrence.
+ * @param item - one entry from the array.
+ */
+function envelopedKey(item: unknown): string | undefined {
+  const fields = entryFields(item);
+  if (!fields || fields === item) {
+    return undefined;
+  }
+  const id = declaredKey(fields);
+  if (!id) {
+    return undefined;
+  }
+  for (const name of ITEM_OCCURRENCE_FIELDS) {
+    const list = fields[name];
+    const first: unknown = Array.isArray(list) ? list[0] : undefined;
+    const occurrence = declaredKey(isRecord(first) && Object.keys(first).length === 1 ? Object.values(first)[0] : first);
+    if (occurrence) {
+      return `${id}~${occurrence}`;
+    }
+  }
+  return id;
+}
 
 /**
  * The item's own stable identifier, when it publishes one.
@@ -906,30 +1409,37 @@ function declaredTitle(item: unknown): string | undefined {
  * alone rather than guessed at, because the shape of a feed item is the
  * publisher's to choose and walking it would turn this into a parser.
  *
- * Bounded by construction: six property names, so at most six URLs.
+ * Bounded twice over. The field list is fixed, and `PUBLISHED_URL_CAP` is
+ * applied on top of it, so the bound on how many URLs one entry may declare
+ * survives someone adding a field to the list. `PUBLISHED_URL_CHAR_CAP`, inside
+ * `isFetchableUrl`, bounds each value's length rather than the count.
  * @param item - one entry from the array.
- * @param baseUrl
+ * @param baseUrl - the feed's own URL, which a relative value resolves against.
  */
 function declaredUrls(item: unknown, baseUrl: string): string[] {
-  if (!isRecord(item)) {
+  const fields = entryFields(item);
+  if (!fields) {
     return [];
   }
   const out: string[] = [];
   for (const field of ITEM_URL_FIELDS) {
-    const value = item[field];
+    const value = fields[field];
     if (typeof value !== 'string') {
       continue;
     }
     // Resolved against the feed's own URL, which is where the entry was
     // published. A base that will not parse leaves the value as written, and
     // a path that stays a path then fails the fetchable test below.
+    if (UNLINKABLE_VALUE_RE.test(value.trim())) {
+      continue;
+    }
     const url = absoluteUrl(value, baseUrl) ?? '';
-    // A CMS export routinely repeats one link under two keys, so the dedupe is
-    // what keeps the stored row honest rather than a formality.
     if (isFetchableUrl(url)) {
       out.push(url);
     }
   }
+  // A CMS export routinely repeats one link under two keys, so the dedupe is
+  // what keeps the stored row honest rather than a formality.
   return dedupe(out).slice(0, PUBLISHED_URL_CAP);
 }
 
@@ -990,8 +1500,9 @@ function discoverFeeds(page: FetchedPage, ctx: SourceContext): FeedCandidate[] {
     add(withFormatJson(page.url), 'json');
   }
 
+  const landedListing = listingAsLanded(page).toString();
   const eligible = found.filter((candidate) => {
-    if (describesTheListing(candidate, page.url)) {
+    if (describesTheListing(candidate, page.url) || (landedListing !== page.url && describesTheListing(candidate, landedListing))) {
       return true;
     }
     runNote(ctx, candidate.url, `source: skipped ${candidate.kind} feed outside the listing path ${candidate.url}`);
@@ -1031,6 +1542,19 @@ function isUnderListingPath(url: URL, listing: URL): boolean {
 }
 
 /**
+ * The listing a fetched page stands for once its redirect is followed: where
+ * it landed, unless that path is an ancestor of the one requested, so a
+ * listing that redirects to its site root never widens its scope to the site.
+ * @param page - the fetched listing.
+ */
+function listingAsLanded(page: FetchedPage): URL {
+  const landed = new URL(page.base);
+  const requested = new URL(page.url);
+  const broader = landed.pathname !== requested.pathname && isUnderListingPath(requested, landed);
+  return broader ? new URL(requested.pathname, landed.origin) : landed;
+}
+
+/**
  * Whether a discovered feed describes THIS listing rather than the whole site.
  *
  * The test is the URL path and nothing else: a feed counts when it sits at the
@@ -1048,7 +1572,7 @@ function isUnderListingPath(url: URL, listing: URL): boolean {
  * A Squarespace `?format=json` candidate is the listing URL itself, so it
  * passes on the paths being equal.
  * @param candidate - the discovered feed.
- * @param listingUrl - the listing it was discovered on, as actually fetched.
+ * @param listingUrl - the listing it was discovered on, as requested or as landed on the same site.
  */
 function describesTheListing(candidate: FeedCandidate, listingUrl: string): boolean {
   if (candidate.kind === 'ics') {
@@ -1134,7 +1658,7 @@ function looksLikeFeed(kind: FeedCandidate['kind'], page: FetchedPage): boolean 
     case 'atom':
       return /<feed\b/i.test(page.raw);
     case 'json':
-      return topLevelJsonArray(page) !== null || jsonObjectBody(page);
+      return feedEntries(page) !== null || jsonObjectBody(page);
   }
 }
 
@@ -1201,19 +1725,6 @@ const CONTENT_LANDMARKS = new Set(['html', 'body', 'main', 'article']);
 /** Closing one of these ended a paragraph in the old stripper, and still does. */
 const BLOCK_SELECTOR = 'p, div, section, article, li, h1, h2, h3, h4, h5, h6';
 
-/**
- * Sentinels for the two kinds of break we add on purpose, so the whitespace
- * pass can flatten the newlines that merely came from the source markup
- * without flattening ours. They are private-use code points, which no real
- * page has any business containing, and they are scrubbed out of the input
- * first so a page cannot smuggle one in either.
- */
-const PARAGRAPH_MARK = '\uE000';
-const LINE_MARK = '\uE001';
-const OWN_MARKS = /[\uE000\uE001]/g;
-const PARAGRAPH_MARK_RE = / ?\uE000 ?/g;
-const LINE_MARK_RE = / ?\uE001 ?/g;
-
 /** JSON-LD can run to megabytes on a big listing page, so it gets a budget. */
 const JSON_LD_CHAR_CAP = 20_000;
 const JSON_LD_HEADING = 'Structured data (JSON-LD):';
@@ -1232,15 +1743,32 @@ const JSON_LD_TRUNCATED = '[structured data truncated]';
  *
  * `structure` is the same walk's structured half, the parsed JSON-LD, the
  * og:image and every URL the page published, kept instead of thrown away.
- * It is optional on the return type because the two callers both write
- * `{ title: undefined, content: raw }` for non-HTML bodies; `content` is
- * byte-identical to what this returned before `structure` existed.
+ * It is optional on the return type because the callers write
+ * `{ title: undefined, content: raw, structure: undefined }` for non-HTML
+ * bodies.
+ *
+ * The og:image is declared on `structure` and is deliberately absent from
+ * `content`. `content` is what the ingest hashes to decide a page changed, and
+ * plenty of sites version that URL by the day they served it, which turns an
+ * unchanged page into a changed document every morning. A reader that wants
+ * the image reads `structure.ogImage`, which is where it always was.
+ *
+ * `ignore` is the one exception to "every URL the page published". An element
+ * a source names there is not part of the page: it comes out before the
+ * title, JSON-LD, links and text are read, so none of it reaches `content` or
+ * `structure`, and a crawl never follows a link only it held. It exists for
+ * the parts of one site no default can name, a sidebar listing other shows
+ * that rotates daily or an SEO script restamped on every request, which would
+ * otherwise make an unchanged page read as edited on every fetch. Feed
+ * declarations in the head are read from the raw markup and are not affected.
  * @param html - raw HTML as fetched
  * @param baseUrl - the URL the HTML came from, used to make hrefs and image
  * sources absolute. Relative URLs are left as written when it is omitted.
+ * @param ignore - CSS selectors the source's config names, already validated
+ * by the config schema. Omitted, nothing extra is removed.
  */
-export function extractFromHtml(html: string, baseUrl?: string): { title?: string; content: string; structure?: PageStructure } {
-  const $ = load(html.replace(OWN_MARKS, ' '));
+export function extractFromHtml(html: string, baseUrl?: string, ignore: readonly string[] = []): { title?: string; content: string; structure?: PageStructure } {
+  const $ = loadPage(html, ignore);
 
   // Read the metadata before the chrome comes out: on plenty of pages the
   // only h1 is the one sitting in the site header.
@@ -1249,9 +1777,10 @@ export function extractFromHtml(html: string, baseUrl?: string): { title?: strin
   const blocks = structuredBlocks($);
   // Collected here for the same reason, and one more: the gate a later stage
   // uses to check a model-returned URL wants every URL the page published,
-  // not only the ones that survive chrome removal.
+  // not only the ones that survive chrome removal. An ignored element is not
+  // chrome; it was removed above and publishes nothing.
   const published = collectLinks($, baseUrl);
-  const structured = structuredText(blocks.serialised);
+  const { text: structured, cut: structuredCut } = structuredText(blocks.serialised);
 
   $(CHROME_SELECTOR).remove();
   removeBoilerplate($);
@@ -1268,9 +1797,6 @@ export function extractFromHtml(html: string, baseUrl?: string): { title?: strin
 
   const text = collapse($('body').text());
   const parts: string[] = [];
-  if (image) {
-    parts.push(`Image: ${image}`);
-  }
   if (text) {
     parts.push(text);
   }
@@ -1281,6 +1807,9 @@ export function extractFromHtml(html: string, baseUrl?: string): { title?: strin
   const structure: PageStructure = {};
   if (blocks.values.length) {
     structure.jsonLd = blocks.values.slice(0, JSON_LD_BLOCK_CAP);
+    if (!structuredCut) {
+      structure.jsonLdInText = true;
+    }
   }
   if (blocks.values.length > JSON_LD_BLOCK_CAP) {
     structure.truncated = true;
@@ -1292,9 +1821,7 @@ export function extractFromHtml(html: string, baseUrl?: string): { title?: strin
     structure.links = published;
   }
 
-  // An image on its own is not content. Both callers read empty content as
-  // "nothing here" and skip the page, which is still the right call.
-  return { title, content: text || structured ? parts.join('\n\n') : '', structure };
+  return { title, content: parts.join('\n\n'), structure };
 }
 
 /**
@@ -1389,9 +1916,9 @@ function structuredBlocks($: CheerioAPI): { values: unknown[]; serialised: strin
  * workspace has on its own.
  * @param blocks - the re-serialised JSON-LD blocks, in document order
  */
-function structuredText(blocks: string[]): string {
+function structuredText(blocks: string[]): { text: string; cut: boolean } {
   if (!blocks.length) {
-    return '';
+    return { text: '', cut: false };
   }
   const kept: string[] = [];
   let budget = JSON_LD_CHAR_CAP;
@@ -1411,7 +1938,9 @@ function structuredText(blocks: string[]): string {
     truncated = true;
     break;
   }
-  return truncated ? `${kept.join('\n')}\n${JSON_LD_TRUNCATED}`.trim() : kept.join('\n');
+  return truncated
+    ? { text: `${kept.join('\n')}\n${JSON_LD_TRUNCATED}`.trim(), cut: true }
+    : { text: kept.join('\n'), cut: false };
 }
 
 /**
@@ -1577,7 +2106,7 @@ function collapse(text: string): string {
  *
  * The crawl starts at the SEED, not at `cfg.startUrl`: with a list of seeds
  * they are not the same URL, and the origin the same-origin rule is read
- * against is the seed's.
+ * against is the seed's, where its redirect landed when that stayed on the site.
  *
  * A page's links are queued in two batches, the seed's own path first and the
  * rest of the origin after, each in page order. See the partition below.
@@ -1585,6 +2114,7 @@ function collapse(text: string): string {
  * @param ctx - the sync context.
  * @param seed - the start page, already fetched (and already counted) by the caller.
  * @param pages - the sync's shared page budget.
+ * @param ignore - the source's `ignore` selectors, applied to every page the crawl reads.
  * @yields {IngestDoc} one document per page the crawl reaches.
  */
 async function* crawl(
@@ -1592,9 +2122,10 @@ async function* crawl(
   ctx: SourceContext,
   seed: FetchedPage,
   pages: PageBudget,
+  ignore: readonly string[],
 ): AsyncIterable<IngestDoc> {
   const startUrl = seed.url;
-  const start = new URL(startUrl);
+  const start = listingAsLanded(seed);
   const startOrigin = start.origin;
   const visited = new Set<string>();
   const queue: QueueEntry[] = [{ url: startUrl, depth: 0 }];
@@ -1610,8 +2141,9 @@ async function* crawl(
     if (!prefetched) {
       pages.attempted += 1;
     }
-    const page = prefetched ?? await fetchPage(url, ctx);
+    const page = prefetched ?? await fetchPage(url, ctx, { ignore });
     if (page) {
+      visited.add(page.base);
       for (const doc of docsFromPage(page, ctx)) {
         yield doc;
       }
@@ -1643,9 +2175,10 @@ async function* crawl(
     // `/about-us/`, none of which has ever held an event.
     const ownPath: QueueEntry[] = [];
     const elsewhere: QueueEntry[] = [];
-    for (const href of pageLinks(page)) {
+    const base = new URL(page.base).origin === startOrigin ? page.base : page.url;
+    for (const href of pageLinks(page, base, ignore)) {
       try {
-        const next = new URL(href, url);
+        const next = new URL(href, base);
         // Strip fragments so #section links don't blow up the queue.
         next.hash = '';
         if (next.origin === startOrigin && !visited.has(next.toString()) && followable(next, cfg)) {
@@ -1670,16 +2203,37 @@ async function* crawl(
 type QueueEntry = { url: string; depth: number };
 
 /**
+ * An HTML page as cheerio reads it, without the elements its source ignores.
+ * An ignored element is not part of the page: its text, JSON-LD and links
+ * reach neither `content` nor `structure`, and no crawl follows a link only it
+ * held. The page itself can never be ignored away.
+ * @param html - raw HTML as fetched.
+ * @param ignore - the source's `ignore` selectors.
+ */
+function loadPage(html: string, ignore: readonly string[]): CheerioAPI {
+  const $ = load(html.replace(OWN_MARKS, ' '));
+  for (const selector of ignore) {
+    $(selector).not('html, head, body').remove();
+  }
+  return $;
+}
+
+/**
  * The links to consider following out of a fetched page.
  * @param page - the fetched page.
+ * @param base - the URL its relative links resolve against.
+ * @param ignore - the source's `ignore` selectors, for a page re-read against where it landed.
  */
-function pageLinks(page: FetchedPage): string[] {
+function pageLinks(page: FetchedPage, base: string, ignore: readonly string[]): string[] {
+  if (page.structure && base !== page.url) {
+    return collectLinks(loadPage(page.raw, ignore), base).map(link => link.url);
+  }
   if (page.structure) {
     return page.structure.links?.map(link => link.url) ?? [];
   }
   // Non-HTML bodies never went through cheerio. The old regex still covers the
   // odd page served as text/plain with markup inside it.
-  return extractLinks(page.raw, page.url);
+  return extractLinks(page.raw, base);
 }
 
 /**

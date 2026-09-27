@@ -1,7 +1,9 @@
 'use client';
 
+import type { LucideIcon } from 'lucide-react';
 import type { PinnableItem } from './nav/navPins';
 import type { DashboardRoute } from '@/features/navigation/dashboardNav';
+import type { PluginNav } from '@/features/navigation/pluginNav';
 import type { SurfaceId } from '@/features/navigation/surfaces';
 import { ArrowLeft, FileText, PanelsTopLeft, Settings2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
@@ -10,14 +12,16 @@ import { Sidebar, SidebarContent, SidebarHeader, SidebarRail } from '@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSidebar } from '@/components/ui/useSidebar';
 import { AppSidebarNav } from '@/features/dashboard/AppSidebarNav';
+import { iconByName } from '@/features/dashboard/iconByName';
 import { InviteTeamCard } from '@/features/dashboard/InviteTeamCard';
-import { applyPins, withoutPins } from '@/features/dashboard/nav/navPins';
+import { applyPins, defaultPinDismissal, resolveWorkPins, withoutPins } from '@/features/dashboard/nav/navPins';
 import { PinnableNav } from '@/features/dashboard/nav/PinnableNav';
 import { useNavPrefs } from '@/features/dashboard/nav/useNavPrefs';
 import { WorkspaceSwitcherLive } from '@/features/dashboard/nav/WorkspaceSwitcher';
 import { OPEN_MANAGE_VIEW, readNavView, writeNavView } from '@/features/dashboard/useNavView';
-import { manageNavGroups, manageRoutes, tabsOf, workRoutes } from '@/features/navigation/dashboardNav';
-import { SurfaceNav } from '@/features/navigation/SurfaceNav';
+import { DASHBOARD_ROUTES, DEFAULT_WORK_PINS, manageNavGroups, manageRoutes, tabsOf, workCoreRoutes, workPinnableRoutes } from '@/features/navigation/dashboardNav';
+import { PLUGIN_NAV_WORKSPACE } from '@/features/navigation/pluginNav';
+import { groupEnabledSurfaces } from '@/features/navigation/surfaces';
 import { VOCION_PRIMARY_MARK } from '@/templates/VocionLogo';
 
 /**
@@ -68,16 +72,32 @@ const BRAND_NAME = process.env.NEXT_PUBLIC_BRAND_NAME || 'Vocion';
 
 /** Workspace-defined pages (libs/workspace/pages.ts), grouped for the nav. */
 export type WorkspaceNavPage = {
+  /** Sits under "More" however few pages there are (`nav.secondary`). */
+  secondary?: boolean;
   title: string;
   url: string;
   section: string;
 };
 
-export const AppSidebar = ({ isAdmin = false, enabledSurfaces = [], workspacePages = [], needsYouCount = 0, ...props }: React.ComponentProps<typeof Sidebar> & {
+/**
+ * A plugin row's icon: the core registry's component when the row is a core
+ * route, else the named lucide icon, else a generic shape — never a crash.
+ * @param url
+ * @param name
+ */
+function pluginIcon(url: string, name: string): LucideIcon {
+  return DASHBOARD_ROUTES.find(r => r.url === url)?.icon ?? iconByName(name);
+}
+
+export const AppSidebar = ({ isAdmin = false, enabledPlugins, enabledSurfaces = [], pluginNav, workspacePages = [], needsYouCount = 0, ...props }: React.ComponentProps<typeof Sidebar> & {
   /** Shows admin-only nav items (Adoption). Gating is enforced server-side; this only hides the link. */
   isAdmin?: boolean;
-  /** Optional surfaces the workspace switched on — see `features/navigation/surfaces.ts`. */
+  /** Plugins the workspace turned on (`project.enabledPlugins`); a plugin-owned row (Data rooms) shows only while its plugin is on. */
+  enabledPlugins?: readonly string[];
+  /** Optional surfaces the workspace switched on — see `features/navigation/surfaces.ts` — minus the ones a plugin claimed. */
   enabledSurfaces?: SurfaceId[];
+  /** Each enabled plugin's rows, folded into sections by `plugin.yaml` `nav.section` (`features/navigation/pluginNav.ts`). */
+  pluginNav?: PluginNav;
   /** Tenant pages from the workspace's pages/ dir — the Pages group. */
   workspacePages?: WorkspaceNavPage[];
   /** Open items waiting on a person — shown as a badge on "Review queue" (the inbox PR supplies it). */
@@ -115,29 +135,83 @@ export const AppSidebar = ({ isAdmin = false, enabledSurfaces = [], workspacePag
   const label = useCallback((r: Pick<DashboardRoute, 'i18nKey' | 'title'>) => (r.i18nKey ? t(r.i18nKey) : r.title), [t]);
 
   // ---- the three WORK groups ----
-  const workspaceItems = workRoutes().map(r => ({
+  // WORKSPACE: Chat and Review are the surface and always show; Briefings,
+  // Artifacts, Search and Data rooms show while pinned (Briefings starts
+  // pinned) and otherwise sit one row down under "More" (Chris, 2026-09-18).
+  const toWorkItem = useCallback((r: DashboardRoute): PinnableItem => ({
     title: label(r),
     url: r.url,
     icon: r.icon,
+    origin: 'work',
     badge: r.url === '/dashboard/inbox' ? needsYouCount : undefined,
-  }));
+    ...(r.pinnable ? {} : { pinnable: false as const }),
+  }), [label, needsYouCount]);
+  const viewer = useMemo(() => ({ isAdmin, enabledPlugins }), [isAdmin, enabledPlugins]);
+  const workCore = useMemo(() => workCoreRoutes(viewer).map(toWorkItem), [toWorkItem, viewer]);
+  // A plugin's Workspace rows join the pinnable WORK rows, pinned by default —
+  // turning a plugin on puts its door beside Chat and Review, not under More.
+  // A core route a plugin owns is rendered from the plugin's list, once.
+  const pluginWorkspace = useMemo(() => (pluginNav?.sections.find(s => s.label === PLUGIN_NAV_WORKSPACE)?.items ?? []).filter(i => !i.secondary), [pluginNav]);
+  // A route a plugin only OFFERS (secondary) is never a pinned door: it joins
+  // the Pages group's "More pages ›" like a forensic page would.
+  const pluginSecondary = useMemo(() => (pluginNav?.sections.find(s => s.label === PLUGIN_NAV_WORKSPACE)?.items ?? []).filter(i => i.secondary), [pluginNav]);
+  // Named-app sections: a plugin's `nav.section: GTM` rows and the workspace's
+  // own surfaces under the same heading render as ONE group, never two "GTM"s.
+  const appSections = useMemo(() => {
+    const out = new Map<string, Array<{ title: string; url: string; icon: LucideIcon; secondary?: boolean }>>();
+    for (const s of groupEnabledSurfaces(enabledSurfaces)) {
+      out.set(s.label, s.items.map(i => ({ title: i.label, url: i.url, icon: pluginIcon(i.url, i.icon) })));
+    }
+    for (const s of pluginNav?.sections.filter(x => x.label !== PLUGIN_NAV_WORKSPACE) ?? []) {
+      out.set(s.label, [...(out.get(s.label) ?? []), ...s.items.map(i => ({ title: i.title, url: i.url, icon: pluginIcon(i.url, i.icon), ...(i.secondary ? { secondary: true } : {}) }))]);
+    }
+    return [...out.entries()].map(([label, items]) => ({ label, items }));
+  }, [enabledSurfaces, pluginNav]);
+  const claimedRoutes = useMemo(() => new Set(pluginNav?.claimedRoutes ?? []), [pluginNav]);
+  const workOptional = useMemo<PinnableItem[]>(() => [
+    ...workPinnableRoutes(viewer).filter(r => !claimedRoutes.has(r.url)).map(toWorkItem),
+    ...pluginWorkspace.map(i => ({ title: i.title, url: i.url, icon: pluginIcon(i.url, i.icon), origin: 'work' as const })),
+  ], [toWorkItem, viewer, claimedRoutes, pluginWorkspace]);
+  const workDefaults = useMemo(() => [...DEFAULT_WORK_PINS, ...pluginWorkspace.map(i => i.url)], [pluginWorkspace]);
+  const workPins = resolveWorkPins({ pins: prefs.pins, dismissed: prefs.dismissed, defaults: workDefaults });
+  const workspaceItems = [...workCore, ...applyPins(workOptional, workPins), ...withoutPins(workOptional, workPins)];
+  const workShown = workCore.length + applyPins(workOptional, workPins).length;
+  // Unpinning a default records the choice; everything else is a plain toggle.
+  const toggleWorkPin = (url: string) => {
+    if (workDefaults.includes(url) && workPins.includes(url) && !prefs.pins.includes(url)) {
+      prefs.dismiss(defaultPinDismissal(url));
+      return;
+    }
+    prefs.togglePin(url);
+  };
 
   // Tenant pages only. Artifacts used to join this group as "saved canvases";
   // they are a WORK row of their own now (registry), with their own log.
   const pageItems = useMemo<PinnableItem[]>(
-    () => workspacePages.map(p => ({ title: p.title, url: p.url, icon: PanelsTopLeft, origin: 'page' as const })),
-    [workspacePages],
+    () => [
+      ...workspacePages.map(p => ({ title: p.title, url: p.url, icon: PanelsTopLeft, origin: 'page' as const })),
+      ...pluginSecondary.map(i => ({ title: i.title, url: i.url, icon: pluginIcon(i.url, i.icon), origin: 'page' as const })),
+    ],
+    [workspacePages, pluginSecondary],
+  );
+
+  // Forensic pages sort last and the cut is made just above them, so they end
+  // up under "More" whatever the page count — while ordinary overflow still
+  // applies to everything before them.
+  const secondaryUrls = useMemo(
+    () => new Set([...workspacePages.filter(p => p.secondary).map(p => p.url), ...pluginSecondary.map(i => i.url)]),
+    [workspacePages, pluginSecondary],
   );
 
   // Every MANAGE destination — pages and their tabs — so a pin to either resolves.
   const manageItems = useMemo<PinnableItem[]>(
-    () => manageRoutes(isAdmin).map(r => ({ title: label(r), url: r.url, icon: r.icon, origin: 'manage' as const })),
-    [isAdmin, label],
+    () => manageRoutes(viewer).map(r => ({ title: label(r), url: r.url, icon: r.icon, origin: 'manage' as const })),
+    [viewer, label],
   );
 
   // The MANAGE sections: top-level rows, each combined page carrying its
   // other tabs (shown beneath it while open; a pinned tab moves up to Pinned).
-  const manageSections = useMemo(() => manageNavGroups(isAdmin).map(({ group, routes }) => ({
+  const manageSections = useMemo(() => manageNavGroups(viewer).map(({ group, routes }) => ({
     label: label(group),
     items: routes.map((r): PinnableItem => ({
       title: label(r),
@@ -146,11 +220,16 @@ export const AppSidebar = ({ isAdmin = false, enabledSurfaces = [], workspacePag
       origin: 'manage',
       tabs: tabsOf(r.url).filter(tab => tab.tabOf).map(tab => ({ title: label(tab), url: tab.url, icon: tab.icon, origin: 'manage' as const })),
     })),
-  })), [isAdmin, label]);
+  })), [viewer, label]);
 
   const pinnable = useMemo(() => [...pageItems, ...manageItems], [pageItems, manageItems]);
   const pinned = applyPins(pinnable, prefs.pins);
   const unpinnedPages = withoutPins(pageItems, prefs.pins);
+  const pagesPrimaryFirst = useMemo(
+    () => [...unpinnedPages].sort((a, b) => Number(secondaryUrls.has(a.url)) - Number(secondaryUrls.has(b.url))),
+    [unpinnedPages, secondaryUrls],
+  );
+  const primaryPageCount = pagesPrimaryFirst.filter(i => !secondaryUrls.has(i.url)).length;
   const manageGroup = (section: { label: string; items: PinnableItem[] }) => (
     <PinnableNav
       key={section.label}
@@ -183,7 +262,16 @@ export const AppSidebar = ({ isAdmin = false, enabledSurfaces = [], workspacePag
           ? (
               <>
                 {/* WORKSPACE — the permanent Vocion pages. */}
-                <AppSidebarNav label={t('main_section_label')} items={workspaceItems} />
+                <PinnableNav
+                  label={t('main_section_label')}
+                  items={workspaceItems}
+                  pins={workPins}
+                  onTogglePin={toggleWorkPin}
+                  max={workShown}
+                  moreLabel={t('more')}
+                  pinLabel={t('pin')}
+                  unpinLabel={t('unpin')}
+                />
 
                 {/* PINNED — this person's pins, in pin order, draggable. */}
                 {pinned.length > 0 && (
@@ -199,19 +287,28 @@ export const AppSidebar = ({ isAdmin = false, enabledSurfaces = [], workspacePag
                   />
                 )}
 
-                {/* PAGES — the workspace's own pages, seven then "More pages ›". */}
+                {/* PAGES — the workspace's own pages. A page that declared
+                    itself `nav.secondary` sits under "More" however few pages
+                    there are: a factory log, a cost ledger and a decisions
+                    archive are forensic, and hiding them behind a COUNT meant
+                    a six-page workspace showed all six with equal weight.
+                    They are sorted last and the cut is made just above them,
+                    so ordinary overflow still applies to everything else. */}
                 <PinnableNav
                   label={t('pages')}
-                  items={unpinnedPages}
+                  items={pagesPrimaryFirst}
                   pins={prefs.pins}
                   onTogglePin={prefs.togglePin}
-                  max={PAGES_MAX}
+                  max={Math.min(PAGES_MAX, primaryPageCount)}
                   {...pinLabels}
                 />
 
-                {/* Workspace-enabled surfaces (workspace.yaml `surfaces:`).
-                    Renders nothing when none are on. */}
-                <SurfaceNav enabled={enabledSurfaces} />
+                {/* Named apps: the workspace's surfaces (workspace.yaml `surfaces:`) and
+                    the plugins that belong to the app (plugin.yaml `nav.section: GTM`),
+                    one group per heading. Renders nothing when none are on. */}
+                {appSections.map(section => (
+                  <AppSidebarNav key={`app:${section.label}`} label={section.label} items={section.items} moreLabel={t('more')} />
+                ))}
 
                 {/* Bottom cluster: invite card (dismissible, remembered),
                     which workspace you're in + the door to its configuration. */}

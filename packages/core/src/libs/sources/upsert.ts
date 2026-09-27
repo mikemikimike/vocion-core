@@ -130,6 +130,7 @@ function validateSourceProcessor(spec: SourceUpsertSpec, known: KnownProcessorNa
     dedupOn?: string[];
     knownCandidates?: { keyedBy?: string };
     seriesLabel?: { sameOn?: string[]; differsOn?: string; keyField?: string };
+    keepIdentityOnReread?: { sameOn?: string[] };
   };
   for (const step of parsed.learningSteps ?? []) {
     if (!known.learningSteps.has(step)) {
@@ -139,14 +140,14 @@ function validateSourceProcessor(spec: SourceUpsertSpec, known: KnownProcessorNa
   if (parsed.agentSlug && !known.agentSlugs.has(parsed.agentSlug)) {
     throw new Error(`source "${spec.slug}" processor names unknown agent: "${parsed.agentSlug}"`);
   }
-  // The identity-relative knobs. Both the known-cards block and the sibling
-  // rule compare dedup-key SEGMENTS, and a segment is found by the field's
-  // POSITION in `dedupOn` (`candidateExtractor/knownCards.ts`,
-  // `candidateExtractor/labels.ts`). A name that is not in `dedupOn` therefore
-  // has no segment: at run time it compares against undefined, matches
-  // nothing, and the operator is left with a rule they believe is in force.
-  // `knownCards.ts` has said "validated at apply time" since it shipped; this
-  // is that validation.
+  // The identity-relative knobs. The known-cards block, the sibling rule and
+  // the reread keep all compare dedup-key SEGMENTS, and a segment is found by
+  // the field's POSITION in `dedupOn` (`candidateExtractor/knownCards.ts`,
+  // `candidateExtractor/labels.ts`, `candidateExtractor/identity.ts`). A name
+  // that is not in `dedupOn` therefore has no segment: at run time it compares
+  // against undefined, matches nothing, and the operator is left with a rule
+  // they believe is in force. `knownCards.ts` has said "validated at apply
+  // time" since it shipped; this is that validation.
   const identity = new Set(parsed.dedupOn ?? []);
   const requireIdentity = (field: string | undefined, knob: string): void => {
     if (field !== undefined && !identity.has(field)) {
@@ -158,6 +159,13 @@ function validateSourceProcessor(spec: SourceUpsertSpec, known: KnownProcessorNa
     requireIdentity(field, 'seriesLabel.sameOn');
   }
   requireIdentity(parsed.seriesLabel?.differsOn, 'seriesLabel.differsOn');
+  const keepSameOn = parsed.keepIdentityOnReread?.sameOn ?? [];
+  for (const field of keepSameOn) {
+    requireIdentity(field, 'keepIdentityOnReread.sameOn');
+  }
+  if (keepSameOn.length > 0 && [...identity].every(field => keepSameOn.includes(field))) {
+    throw new Error(`source "${spec.slug}" processor names every dedupOn field in keepIdentityOnReread.sameOn, so no identity value is left to keep (${[...identity].join(', ')})`);
+  }
   // And the one knob that must NOT be identity. The label stage runs BEFORE
   // the proposal (`candidateExtractor/labels.ts` writes into `record.fields`,
   // `propose.ts` reads them), so a key written into an identity field would
@@ -171,6 +179,25 @@ function validateSourceProcessor(spec: SourceUpsertSpec, known: KnownProcessorNa
   };
   requireNotIdentity(parsed.seriesLabel?.keyField, 'seriesLabel.keyField');
   return { slug: spec.processor.slug, config: spec.processor.config };
+}
+
+/**
+ * Check a declared source against the registries it names — the connector,
+ * that connector's config schema, and the `processor` block — without
+ * touching the database. Throws with the source named, exactly as
+ * {@link upsertSourceRow} does, because it is the first half of that
+ * function: the half a dry-run with no database can still do.
+ * @param spec - What the writer declared.
+ * @param known - The org's learning steps and agents a processor may name.
+ */
+export function validateSourceSpec(spec: SourceUpsertSpec, known: KnownProcessorNames): ProcessorRef | undefined {
+  const connector = getConnector(spec.kind);
+  if (!connector) {
+    throw new Error(`source "${spec.slug}" references unknown connector kind: "${spec.kind}". Registered: ${listConnectors().map(c => c.slug).join(', ')}`);
+  }
+  // Validate the per-connector config blob. Throws ZodError on bad input.
+  connector.configSchema.parse(spec.config);
+  return validateSourceProcessor(spec, known);
 }
 
 /**
@@ -190,13 +217,7 @@ export async function upsertSourceRow(
   spec: SourceUpsertSpec,
   opts: { known: KnownProcessorNames; dryRun?: boolean },
 ): Promise<{ outcome: SourceUpsertOutcome; id: number | null }> {
-  const connector = getConnector(spec.kind);
-  if (!connector) {
-    throw new Error(`source "${spec.slug}" references unknown connector kind: "${spec.kind}". Registered: ${listConnectors().map(c => c.slug).join(', ')}`);
-  }
-  // Validate the per-connector config blob. Throws ZodError on bad input.
-  connector.configSchema.parse(spec.config);
-  const processor = validateSourceProcessor(spec, opts.known);
+  const processor = validateSourceSpec(spec, opts.known);
 
   const [existing] = await db
     .select()

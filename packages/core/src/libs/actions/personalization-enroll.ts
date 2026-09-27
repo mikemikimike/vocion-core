@@ -68,7 +68,7 @@ const DATE_FORMAT = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'num
  * slot names. Absent source, absent keys, both read as defaults.
  * @param orgId
  */
-async function contactsSourceConfig(orgId: string): Promise<{ portalId?: string | number; nurtureSlots?: unknown }> {
+async function contactsSourceConfig(orgId: string): Promise<{ portalId?: string | number; nurtureSlots?: unknown; defaultSender?: string }> {
   const { and, eq } = await import('drizzle-orm');
   const { db } = await import('@/libs/DB');
   const { knowledgeSourceSchema } = await import('@/models/Schema');
@@ -80,7 +80,7 @@ async function contactsSourceConfig(orgId: string): Promise<{ portalId?: string 
       eq(knowledgeSourceSchema.slug, 'hubspot-contacts'),
     ))
     .limit(1);
-  return (source?.configJson as { portalId?: string | number; nurtureSlots?: unknown } | null) ?? {};
+  return (source?.configJson as { portalId?: string | number; nurtureSlots?: unknown; defaultSender?: string } | null) ?? {};
 }
 
 /**
@@ -134,6 +134,37 @@ function regenerateTurnOutputFor(rules: VoiceRules) {
   });
 }
 
+/**
+ * What the SCOPED turn must answer with: one send, because the instruction
+ * was about one send.
+ *
+ * Not "the full list, and please only change send 4". The turn was asked
+ * exactly that in prose — *"rewrite what the note asks and keep the rest"* —
+ * and rewrote all four anyway (Chris, 2026-09-20: *"I approved emails 1-3 and
+ * then regenerated the 4th one and it regenerated all emails"*). A shape that
+ * cannot carry the other sends is what makes that impossible rather than
+ * discouraged, which is this repo's rule for a behaviour that is a
+ * requirement: prompt once, then enforce it structurally. The server keeps
+ * every other send from the input it already holds.
+ * @param rules - The merged workspace voice rules.
+ */
+function scopedRegenerateTurnOutputFor(rules: VoiceRules) {
+  return z.object({
+    /** True when the note invalidates the research itself — the full pass takes over. */
+    needsResearch: z.boolean(),
+    /** Why it needs research, or a short note on what changed. */
+    reason: z.string().nullish(),
+    send: z.object({
+      subject: outboundCopy(rules, 'subject').min(1),
+      body: outboundCopy(rules, 'body').min(1),
+    }).nullish(),
+  }).superRefine((v, sctx) => {
+    if (!v.needsResearch && !v.send) {
+      sctx.addIssue({ code: z.ZodIssueCode.custom, message: 'send is required (the one named in the task) unless needsResearch is true' });
+    }
+  });
+}
+
 type FastRegenerateOutcome = { done: true } | { done: false; reason?: string };
 
 /**
@@ -150,6 +181,7 @@ type FastRegenerateOutcome = { done: true } | { done: false; reason?: string };
  * @param opts.lead - The full lead_brief row behind the card.
  * @param opts.skillSlug - The workspace's mapped regenerate composition.
  * @param opts.feedback
+ * @param opts.contentId - The one send the instruction was typed beside, if any.
  */
 async function regenerateSequenceCopy(opts: {
   ctx: { orgId: string; invokedBy?: string; reviewedBy?: string };
@@ -157,9 +189,115 @@ async function regenerateSequenceCopy(opts: {
   lead: typeof import('@/models/Schema').leadBriefSchema.$inferSelect;
   skillSlug: string;
   feedback: string;
+  contentId?: string;
 }): Promise<FastRegenerateOutcome> {
   const { ctx, input, lead, skillSlug, feedback } = opts;
   const { logger } = await import('@/libs/Logger');
+
+  // Which send the reviewer typed the instruction beside. `send-<step>` is the
+  // id the presenter gives each item, and `applyContentEdits` reads the same
+  // one, so the two paths that act on a single send agree on what names it.
+  const step = Number(/^send-(\d+)$/.exec(opts.contentId ?? '')?.[1]);
+  const target = Number.isInteger(step) ? input.sends.find(s => s.step === step) : undefined;
+
+  // ── One send: rewrite that one, keep the rest verbatim ──────────────────
+  //
+  // Everything outside the named send comes from the input we already hold,
+  // so a scoped regenerate CANNOT disturb another send's copy — and therefore
+  // cannot clear a check a reviewer earned on it, since a check is a hash of
+  // exactly that copy. The sequence, the sender and the recommendation are
+  // left alone for the same reason: the instruction was typed into a box that
+  // asks what one email should do differently.
+  //
+  // No library pre-read and no `hubspot_list_sequences` here either. The
+  // sequence cannot change on this turn, so reading it would be a HubSpot
+  // round trip whose answer has nowhere to land.
+  if (target) {
+    const label = target.day !== undefined ? `Day ${target.day}` : `Send ${target.step}`;
+    const voiceRules = await voiceRulesFor(ctx.orgId);
+    const { runSkillTurn } = await import('@/services/agents/skillTurn');
+    const { output, toolCalls, durationMs } = await runSkillTurn({
+      orgId: ctx.orgId,
+      skillSlug,
+      userId: ctx.reviewedBy,
+      task: [
+        `A reviewer pressed Regenerate on ONE send of the enroll card for ${input.contactName} (${input.contactRef}).`,
+        `The send is step ${target.step} (${label}). Their instruction is:`,
+        `"${feedback}"`,
+        'Rewrite that send, and answer with that send alone. The others keep exactly what they have — a reviewer may already have approved them — so write this one to sit correctly beside them. Answer needsResearch when the note falls outside what rewriting one send can fix.',
+      ].join('\n\n'),
+      context: [
+        {
+          title: 'Lead brief (the research behind the card — unchanged by this turn)',
+          body: JSON.stringify({
+            contactRef: lead.contactRef,
+            contactName: lead.contactName,
+            contactTitle: lead.contactTitle,
+            companyName: lead.companyName,
+            entranceSource: lead.entranceSource,
+            utmCampaign: lead.utmCampaign,
+            confidence: lead.confidence,
+            sections: lead.sections,
+            claims: lead.claims,
+            missing: lead.missing,
+            engagement: { sent: lead.engagementSent, opened: lead.engagementOpened },
+          }, null, 2),
+        },
+        {
+          title: `The send to rewrite (step ${target.step}, ${label})`,
+          body: JSON.stringify({ step: target.step, day: target.day, subject: target.subject, body: target.body }, null, 2),
+        },
+        {
+          title: 'The rest of the sequence, for continuity (NOT yours to change on this turn)',
+          body: JSON.stringify({
+            sequenceName: input.sequenceName,
+            sends: input.sends.filter(x => x.step !== target.step),
+          }, null, 2),
+        },
+      ],
+      outputSchema: scopedRegenerateTurnOutputFor(voiceRules),
+      outputInstruction: 'Fields: needsResearch (boolean); reason (string; why research is needed, or a short note on what you changed); send ({subject, body} for the ONE send named in the task, required unless needsResearch). Any "is banned" message names a phrase the sender will not have in a send: remove it and say the thing plainly, do not paraphrase it back in.',
+      toolAllowlist: ['get_lead_brief'],
+      maxAnswerRetries: 1,
+    });
+
+    if (output.needsResearch) {
+      logger.info('scoped regenerate routed to research', { orgId: ctx.orgId, contactRef: input.contactRef, step: target.step, reason: output.reason, durationMs });
+      return { done: false, reason: output.reason ?? undefined };
+    }
+
+    const { saveDraftSequence } = await import('@/services/PersonalizationQueueService');
+    const saved = await saveDraftSequence(ctx.orgId, {
+      // Order preserved, because `saveDraftSequence` assigns each step from
+      // its position. Only the named one carries new copy.
+      sends: input.sends.map(x => ({
+        subject: x.step === target.step ? output.send!.subject : x.subject,
+        body: x.step === target.step ? output.send!.body : x.body,
+        ...(x.day != null ? { day: x.day } : {}),
+      })),
+      contactRef: input.contactRef,
+      recommendedSequence: {
+        id: input.sequenceId,
+        name: input.sequenceName,
+        ...(lead.recommendedSequence?.reason != null ? { reason: lead.recommendedSequence.reason } : {}),
+      },
+      senderEmail: input.senderEmail,
+      hubspotUserId: input.hubspotUserId,
+    });
+    if (!saved.saved) {
+      throw new Error(`scoped regenerate could not save the redraft: ${saved.message ?? saved.reason ?? 'unknown'}`);
+    }
+    logger.info('scoped regenerate landed', {
+      orgId: ctx.orgId,
+      contactRef: input.contactRef,
+      step: target.step,
+      reviewRunId: saved.reviewRunId,
+      sendCount: saved.sendCount,
+      toolCalls,
+      durationMs,
+    });
+    return { done: true };
+  }
 
   // The library, read ahead so the common case needs no lookup at all.
   // Best-effort: a failed read leaves the tool for the model to try.
@@ -271,6 +409,39 @@ async function regenerateSequenceCopy(opts: {
   return { done: true };
 }
 
+/**
+ * Which positions of `input.sends` are already on this contact's pending (or
+ * failed) card with the same subject and body. Those sends were not written by
+ * whoever is proposing now; they are being carried. Empty when there is no
+ * such card, which is the brand-new-proposal case.
+ * @param orgId
+ * @param input - The sends being proposed, in order.
+ */
+async function unchangedSends(orgId: string, input: z.infer<typeof enrollInput>): Promise<Set<number>> {
+  const { and, eq, inArray } = await import('drizzle-orm');
+  const { db } = await import('@/libs/DB');
+  const { actionRunSchema } = await import('@/models/Schema');
+  const [existing] = await db
+    .select({ input: actionRunSchema.input })
+    .from(actionRunSchema)
+    .where(and(
+      eq(actionRunSchema.orgId, orgId),
+      eq(actionRunSchema.actionId, 'personalization.enroll'),
+      eq(actionRunSchema.dedupKey, `personalization.enroll:${input.contactRef}`),
+      inArray(actionRunSchema.status, ['pending', 'failed']),
+    ))
+    .limit(1);
+  const prior = (existing?.input as { sends?: Array<{ subject?: string; body?: string }> } | undefined)?.sends ?? [];
+  const out = new Set<number>();
+  input.sends.forEach((send, i) => {
+    const was = prior[i];
+    if (was && was.subject === send.subject && was.body === send.body) {
+      out.add(i);
+    }
+  });
+  return out;
+}
+
 export const personalizationEnrollAction: Action<typeof enrollInput> = {
   id: 'personalization.enroll',
   name: 'Enroll MQL in sequence',
@@ -298,7 +469,18 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
    */
   async precheck(ctx, input) {
     const rules = await voiceRulesFor(ctx.orgId);
-    const { ok, report, count } = lintSends(input.sends, rules);
+    // Only the sends that CHANGED are judged. A scoped regenerate rewrites one
+    // send and, by design, keeps the others word for word so a reviewer's
+    // approvals on them survive; it then re-proposes the whole sequence. A
+    // card drafted before the gate existed carries em dashes in the sends
+    // nobody touched, so judging all of them refused the clean send for its
+    // neighbours' sake, every time, and the reviewer could fix nothing
+    // (ticket 069, proposal 509, 2026-09-22). A send identical to what is
+    // already on the pending card was already on the card; refusing it now
+    // removes nothing. A brand-new card has no pending run, so every send is
+    // new and every send is judged: nothing with a dash gets IN through here.
+    const unchanged = await unchangedSends(ctx.orgId, input);
+    const { ok, report, count } = lintSends(input.sends.map((s, i) => ({ ...s, step: s.step ?? i + 1 })).filter((_, i) => !unchanged.has(i)), rules);
     if (ok) {
       return;
     }
@@ -365,6 +547,22 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
     if (lead?.utmCampaign) {
       provenance.push({ label: 'Campaign', value: lead.utmCampaign });
     }
+    // The ad lead magnet they answered, from the CRM mirror (the ledger row
+    // does not carry it; see `contactUtmContentByRef`).
+    const { contactUtmContentByRef } = await import('@/services/CrmRecordsService');
+    const utmContent = (await contactUtmContentByRef(ctx.orgId, [input.contactRef]).catch(() => new Map<string, string>())).get(input.contactRef);
+    if (utmContent) {
+      provenance.push({ label: 'Lead magnet', value: utmContent });
+    }
+    // Who the emails go out as. The workspace's configured sender wins over
+    // whatever the card carries, and the card says so when they differ.
+    const effectiveSender = sourceCfg.defaultSender ?? input.senderEmail;
+    provenance.push({
+      label: 'Sender',
+      value: sourceCfg.defaultSender && sourceCfg.defaultSender.toLowerCase() !== input.senderEmail.toLowerCase()
+        ? `${sourceCfg.defaultSender} (the card named ${input.senderEmail})`
+        : effectiveSender,
+    });
     if (lead?.mqlAt) {
       provenance.push({ label: 'Became MQL', value: DATE_FORMAT.format(lead.mqlAt) });
     } else if (lead?.arrivedAt) {
@@ -442,7 +640,7 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
   // A fast-path error propagates: the regenerate route clears the in-flight
   // stamp on a rejected dispatch, so the card re-enables instead of waiting
   // out the staleness window.
-  async regenerate(ctx, input, runId, feedback) {
+  async regenerate(ctx, input, runId, feedback, opts) {
     const { and, eq } = await import('drizzle-orm');
     const { db } = await import('@/libs/DB');
     const { leadBriefSchema } = await import('@/models/Schema');
@@ -462,7 +660,7 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
     const skillSlug = await regenerateSkillFor(ctx.orgId, 'personalization.enroll');
     let researchReason = feedback;
     if (skillSlug && lead.sections.length > 0) {
-      const outcome = await regenerateSequenceCopy({ ctx, input, lead, skillSlug, feedback });
+      const outcome = await regenerateSequenceCopy({ ctx, input, lead, skillSlug, feedback, ...(opts?.contentId ? { contentId: opts.contentId } : {}) });
       if (outcome.done) {
         return;
       }
@@ -533,6 +731,25 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
       client = resolved.client;
     }
 
+    // The sender is workspace config when the workspace names one. The card
+    // still carries a sender (the library the draft read), but a redraft can
+    // read another user's library, and on 2026-09-25 that enrolled contacts
+    // as the founder with his inbox sending and his name on every task. A
+    // configured sender the portal cannot resolve stops the enrollment
+    // rather than falling back to the card's.
+    const sourceCfg = await contactsSourceConfig(ctx.orgId);
+    let senderEmail = input.senderEmail;
+    let hubspotUserId = input.hubspotUserId;
+    if (sourceCfg.defaultSender && sourceCfg.defaultSender.toLowerCase() !== input.senderEmail.toLowerCase()) {
+      const { resolveHubspotUserId } = await import('@/libs/hubspot/sequences');
+      const user = await resolveHubspotUserId(client, sourceCfg.defaultSender);
+      if (!user.ok) {
+        throw new Error(`Not enrolled: the workspace's sender ${sourceCfg.defaultSender} could not be resolved on the portal (${user.message}), and the card's sender ${input.senderEmail} is not used in its place`);
+      }
+      senderEmail = sourceCfg.defaultSender;
+      hubspotUserId = user.data.userId;
+    }
+
     // HubSpot allows ONE active sequence per contact, and the portal's own
     // automations race this review flow (observed 2026-09-14: a workflow
     // auto-enrolled the lead hours before the human approved, and the approved
@@ -545,7 +762,7 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
       // Best-effort detail for the result; the sender's library may not see a
       // foreign enrollment, and the replace proceeds either way.
       const { getContactEnrollment } = await import('@/libs/hubspot/sequences');
-      const detail = await getContactEnrollment(client, hubspotId, input.hubspotUserId);
+      const detail = await getContactEnrollment(client, hubspotId, hubspotUserId);
       replacedSequence = {
         sequenceId: (detail.ok && detail.data.sequenceId) || enrollmentState.data.latestSequenceId,
         sequenceName: detail.ok ? detail.data.sequenceName ?? null : null,
@@ -559,11 +776,18 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
     // A ladder rung sends whatever the contact's nurture slots hold, so the
     // approved sends go onto the contact FIRST, and a failed write stops the
     // enrollment: an enrolled contact with empty slots receives empty emails.
-    const { isNurtureSequence, nurtureSlotProperties, readNurtureSlotsConfig, writeNurtureSlots } = await import('@/libs/hubspot/nurtureSlots');
-    const slotsCfg = readNurtureSlotsConfig((await contactsSourceConfig(ctx.orgId)).nurtureSlots);
+    const { ensureNurtureSlotProperties, isNurtureSequence, nurtureSlotProperties, readNurtureSlotsConfig, writeNurtureSlots } = await import('@/libs/hubspot/nurtureSlots');
+    const slotsCfg = readNurtureSlotsConfig(sourceCfg.nurtureSlots);
     let slotsWritten = 0;
     if (isNurtureSequence(input.sequenceName, slotsCfg)) {
       const properties = nurtureSlotProperties(input.sends, slotsCfg);
+      // The portal may not have a property for every slot yet (a fifth rung
+      // email, a new portal). Provision what is missing before the write, so
+      // raising `maxSlots` in the workspace is the whole platform-side change.
+      const ensured = await ensureNurtureSlotProperties(client, slotsCfg, input.sends.length);
+      if (!ensured.ok) {
+        throw new Error(`Not enrolled: the nurture slot properties could not be checked or created on the portal (${ensured.message})`);
+      }
       const written = await writeNurtureSlots(client, hubspotId, properties);
       if (!written.ok) {
         throw new Error(`Not enrolled: the nurture slots could not be written to the contact (${written.message}), and "${input.sequenceName}" would send empty emails`);
@@ -577,8 +801,8 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
     const enrolled = await enrollContact(client, {
       sequenceId: input.sequenceId,
       contactId: hubspotId,
-      senderEmail: input.senderEmail,
-      userId: input.hubspotUserId,
+      senderEmail,
+      userId: hubspotUserId,
     });
     if (!enrolled.ok) {
       throw new Error(`HubSpot sequence enrollment failed: ${enrolled.message}`);
@@ -587,13 +811,16 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
     // The sequences API cannot carry per-enrollment copy, so the APPROVED
     // sends are staged for the sender on the contact's timeline. Non-fatal:
     // the enrollment already happened, and the result says which occurred.
-    // hs_note_body renders as HTML too — convert at the same boundary as the slots.
-    const { textToEmailHtml } = await import('@/libs/hubspot/emailHtml');
+    // hs_note_body renders as HTML too, and each body is converted on its own
+    // rather than after being joined: a reviewer's formatted send is already
+    // HTML, and escaping the whole joined string would show them its tags.
+    const { emailBodyHtml } = await import('@/libs/writing/emailBody');
+    const esc = (v: string) => v.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
     const noteBody = [
-      `Approved personalized sends for "${input.sequenceName}" (reviewed in Vocion):`,
-      ...input.sends.map(s => `Send ${s.step}${s.day !== undefined ? ` · Day ${s.day}` : ''}\nSubject: ${s.subject}\n\n${s.body}`),
-    ].join('\n\n---\n\n');
-    const note = await stageSendsAsNote(client, hubspotId, textToEmailHtml(noteBody));
+      `<p>Approved personalized sends for "${esc(input.sequenceName)}" (reviewed in Vocion):</p>`,
+      ...input.sends.map(s => `<p><strong>Send ${s.step}${s.day !== undefined ? ` · Day ${s.day}` : ''}</strong><br>Subject: ${esc(s.subject)}</p>${emailBodyHtml(s.body)}`),
+    ].join('<hr>');
+    const note = await stageSendsAsNote(client, hubspotId, noteBody);
 
     // The lane flip: reviewed sends persist on the lead (the reviewer's
     // edited copy — decide() re-wrote the input before execution), and the
@@ -620,7 +847,9 @@ export const personalizationEnrollAction: Action<typeof enrollInput> = {
       sequenceId: input.sequenceId,
       sequenceName: input.sequenceName,
       contactRef: input.contactRef,
-      senderEmail: input.senderEmail,
+      senderEmail,
+      // The sender the card carried, when the workspace's own won over it.
+      cardSenderEmail: senderEmail.toLowerCase() === input.senderEmail.toLowerCase() ? null : input.senderEmail,
       sendCount: input.sends.length,
       nurtureSlotsWritten: slotsWritten,
       sendsStagedAsNote: note.ok,

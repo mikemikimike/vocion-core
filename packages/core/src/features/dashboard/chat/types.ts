@@ -6,6 +6,9 @@
  * component import without dragging in the orchestrator.
  */
 
+import type { SelfUpdateReceipt } from '@/libs/actions/selfUpdate';
+import type { TurnStatus } from '@/services/chat/turnStatus';
+
 export type IndexedDocument = {
   document_id: string;
   semantic_identifier: string;
@@ -41,7 +44,11 @@ export type SkillResult = {
 /** One run inside an assistant message: either a text chunk or an inline tool breadcrumb. */
 export type AgentRun
   = | { type: 'text'; text: string }
-    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string; state?: 'pending' | 'done' | 'error' };
+    | { type: 'tool'; name: string; input?: Record<string, unknown>; output?: string; state?: 'pending' | 'done' | 'error' }
+    /** A card the turn put up (backlog 025) — rendered from the row after a reload. */
+    | { type: 'card'; id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string; ref?: { type: string; id: number } }
+    /** A person's decision on a card, written as a user turn. */
+    | { type: 'card_decision'; cardId: string; action: string; runId?: number; label?: string };
 
 /** A source surfaced by an actor during the turn (bubbles into the trace). */
 export type TraceCitation = {
@@ -71,7 +78,15 @@ export type TraceNode = {
   resultDetail?: string;
   /** Accumulated reasoning text (from `delta` progress events). */
   text?: string;
+  /**
+   * Where the call has got to while it runs — `sheet 7 of 12`. Rendered after
+   * the label on the live step line (`stepProgressLabel`) and dropped the
+   * moment the step lands, so a finished trace never keeps a stale count.
+   */
+  progress?: string;
   result?: string;
+  /** Both tenses of the step's name, once known; `label` is re-derived from it as the status changes. */
+  labels?: { running: string; done: string };
   confidence?: number;
   citations?: TraceCitation[];
   /**
@@ -87,6 +102,10 @@ export type TraceNode = {
 
 /** A2UI: a one-tap recommended action rendered as a card in the answer. */
 export type RecommendedAction = {
+  /** The card's id (backlog 025) — how a `card_update` and a decision find it. Absent on a pre-card row. */
+  id?: string;
+  /** The card's state as the server last said it. */
+  state?: 'proposed' | 'filed' | 'decided' | 'deferred' | 'expired';
   actionId: string;
   input: Record<string, unknown>;
   label: string;
@@ -102,6 +121,9 @@ export type RecommendedAction = {
 
 /** How recommended actions behave in a thread (0094). Mirrors `CONVERSATION_AUTONOMY` on the server. */
 export type ConversationAutonomy = 'ask' | 'act-within-bounds';
+
+/** Which model answered a turn and how hard it thought — the turn's footer (`run_meta` event). */
+export type TurnModel = { model: string; provider: string; strength: 'fast' | 'balanced' | 'deep'; thinking: 'off' | 'low' | 'medium' | 'high' };
 
 /**
  * A record the person pointed the conversation at — an `@` tag in the
@@ -134,9 +156,18 @@ export type ContextRef = {
 export type ChatMessageArtifact = {
   id: number;
   title: string;
-  kind: 'table' | 'markdown' | 'chart' | 'record' | 'link' | 'file' | 'sequence' | 'document';
+  kind: 'table' | 'markdown' | 'chart' | 'record' | 'link' | 'file' | 'sequence' | 'document' | 'mission' | 'playbook';
   version: number;
 };
+
+/**
+ * One thing the system changed about ITSELF during a turn — a wiki page, a
+ * mission's notes, a playbook, an agent's own instructions, a remembered
+ * rule, a capability. The shape is the server's, imported rather than
+ * mirrored: `libs/actions/selfUpdate.ts` is pure, and one noun beats two that
+ * drift (principle 7).
+ */
+export type { SelfUpdateReceipt } from '@/libs/actions/selfUpdate';
 
 /**
  * A file a person put into the turn — an image, a PDF, a text file. It is an
@@ -160,6 +191,8 @@ export type ChatAttachment = {
 export type ChatMessage = {
   /** Persisted row id, once known — the feedback control writes against it. */
   id?: number;
+  /** Which model answered this turn (assistant rows, live only — not persisted). */
+  model?: TurnModel;
   role: 'user' | 'assistant';
   content: string;
   /** The person's thumb on this turn (assistant rows only), as stored. */
@@ -167,10 +200,18 @@ export type ChatMessage = {
   /** When a turn was routed to a specialist (`@agent`), who answered — rendered as the speaker (§9). */
   agentSlug?: string;
   agentName?: string;
+  /** When the workspace chose the agent (`services/agents/router.ts`): candidates, pick, reason — the "via" eyebrow's tooltip. */
+  routing?: import('@/services/agents/router').RoutingDecision;
   /** A2UI recommended-action cards emitted during this turn (clickable). */
   recommendations?: RecommendedAction[];
   /** Artifacts this turn created or changed (0101) — chips under the message. */
   artifacts?: ChatMessageArtifact[];
+  /**
+   * What the system taught itself during this turn — one chip under the
+   * message, each entry undoable. Several in a turn group into that chip
+   * rather than stacking beside it.
+   */
+  selfUpdates?: SelfUpdateReceipt[];
   /** Files the person attached to this (user) message — chips above its text. */
   attachments?: ChatAttachment[];
   documents?: IndexedDocument[];
@@ -196,6 +237,21 @@ export type ChatMessage = {
   thinkingText?: string;
   /** Agent's self-assessment of this turn's confidence (N.2). Null when the runtime didn't expose a signal. */
   confidence?: 'confident' | 'uncertain' | 'speculative' | null;
+  /**
+   * How the turn ended (#114) — the vocabulary lives in
+   * `services/chat/turnStatus.ts`. Absent or `complete` on a healthy turn;
+   * `incomplete`, `failed` and `refused` each get their own notice and are
+   * left out of the model's history; `stopped`, `truncated` and `continued`
+   * are ordinary endings, each with a quiet one-line marker instead.
+   */
+  status?: TurnStatus | null;
+  /**
+   * Why the turn ended that way, in the runtime's own words ("the model
+   * connection dropped mid-answer", "Budget exceeded for …"). Shown under the
+   * notice so a person can say what happened when they report it, and
+   * persisted since #114 so a reloaded turn still carries it.
+   */
+  statusReason?: string;
 };
 
 export type AgentOption = {

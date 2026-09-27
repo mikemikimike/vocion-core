@@ -2,7 +2,7 @@
   "name": "@vocion/core",
   "version": "0.1.0",
   "private": true,
-  "description": "Vocion — Next.js app, Postgres schema, MCP server, workflow runner.",
+  "description": "Vocion \u2014 Next.js app, Postgres schema, MCP server, workflow runner.",
   "license": "MPL-2.0",
   "engines": {
     "node": ">=20.3"
@@ -19,6 +19,7 @@
     "docs:ingest": "dotenv -c -- tsx src/scripts/ingest-docs.ts",
     "seed:demo": "dotenv -c -- tsx src/scripts/seed-demo.ts",
     "adoption:backfill": "dotenv -c -- tsx src/scripts/backfill-adoption-events.ts",
+    "voice:relint": "dotenv -c -- tsx src/scripts/relint-pending-enrolls.ts",
     "adoption:seed-demo": "dotenv -c -- tsx src/scripts/seed-adoption-demo.ts",
     "start": "next start",
     "build-stats": "cross-env ANALYZE=true npm run build",
@@ -32,6 +33,7 @@
     "openapi:generate": "tsx src/scripts/generate-openapi.ts",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "e2e:chat-incomplete": "VOCION_LLM_PROVIDER=scripted VOCION_LLM_SCRIPT=e2e/chat-incomplete/scripts/mid-stream-failure.json WORKSPACE_PATH=templates/workspaces/client-documents VOCION_DISABLE_RUNTIME=1 playwright test --project=chat-incomplete --workers=1",
     "e2e:documents": "VOCION_LLM_PROVIDER=scripted VOCION_LLM_SCRIPT=e2e/documents/scripts/proposal-loop.json WORKSPACE_PATH=templates/workspaces/client-documents VOCION_DISABLE_RUNTIME=1 playwright test --project=documents --workers=1",
     "db-server:file": "pglite-server --extensions=vector --db=local.db --run 'npm run db:migrate'",
     "db-server:memory": "pglite-server --extensions=vector --run 'npm run db:migrate'",
@@ -70,7 +72,9 @@
     "connectors:backfill-credentials": "dotenv -c -- tsx src/scripts/backfill-connector-credentials.ts",
     "user:create": "dotenv -c -- tsx src/scripts/create-local-user.ts",
     "consolidate:run": "dotenv -c -- tsx src/scripts/run-consolidation.ts",
-    "version:write": "node scripts/write-version.mjs"
+    "artifacts:sweep": "dotenv -c -- tsx src/scripts/sweep-artifacts.ts",
+    "version:write": "node scripts/write-version.mjs",
+    "people:apply": "tsx src/scripts/apply-people.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.88.0",
@@ -110,6 +114,10 @@
     "@temporalio/client": "^1.17.1",
     "@temporalio/worker": "^1.17.1",
     "@temporalio/workflow": "^1.17.1",
+    "@tiptap/extension-link": "^3.31.3",
+    "@tiptap/pm": "^3.31.3",
+    "@tiptap/react": "^3.31.3",
+    "@tiptap/starter-kit": "^3.31.3",
     "@uiw/react-codemirror": "^4.25.9",
     "@vocion/sdk": "*",
     "ajv": "^8.17.1",
@@ -144,6 +152,7 @@
     "rehype-slug": "^6.0.0",
     "remark-directive": "^4.0.0",
     "remark-gfm": "^4.0.1",
+    "sanitize-html": "^2.17.7",
     "sharp": "^0.34.5",
     "stripe": "^18.5.0",
     "swagger-ui-react": "^5.33.0",
@@ -172,6 +181,7 @@
     "@types/pg": "^8.18.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@types/sanitize-html": "^2.16.1",
     "@types/swagger-ui-react": "^5.18.0",
     "@vitejs/plugin-react": "^5.1.4",
     "@vitest/browser": "^4.0.18",

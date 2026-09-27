@@ -12,6 +12,7 @@ node_modules
 
 # testing
 /coverage
+/packages/core/coverage
 /vitest-test-results
 # Also written under packages/core when vitest runs from there.
 vitest-test-results/
@@ -89,3 +90,6 @@ packages/core/public/pagefind/
 # Internal, MetaCTO-only planning/strategy/case-study docs. The repo is public;
 # docs/internal/README.md says "Not public". Distributed privately, not here.
 docs/internal/
+
+# Session probes. Written to look at the running product, never shipped.
+packages/core/src/scripts/tmp-*.ts
