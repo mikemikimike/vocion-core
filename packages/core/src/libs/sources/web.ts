@@ -43,6 +43,7 @@ import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { load } from 'cheerio';
 import { z } from 'zod';
+import { dayKey, dayPlus, isoInZone, isValidTimeZone } from '@/libs/time/zone';
 import { JSON_LD_BLOCK_CAP, pageMetadata } from './pageMetadata';
 
 const urlsFromSchema = z.object({
@@ -606,17 +607,21 @@ const ICS_EXPORT_STAMP = 'DTSTAMP';
 /**
  * Split an ICS body on `BEGIN:VEVENT` … `END:VEVENT`.
  *
- * A text split and nothing more: no TZID arithmetic, no RRULE expansion. Every
- * property read as a value is unfolded, because RFC 5545 makes a fold a fact
- * about the line rather than about the value, so reading one without unfolding
- * simply truncates it. A recurring event stays one document unless the feed
- * itself writes separate components with RECURRENCE-ID.
+ * A text split with no RRULE expansion. Every property read as a value is
+ * unfolded, because RFC 5545 makes a fold a fact about the line rather than
+ * about the value, so reading one without unfolding simply truncates it. A
+ * recurring event stays one document unless the feed itself writes separate
+ * components with RECURRENCE-ID.
  *
- * The component is kept verbatim but for `ICS_EXPORT_STAMP`, which says when
- * the file was written and would otherwise make a re-export read as an edit.
+ * The document text is the component without `ICS_EXPORT_STAMP`, which says
+ * when the file was written and would otherwise make a re-export read as an
+ * edit, with its lines unfolded and, when the calendar declares its zone, its
+ * UTC times written as that zone's wall clock (see `icsModelLines`). Keys are
+ * read from the component as written.
  * @param page - the fetched feed.
  */
 function splitIcs(page: FetchedPage): IngestDoc[] | null {
+  const zone = calendarTimeZone(page.raw);
   const blocks: string[][] = [];
   let current: string[] | null = null;
   for (const line of page.raw.split(/\r?\n/)) {
@@ -656,11 +661,12 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     }
     seen.add(externalId);
     const published = icsPublishedUrls(block, page.url);
+    const endsOn = icsEndsOn(block, zone);
     docs.push({
       externalId,
       uri: externalId,
       title: icsValue(block, 'SUMMARY') || uid,
-      content: withoutIcsProperty(block, ICS_EXPORT_STAMP).join('\n'),
+      content: icsModelLines(withoutIcsProperty(block, ICS_EXPORT_STAMP), zone).join('\n'),
       // Feed-wide headers say nothing about one event inside it.
       etag: null,
       lastModifiedAt: null,
@@ -670,6 +676,7 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
         // Omitted when empty: an entry that publishes no URL must keep writing
         // the metadata it wrote before, or every sync reports a refresh.
         ...(published.length ? { publishedUrls: published } : {}),
+        ...(endsOn ? { endsOn } : {}),
       },
     });
   }
@@ -852,6 +859,22 @@ function icsValueColon(line: string): { colon: number; guessed: boolean } {
 const ICS_FOLD_RE = /^[ \t]/;
 
 /**
+ * Lines with every fold joined back to the line it continues.
+ * @param lines - content lines, as written.
+ */
+function unfoldIcs(lines: string[]): string[] {
+  const out: string[] = [];
+  for (const line of lines) {
+    if (ICS_FOLD_RE.test(line) && out.length > 0) {
+      out[out.length - 1] += line.slice(1);
+    } else {
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/**
  * One occurrence of a property, unfolded, with what the scanner knows about
  * it: whether the event itself wrote it rather than a component nested inside
  * it, and whether the split between its name and its value had to be guessed.
@@ -918,6 +941,125 @@ function withoutIcsProperty(lines: string[], name: string): string[] {
     }
   }
   return drop.size === 0 ? lines : lines.filter((_, i) => !drop.has(i));
+}
+
+/** Properties whose UTC date-times `icsModelLines` writes as local wall clock. */
+const ICS_ZONED_PROPERTIES = new Set(['DTSTART', 'DTEND', 'RECURRENCE-ID', 'EXDATE', 'RDATE']);
+const ICS_UTC_TIME_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i;
+/** How far a zone's clocks jump at a change: half an hour, one or two. */
+const CLOCK_SHIFTS_MS = [1_800_000, 3_600_000, 7_200_000];
+
+/**
+ * The zone a calendar declares for itself in its header (`X-WR-TIMEZONE`).
+ * @param raw - the whole calendar file.
+ */
+function calendarTimeZone(raw: string): string | undefined {
+  const start = raw.search(/^BEGIN:VEVENT/im);
+  return knownTimeZone(icsValue((start < 0 ? raw : raw.slice(0, start)).split(/\r?\n/), 'X-WR-TIMEZONE'));
+}
+
+/**
+ * A UTC date-time as a Date.
+ * @param value - `YYYYMMDDTHHMMSSZ`.
+ */
+function icsUtcInstant(value: string): Date | undefined {
+  const m = ICS_UTC_TIME_RE.exec(value);
+  return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))) : undefined;
+}
+
+/**
+ * A UTC date-time as the same moment on a zone's wall clock, in ICS form, or
+ * undefined for a wall time the zone shows twice (when its clocks go back):
+ * RFC 5545 reads that as the first one, which would move the event.
+ * @param value - `YYYYMMDDTHHMMSSZ`.
+ * @param zone - an IANA time zone name.
+ */
+function icsWallClock(value: string, zone: string): string | undefined {
+  const at = icsUtcInstant(value);
+  if (!at) {
+    return undefined;
+  }
+  const wall = (d: Date) => isoInZone(d, zone).slice(0, 19);
+  const local = wall(at);
+  const repeated = CLOCK_SHIFTS_MS.some(shift => wall(new Date(at.getTime() + shift)) === local || wall(new Date(at.getTime() - shift)) === local);
+  return repeated ? undefined : local.replaceAll('-', '').replaceAll(':', '');
+}
+
+/**
+ * One content line with its UTC times written in the calendar's zone, as
+ * `DTSTART;TZID=<zone>:<local>`. Lines that already name a zone, carry
+ * dates rather than date-times, or mix forms are left as they are.
+ * @param line - one unfolded content line.
+ * @param zone - the calendar's declared zone.
+ */
+function icsLineInZone(line: string, zone: string): string {
+  const { colon, guessed } = icsValueColon(line);
+  if (colon < 0 || guessed) {
+    return line;
+  }
+  const [name = '', ...params] = line.slice(0, colon).split(';');
+  if (!ICS_ZONED_PROPERTIES.has(name.toUpperCase()) || params.some(param => /^(?:TZID=|VALUE=(?:DATE|PERIOD)$)/i.test(param))) {
+    return line;
+  }
+  const local = line.slice(colon + 1).split(',').map(value => icsWallClock(value, zone));
+  if (local.includes(undefined)) {
+    return line;
+  }
+  return `${[name, `TZID=${zone}`, ...params].join(';')}:${local.join(',')}`;
+}
+
+/**
+ * Whether the component's times repeat in UTC: it has its own RRULE, or it is
+ * an override that also moves every later occurrence (`RANGE=THISANDFUTURE`).
+ * @param lines - the component's lines, as written.
+ */
+function icsRepeatsInUtc(lines: string[]): boolean {
+  return icsOwnValue(lines, 'RRULE') !== '' || unfoldIcs(lines).some(line => /^RECURRENCE-ID;[^:]*RANGE=THISANDFUTURE/i.test(line));
+}
+
+/**
+ * The component as the model reads it: every folded line joined back to the
+ * line it continues, so a URL or a description arrives whole, and, when the
+ * calendar declares a zone, UTC times on the wall clock of that zone. A
+ * component whose times repeat in UTC keeps them, since a local start would
+ * move every occurrence after a clock change.
+ * @param lines - the component's lines, as written.
+ * @param zone - the calendar's declared zone, if any.
+ */
+function icsModelLines(lines: string[], zone?: string): string[] {
+  const out = unfoldIcs(lines);
+  return zone && !icsRepeatsInUtc(lines) ? out.map(line => icsLineInZone(line, zone)) : out;
+}
+
+/**
+ * The last calendar day a one-off entry covers, `YYYY-MM-DD`, or undefined
+ * when the entry repeats, overrides every later occurrence
+ * (`RANGE=THISANDFUTURE`), or ends by `DURATION`. An all-day `DTEND` is
+ * exclusive, so the day before it.
+ * @param block - the component's lines, as written.
+ * @param zone - the calendar's declared zone, if any.
+ */
+function icsEndsOn(block: string[], zone?: string): string | undefined {
+  if (icsRepeatsInUtc(block) || icsOwnValue(block, 'RDATE')) {
+    return undefined;
+  }
+  const end = icsOwnValue(block, 'DTEND');
+  if (!end && icsOwnValue(block, 'DURATION')) {
+    return undefined;
+  }
+  const value = end || icsOwnValue(block, 'DTSTART');
+  if (zone) {
+    const at = icsUtcInstant(value);
+    if (at) {
+      return dayKey(at, zone);
+    }
+  }
+  const m = /^(\d{4})(\d{2})(\d{2})(T\d{6}Z?)?$/i.exec(value);
+  if (!m) {
+    return undefined;
+  }
+  const day = `${m[1]}-${m[2]}-${m[3]}`;
+  return end && !m[4] ? dayPlus(day, -1) : day;
 }
 
 /**
@@ -1005,6 +1147,15 @@ function icsValue(lines: string[], name: string): string {
 }
 
 /**
+ * The component's own value for a property, never one of a nested alarm's.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ * @param name - the property name, uppercase.
+ */
+function icsOwnValue(lines: string[], name: string): string {
+  return icsProperties(lines, name).find(p => p.own)?.value ?? '';
+}
+
+/**
  * Keys a JSON feed is known to keep its entries under, most trusted first.
  *
  * A tie-breaker, not the rule. Naming one CMS's vocabulary as *the* place to
@@ -1071,10 +1222,8 @@ function feedEntries(page: FetchedPage): unknown[] | null {
   if (!page.contentType.includes('json')) {
     return null;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(page.raw);
-  } catch {
+  const parsed = pageJson(page);
+  if (parsed === undefined) {
     return null;
   }
   const bare = entryArray(parsed);
@@ -1170,6 +1319,56 @@ function plainText(value: string): string {
   return MARKUP_RE.test(value) ? flatten(textFromMarkup(value)) : value;
 }
 
+/** A region zone (`Area/City`); offsets such as `+05:30` and the `Etc/` aliases are not. */
+const REGION_ZONE_RE = /^(?!Etc\/)[A-Z][\w+-]*(?:\/[\w+-]+)+$/i;
+
+/**
+ * A zone name a feed declared, kept only when it is a region zone the runtime
+ * knows, in its canonical spelling: an offset would break a TZID parameter,
+ * and UTC needs no rewrite.
+ * @param value - whatever the feed wrote where a zone name belongs.
+ */
+function knownTimeZone(value: unknown): string | undefined {
+  const zone = typeof value === 'string' ? value.trim() : '';
+  if (!REGION_ZONE_RE.test(zone) || !isValidTimeZone(zone)) {
+    return undefined;
+  }
+  return new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
+}
+
+const parsedBodies = new WeakMap<FetchedPage, unknown>();
+
+/**
+ * The page's body parsed as JSON, once per page, or undefined when it does not parse.
+ * @param page - the fetched page.
+ */
+function pageJson(page: FetchedPage): unknown {
+  if (!parsedBodies.has(page)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(page.raw);
+    } catch {
+      parsed = undefined;
+    }
+    parsedBodies.set(page, parsed);
+  }
+  return parsedBodies.get(page);
+}
+
+/**
+ * The time zone a JSON feed declares for itself: Squarespace writes it under
+ * `website.timeZone`, other feeds at the top level.
+ * @param page - the fetched feed.
+ */
+function feedTimeZone(page: FetchedPage): string | undefined {
+  const parsed = pageJson(page);
+  if (!isRecord(parsed)) {
+    return undefined;
+  }
+  const website = isRecord(parsed.website) ? parsed.website : {};
+  return knownTimeZone(parsed.timeZone) ?? knownTimeZone(parsed.timezone) ?? knownTimeZone(website.timeZone);
+}
+
 /**
  * The entry as it reads: markup reduced to the text it renders, a millisecond
  * timestamp written as the instant it names, view counters left out.
@@ -1183,10 +1382,14 @@ function plainText(value: string): string {
  * also what a reader, human or model, was going to read anyway: an epoch
  * integer is a date nobody can check, and the markup is several times the size
  * of the words inside it.
+ *
+ * An instant is written in the feed's own time zone when the feed names one,
+ * because a model asked for local times copies a UTC hour as if it were local.
  * @param value - any JSON value from the entry.
  * @param key - the key it sat under, where it had one.
+ * @param zone - the time zone the feed declares, if any.
  */
-function readable(value: unknown, key?: string): unknown {
+function readable(value: unknown, key?: string, zone?: string): unknown {
   if (typeof value === 'string') {
     return MARKUP_RE.test(value) ? textFromMarkup(value) : value;
   }
@@ -1196,15 +1399,18 @@ function readable(value: unknown, key?: string): unknown {
       && Number.isInteger(value)
       && value >= EPOCH_MS_MIN
       && value <= EPOCH_MS_MAX;
-    return isInstant ? new Date(value).toISOString() : value;
+    if (!isInstant) {
+      return value;
+    }
+    return zone ? isoInZone(new Date(value), zone) : new Date(value).toISOString();
   }
   if (Array.isArray(value)) {
-    return value.map(entry => readable(entry, key));
+    return value.map(entry => readable(entry, key, zone));
   }
   if (isRecord(value)) {
     return Object.fromEntries(Object.entries(value)
       .filter(([k]) => !ITEM_VOLATILE_FIELDS.has(k))
-      .map(([k, v]) => [k, readable(v, k)]));
+      .map(([k, v]) => [k, readable(v, k, zone)]));
   }
   return value;
 }
@@ -1217,6 +1423,7 @@ function readable(value: unknown, key?: string): unknown {
  * @param items - the entries, as `feedEntries` found them.
  */
 function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null {
+  const zone = feedTimeZone(page);
   if (!items.length) {
     // Unreachable from the one caller, because `feedEntries` answers only with
     // null or a non-empty list. Kept rather than dropped because of what
@@ -1258,7 +1465,7 @@ function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null
       externalId,
       uri: externalId,
       title: declared === undefined ? key : plainText(declared),
-      content: JSON.stringify(readable(item)) ?? body,
+      content: JSON.stringify(readable(item, undefined, zone)) ?? body,
       etag: null,
       lastModifiedAt: null,
       metadata: {
@@ -1667,11 +1874,7 @@ function looksLikeFeed(kind: FeedCandidate['kind'], page: FetchedPage): boolean 
  * @param page - the fetched candidate.
  */
 function jsonObjectBody(page: FetchedPage): boolean {
-  try {
-    return isRecord(JSON.parse(page.raw));
-  } catch {
-    return false;
-  }
+  return isRecord(pageJson(page));
 }
 
 /**

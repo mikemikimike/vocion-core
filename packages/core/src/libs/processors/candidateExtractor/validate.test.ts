@@ -119,6 +119,79 @@ describe('candidate extractor validation', () => {
     expect(out.records.map(kept => kept.fields.title)).toEqual(['Winter Market']);
   });
 
+  it('drops a series occurrence past the horizon, and keeps a one-off however far ahead', () => {
+    const config = configWith({
+      recurrenceHorizonDays: 60,
+      seriesLabel: { sameOn: ['title', 'venueName'], differsOn: 'startDate', evidenceField: 'recurrence', flagField: 'seriesMatch' },
+    });
+
+    const out = run([
+      record({ fields: { startDate: '2027-01-12', recurrence: 'every second Tuesday' } }),
+      record({ fields: { title: 'New Year Gala', startDate: '2027-01-12' } }),
+      record({ fields: { startDate: '2026-12-08', recurrence: 'every second Tuesday' } }),
+    ], config);
+
+    expect(out.counts['skipped.beyond_horizon']).toBe(1);
+    expect(out.records.map(kept => `${kept.fields.title} ${kept.fields.startDate}`)).toEqual(['New Year Gala 2027-01-12', 'Open Mic Night 2026-12-08']);
+  });
+
+  it('keeps a series occurrence on the last day of the horizon and drops the day after', () => {
+    const config = configWith({
+      recurrenceHorizonDays: 60,
+      seriesLabel: { sameOn: ['title', 'venueName'], differsOn: 'startDate', evidenceField: 'recurrence', flagField: 'seriesMatch' },
+    });
+
+    const out = run([
+      record({ fields: { startDate: '2027-01-09', recurrence: 'every Saturday' } }),
+      record({ fields: { startDate: '2027-01-10', recurrence: 'every Saturday' } }),
+    ], config);
+
+    expect(out.records.map(kept => kept.fields.startDate)).toEqual(['2027-01-09']);
+  });
+
+  it('keeps every series occurrence when no series evidence field is configured', () => {
+    const out = run([record({ fields: { startDate: '2027-06-08', recurrence: 'every second Tuesday' } })]);
+
+    expect(out.records).toHaveLength(1);
+  });
+
+  it('notes a quoted field the document does not print as written, and keeps the value', () => {
+    const config = configWith({ quotedFields: ['price'] });
+
+    const out = run([
+      record({ fields: { price: '$10 to $12' } }),
+      record({ fields: { title: 'Late Set', price: 'Tickets $12' } }),
+    ], config);
+
+    expect(out.records[0]?.fields.price).toBe('$10 to $12');
+    expect(out.records[0]?.issues.join(' ')).toContain('price: "$10 to $12" is not written this way in the document');
+    expect(out.records[1]?.issues).toEqual([]);
+  });
+
+  it('does not note a quoted value the operator supplied, or one the document only escaped', () => {
+    const defaulted = run([record()], configWith({ quotedFields: ['price'], defaults: { price: 'Free' } }));
+
+    expect(defaulted.records[0]?.issues).toEqual([]);
+
+    const escaped = run(
+      [record({ fields: { price: '$15, $20 at the door' } }), record({ fields: { title: 'Late Set', price: '"VIP" $30' } })],
+      configWith({ quotedFields: ['price'] }),
+      { pageText: `DESCRIPTION:Tickets $15\\, $20 at the door\n${JSON.stringify({ tier: '"VIP" $30' })}` },
+    );
+
+    expect(escaped.records.map(kept => kept.issues)).toEqual([[], []]);
+  });
+
+  it('undoes line-break escapes in one pass, so a price printed across lines still matches', () => {
+    const out = run(
+      [record({ fields: { price: 'Adults $20 Kids $10' } })],
+      configWith({ quotedFields: ['price'] }),
+      { pageText: JSON.stringify({ tiers: 'Adults $20\r\nKids $10', path: 'C:\\new' }) },
+    );
+
+    expect(out.records[0]?.issues).toEqual([]);
+  });
+
   it('drops an out-of-enum value and keeps the card, noting what went', () => {
     const config = configWith({ allowedValues: { categories: ['Music', 'Comedy'] } });
 
@@ -182,9 +255,10 @@ describe('candidate extractor validation', () => {
   });
 
   it('accepts a folded URL however the model rejoined it, and stores the document\'s spelling', () => {
-    // The connector declares the URL joined back up, but the model is shown the
-    // document as written, folds and all. Comparing literally would drop
-    // exactly the long URLs a fold exists for, so both sides lose whitespace.
+    // The connector declares the URL joined back up, and a document stored
+    // before it joined folds for the model still shows them. Comparing
+    // literally would drop exactly the long URLs a fold exists for, so both
+    // sides lose whitespace.
     // What is kept is the declared string, never the model's: the stored value
     // becomes the href on a reviewer's card, and a newline in it is a dead
     // link that passed the gate.

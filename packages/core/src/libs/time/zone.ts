@@ -49,8 +49,19 @@ export function resolveTimeZone(...candidates: Array<string | null | undefined>)
 
 type Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
 
+// Keyed by the spelling a caller passed, which a browser controls, so it is capped.
+const wallClocks = new Map<string, Intl.DateTimeFormat>();
+const wallClocksCap = 64;
+
 function wallClock(d: Date, tz: string): Parts {
-  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  let f = wallClocks.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+    if (wallClocks.size >= wallClocksCap) {
+      wallClocks.clear();
+    }
+    wallClocks.set(tz, f);
+  }
   const out: Record<string, number> = {};
   for (const p of f.formatToParts(d)) {
     if (p.type !== 'literal') {
@@ -58,6 +69,17 @@ function wallClock(d: Date, tz: string): Parts {
     }
   }
   return { year: out.year!, month: out.month!, day: out.day!, hour: out.hour! % 24, minute: out.minute!, second: out.second! };
+}
+
+/**
+ * A calendar day N days after another; negative moves back.
+ * @param day - The starting day, `YYYY-MM-DD`.
+ * @param days - Days to add.
+ */
+export function dayPlus(day: string, days: number): string {
+  const at = new Date(`${day}T00:00:00Z`);
+  at.setUTCDate(at.getUTCDate() + days);
+  return at.toISOString().slice(0, 10);
 }
 
 /**
@@ -101,6 +123,21 @@ export function zoneOffsetMinutes(d: Date, tz: string): number {
   const p = wallClock(d, tz);
   const asIfUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
   return Math.round((asIfUtc - d.getTime()) / 60_000);
+}
+
+/**
+ * An instant as ISO 8601 on a zone's wall clock, with that zone's offset and
+ * whole seconds: `2026-10-02T12:00:00-04:00`.
+ * @param d - The instant.
+ * @param tz - The zone.
+ */
+export function isoInZone(d: Date, tz: string): string {
+  const p = wallClock(d, tz);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const minutes = zoneOffsetMinutes(d, tz);
+  const abs = Math.abs(minutes);
+  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}`
+    + `${minutes < 0 ? '-' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
 /**

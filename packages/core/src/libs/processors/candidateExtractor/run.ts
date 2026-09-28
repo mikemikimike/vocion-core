@@ -28,6 +28,7 @@ import type { DocumentProcessor, ProcessorResult } from '../types';
 import type { CandidateExtractorConfig } from './config';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { pushScore } from '@/libs/Langfuse';
+import { dayPlus } from '@/libs/time/zone';
 import { keepIdentity, loadDocumentCards } from './identity';
 import { loadKnownCards } from './knownCards';
 import { labelRecords } from './labels';
@@ -116,7 +117,16 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     publishedUrls?: string[];
     ogImage?: string;
     feedUrl?: string;
+    endsOn?: string;
   };
+
+  // A one-off entry that ended two days ago or more can only yield past
+  // records, which `dropIfPast` would drop after paying for them. One day of
+  // margin covers a feed whose zone differs from the configured one.
+  if (config.dropIfPast && typeof metadata.endsOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(metadata.endsOn) && metadata.endsOn < dayPlus(today, -1)) {
+    counts['skipped.past_before_call'] = 1;
+    return { produced: 0, skipped: 1, notes: [`the entry ended on ${metadata.endsOn}, so it was not read`], counts };
+  }
   const jsonLdBlocks = metadata.jsonLd ?? [];
 
   const [known, rules, objectSchema, documentCards] = await Promise.all([

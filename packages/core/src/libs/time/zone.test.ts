@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockLine, dayDistance, dayKey, formatDateTime, isValidTimeZone, resolveTimeZone, sameDay, startOfDay, zoneOffsetMinutes } from './zone';
+import { clockLine, dayDistance, dayKey, dayPlus, formatDateTime, isoInZone, isValidTimeZone, resolveTimeZone, sameDay, startOfDay, zoneOffsetMinutes } from './zone';
 
 const LA = 'America/Los_Angeles';
 // Thu 2026-09-17 17:30 PDT = Fri 2026-09-18 00:30 UTC — the moment the UTC day had already flipped on Chris.
@@ -41,6 +41,17 @@ describe('time zones', () => {
     // 2026-11-01 is the fall-back day in the US: still local midnight, at PDT's offset.
     expect(startOfDay('2026-11-01', LA).toISOString()).toBe('2026-11-01T07:00:00.000Z');
     expect(startOfDay('2026-11-02', LA).toISOString()).toBe('2026-11-02T08:00:00.000Z');
+  });
+
+  it('writes an instant on a zone\'s wall clock with its offset, in half-hour zones and on both sides of a clock change', () => {
+    expect(isoInZone(new Date('2026-01-01T12:00:00Z'), 'Asia/Kolkata')).toBe('2026-01-01T17:30:00+05:30');
+    expect(isoInZone(new Date('2026-11-01T05:30:00Z'), 'America/New_York')).toBe('2026-11-01T01:30:00-04:00');
+    expect(isoInZone(new Date('2026-11-01T06:30:00.878Z'), 'America/New_York')).toBe('2026-11-01T01:30:00-05:00');
+  });
+
+  it('moves a calendar day across a month and a year', () => {
+    expect(dayPlus('2026-12-31', 1)).toBe('2027-01-01');
+    expect(dayPlus('2026-03-01', -1)).toBe('2026-02-28');
   });
 
   it('formats a time a person can act on, zone named', () => {

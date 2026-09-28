@@ -73,6 +73,7 @@ describe('candidate-extractor config', () => {
       allowedValues: { categories: ['music', 'theatre'] },
       onViolation: 'dropRecord',
       mustAppearInDocument: ['price'],
+      quotedFields: ['price'],
       collapseWithinDocument: true,
       resolveAgainst: [{
         objectType: 'venue-candidate',

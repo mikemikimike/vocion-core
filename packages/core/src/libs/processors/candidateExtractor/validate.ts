@@ -26,6 +26,7 @@ import type { CandidateExtractorConfig } from './config';
 import type { ExtractedRecord } from './model';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { normaliseForKey } from '@/libs/actions/objects-propose-candidate';
+import { dayPlus } from '@/libs/time/zone';
 import { calendarDayOf } from './knownCards';
 
 /** An adopted rule a record cites, with the text the model was shown. */
@@ -134,6 +135,16 @@ export function calendarToday(timezone: string | undefined, now: Date = new Date
 }
 
 /**
+ * Text with the escapes of a calendar file and of JSON undone in one pass
+ * (`\,` `\;` `\"` `\\` and the `\n` `\r` `\t` breaks), so a value is compared
+ * with what a reader sees.
+ * @param text - Document text.
+ */
+function unescaped(text: string): string {
+  return text.replace(/\\([nrt,;"\\])/gi, (_, c: string) => ('nrtNRT'.includes(c) ? ' ' : c));
+}
+
+/**
  * Digit runs in a value, which are what a document has to corroborate.
  * @param value - The field value.
  */
@@ -154,11 +165,12 @@ function isBlank(value: unknown): boolean {
  * A URL with its whitespace removed, which is how both sides of the gate are
  * compared.
  *
- * A calendar feed folds a long line, and the model is shown the document as it
- * was written, folds and all, while the connector declares the value joined
- * back up. Comparing the two literally would drop exactly the long URLs a fold
- * exists for. No real URL carries whitespace, so removing it costs nothing and
- * makes the comparison independent of how the model handled the fold.
+ * A calendar feed folds a long line, and a document stored before the
+ * connector joined folds for the model still shows them, while the connector
+ * declares the value joined back up. Comparing the two literally would drop
+ * exactly the long URLs a fold exists for. No real URL carries whitespace, so
+ * removing it costs nothing and makes the comparison independent of how the
+ * model handled the fold.
  * @param url - either side's URL.
  */
 function squashUrl(url: string): string {
@@ -312,16 +324,21 @@ export function validateRecords(opts: {
   };
 
   const kept: ValidatedRecord[] = [];
+  const pageBlob = () => `${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`;
   let pageHaystack: string | null = null;
+  let quotedHaystack: string | null = null;
+  const horizon = dayPlus(opts.today, config.recurrenceHorizonDays);
   for (const raw of opts.records) {
     const { scores: rawScores, matchedRules: rawRules, ...rest } = raw;
     const record: ValidatedRecord = { ...rest, fields: { ...raw.fields }, issues: [] };
 
     // Defaults first: they are what a venue site's page leaves unsaid, and the
     // identity check below has to see them.
+    const defaulted = new Set<string>();
     for (const [field, value] of Object.entries(config.defaults ?? {})) {
       if (isBlank(record.fields[field])) {
         record.fields[field] = value;
+        defaulted.add(field);
       }
     }
 
@@ -345,6 +362,18 @@ export function validateRecords(opts: {
       // next week is still on.
       if (day && day < opts.today && !(keepUntil && keepUntil >= opts.today)) {
         bump('skipped.past');
+        continue;
+      }
+    }
+
+    // The prompt asks for series occurrences inside the horizon only; this
+    // holds the model to it. A dated one-off carries no series evidence and
+    // is never cut, however far ahead it is.
+    const series = config.seriesLabel;
+    if (series?.evidenceField && !isBlank(record.fields[series.evidenceField])) {
+      const day = calendarDayOf(record.fields[series.differsOn]);
+      if (day && day > horizon) {
+        bump('skipped.beyond_horizon');
         continue;
       }
     }
@@ -394,6 +423,18 @@ export function validateRecords(opts: {
       if (runs.length > 0 && !runs.every(run => opts.pageText.includes(run))) {
         delete record.fields[field];
         record.issues.push(`${field}: dropped, its digits do not appear anywhere in the document`);
+      }
+    }
+
+    // A value the operator supplied is not the document's to print.
+    for (const field of config.quotedFields ?? []) {
+      const value = record.fields[field];
+      if (typeof value !== 'string' || isBlank(value) || defaulted.has(field)) {
+        continue;
+      }
+      quotedHaystack ??= squash(unescaped(pageBlob()));
+      if (!quotedHaystack.includes(squash(value))) {
+        record.issues.push(`${field}: "${value}" is not written this way in the document; check it against the source`);
       }
     }
 
@@ -458,7 +499,7 @@ export function validateRecords(opts: {
 
     const known = opts.rules ?? [];
     if (rawRules !== undefined && known.length > 0) {
-      pageHaystack ??= squash(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`);
+      pageHaystack ??= squash(pageBlob());
       const cited: CitedRule[] = [];
       for (const answer of rawRules) {
         const rule = resolveRule(answer.id, known);

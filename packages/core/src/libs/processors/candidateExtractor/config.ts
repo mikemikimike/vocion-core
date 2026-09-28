@@ -134,6 +134,8 @@ export const candidateExtractorConfigSchema = z.object({
   onViolation: z.enum(['dropValue', 'dropRecord']).default('dropValue'),
   /** Fields whose digits must occur in the document, or the field is dropped. */
   mustAppearInDocument: z.array(FieldName).max(20).optional(),
+  /** Fields the document must print as written; a value it does not is kept, with a note for the reviewer. */
+  quotedFields: z.array(FieldName).max(20).optional(),
   /** Collapse records that share the `dedupOn` identity within one document. */
   collapseWithinDocument: z.boolean().default(false),
   /** Canonicalise printed values against approved objects of another type. */

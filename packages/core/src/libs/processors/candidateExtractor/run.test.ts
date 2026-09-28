@@ -180,6 +180,41 @@ describe('candidate extractor, one document end to end', () => {
     expect(human).toContain('<jsonld>');
   });
 
+  it('does not call the model for a one-off entry that ended two days ago or more', async () => {
+    invoke.mockResolvedValue(answer());
+
+    const result = await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: day(-3) } } }));
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(result.counts?.['skipped.past_before_call']).toBe(1);
+    expect(result.retry).toBeUndefined();
+  });
+
+  it('reads an entry whose end day is not a calendar day', async () => {
+    invoke.mockResolvedValue(answer());
+
+    await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: '1999' } } }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reads an entry that ended yesterday', async () => {
+    invoke.mockResolvedValue(answer());
+
+    await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: day(-1) } } }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a long-past entry for a source that keeps past records', async () => {
+    invoke.mockResolvedValue(answer());
+    const { dropIfPast: _, ...keepsPast } = config;
+
+    await run(context({ config: keepsPast, document: { ...document, metadata: { ...document.metadata, endsOn: day(-30) } } }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it('does not send the structured data twice when the page text already carries it whole', async () => {
     invoke.mockResolvedValue(answer());
 
