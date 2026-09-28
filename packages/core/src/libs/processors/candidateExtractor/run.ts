@@ -29,7 +29,7 @@ import type { CandidateExtractorConfig } from './config';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { pushScore } from '@/libs/Langfuse';
 import { keepIdentity, loadDocumentCards } from './identity';
-import { loadKnownCards } from './knownCards';
+import { dayPlus, loadKnownCards } from './knownCards';
 import { labelRecords } from './labels';
 import { renderLearnings } from './learnings';
 import { extractRecords, SKIP_OUTCOME } from './model';
@@ -37,7 +37,7 @@ import { oncePerSync } from './oncePerSync';
 import { buildExtractionPrompt } from './prompt';
 import { PROPOSAL_CAP_HIT_NOTE, proposeRecords } from './propose';
 import { proposeRelatedObjects, resolveRecords } from './resolve';
-import { calendarToday, shiftDay, validateRecords } from './validate';
+import { calendarToday, validateRecords } from './validate';
 
 /**
  * Merge a stage's counters into the document's.
@@ -122,7 +122,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
   // A one-off entry that ended two days ago or more can only yield past
   // records, which `dropIfPast` would drop after paying for them. One day of
   // margin covers a feed whose zone differs from the configured one.
-  if (config.dropIfPast && typeof metadata.endsOn === 'string' && metadata.endsOn < shiftDay(today, -1)) {
+  if (config.dropIfPast && typeof metadata.endsOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(metadata.endsOn) && metadata.endsOn < dayPlus(today, -1)) {
     counts['skipped.past_before_call'] = 1;
     return { produced: 0, skipped: 1, notes: [`the entry ended on ${metadata.endsOn}, so it was not read`], counts };
   }

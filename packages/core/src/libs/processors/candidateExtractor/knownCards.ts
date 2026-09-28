@@ -107,7 +107,7 @@ export function calendarDayOf(value: unknown): string | null {
  * @param day - The starting day, `YYYY-MM-DD`.
  * @param days - Days to add.
  */
-function dayPlus(day: string, days: number): string {
+export function dayPlus(day: string, days: number): string {
   const at = new Date(`${day}T00:00:00Z`);
   at.setUTCDate(at.getUTCDate() + days);
   return at.toISOString().slice(0, 10);

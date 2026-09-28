@@ -190,6 +190,14 @@ describe('candidate extractor, one document end to end', () => {
     expect(result.retry).toBeUndefined();
   });
 
+  it('reads an entry whose end day is not a calendar day', async () => {
+    invoke.mockResolvedValue(answer());
+
+    await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: 'last week' } } }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it('still reads an entry that ended yesterday', async () => {
     invoke.mockResolvedValue(answer());
 

@@ -154,6 +154,20 @@ describe('candidate extractor validation', () => {
     expect(out.records[1]?.issues).toEqual([]);
   });
 
+  it('does not note a quoted value the operator supplied, or one the document only escaped', () => {
+    const defaulted = run([record()], configWith({ quotedFields: ['price'], defaults: { price: 'Free' } }));
+
+    expect(defaulted.records[0]?.issues).toEqual([]);
+
+    const escaped = run(
+      [record({ fields: { price: '$15, $20 at the door' } }), record({ fields: { title: 'Late Set', price: '"VIP" $30' } })],
+      configWith({ quotedFields: ['price'] }),
+      { pageText: `DESCRIPTION:Tickets $15\\, $20 at the door\n${JSON.stringify({ tier: '"VIP" $30' })}` },
+    );
+
+    expect(escaped.records.map(kept => kept.issues)).toEqual([[], []]);
+  });
+
   it('drops an out-of-enum value and keeps the card, noting what went', () => {
     const config = configWith({ allowedValues: { categories: ['Music', 'Comedy'] } });
 

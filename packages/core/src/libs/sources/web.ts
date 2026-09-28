@@ -43,6 +43,7 @@ import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { load } from 'cheerio';
 import { z } from 'zod';
+import { dayKey, isoInZone, isValidTimeZone } from '@/libs/time/zone';
 import { JSON_LD_BLOCK_CAP, pageMetadata } from './pageMetadata';
 
 const urlsFromSchema = z.object({
@@ -606,8 +607,9 @@ const ICS_EXPORT_STAMP = 'DTSTAMP';
 /**
  * Split an ICS body on `BEGIN:VEVENT` … `END:VEVENT`.
  *
- * A text split and nothing more: no TZID arithmetic, no RRULE expansion. Every
- * property read as a value is unfolded, because RFC 5545 makes a fold a fact
+ * A text split, with no RRULE expansion; zones are converted only in the text
+ * the model reads (see `icsModelLines`). Every property read as a value is
+ * unfolded, because RFC 5545 makes a fold a fact
  * about the line rather than about the value, so reading one without unfolding
  * simply truncates it. A recurring event stays one document unless the feed
  * itself writes separate components with RECURRENCE-ID.
@@ -932,7 +934,7 @@ const ICS_UTC_TIME_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i;
 
 /**
  * The zone a calendar declares for itself in its header (`X-WR-TIMEZONE`).
- * @param raw - the whole calendar file.
+ * @param raw - The whole calendar file.
  */
 function calendarTimeZone(raw: string): string | undefined {
   const start = raw.search(/^BEGIN:VEVENT/im);
@@ -942,26 +944,38 @@ function calendarTimeZone(raw: string): string | undefined {
 }
 
 /**
- * A UTC date-time as the same moment on a zone's wall clock, in ICS form.
+ * A UTC date-time as a Date.
  * @param value - `YYYYMMDDTHHMMSSZ`.
- * @param zone - an IANA time zone name.
+ */
+function icsUtcInstant(value: string): Date | undefined {
+  const m = ICS_UTC_TIME_RE.exec(value);
+  return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))) : undefined;
+}
+
+/**
+ * A UTC date-time as the same moment on a zone's wall clock, in ICS form, or
+ * undefined for a wall time the zone shows twice (the hour clocks go back):
+ * RFC 5545 reads that as the first one, which would move the event.
+ * @param value - `YYYYMMDDTHHMMSSZ`.
+ * @param zone - An IANA time zone name.
  */
 function icsWallClock(value: string, zone: string): string | undefined {
-  const m = ICS_UTC_TIME_RE.exec(value);
-  if (!m) {
+  const at = icsUtcInstant(value);
+  if (!at) {
     return undefined;
   }
-  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
-  const local = wallClock(ms, zone);
-  return local ? `${local.date.replaceAll('-', '')}T${local.time.replaceAll(':', '')}` : undefined;
+  const wall = (d: Date) => isoInZone(d, zone).slice(0, 19);
+  const local = wall(at);
+  const repeated = [-3_600_000, -1_800_000, 1_800_000, 3_600_000].some(shift => wall(new Date(at.getTime() + shift)) === local);
+  return repeated ? undefined : local.replaceAll('-', '').replaceAll(':', '');
 }
 
 /**
  * One content line with its UTC times written in the calendar's zone, as
  * `DTSTART;TZID=<zone>:<local>`. Lines that already name a zone, carry
  * dates rather than date-times, or mix forms are left as they are.
- * @param line - one unfolded content line.
- * @param zone - the calendar's declared zone.
+ * @param line - One unfolded content line.
+ * @param zone - The calendar's declared zone.
  */
 function icsLineInZone(line: string, zone: string): string {
   const { colon, guessed } = icsValueColon(line);
@@ -983,8 +997,8 @@ function icsLineInZone(line: string, zone: string): string {
  * The component as the model reads it: every folded line joined back to the
  * line it continues, so a URL or a description arrives whole, and, when the
  * calendar declares a zone, UTC times on the wall clock of that zone.
- * @param lines - the component's lines, as written.
- * @param zone - the calendar's declared zone, if any.
+ * @param lines - The component's lines, as written.
+ * @param zone - The calendar's declared zone, if any.
  */
 function icsModelLines(lines: string[], zone?: string): string[] {
   const out: string[] = [];
@@ -1000,31 +1014,31 @@ function icsModelLines(lines: string[], zone?: string): string[] {
 
 /**
  * The last calendar day a one-off entry covers, `YYYY-MM-DD`, or undefined
- * when the entry repeats or its end cannot be read without arithmetic
- * (`DURATION`). An all-day `DTEND` is exclusive, so the day before it.
- * @param block - the component's lines, as written.
- * @param zone - the calendar's declared zone, if any.
+ * when the entry repeats, overrides every later occurrence
+ * (`RANGE=THISANDFUTURE`), or ends by `DURATION`. An all-day `DTEND` is
+ * exclusive, so the day before it.
+ * @param block - The component's lines, as written.
+ * @param zone - The calendar's declared zone, if any.
  */
 function icsEndsOn(block: string[], zone?: string): string | undefined {
-  if (icsValue(block, 'RRULE') || icsValue(block, 'RDATE')) {
+  if (icsValue(block, 'RRULE') || icsValue(block, 'RDATE') || block.some(line => /^RECURRENCE-ID;[^:]*RANGE=THISANDFUTURE/i.test(line))) {
     return undefined;
   }
   const end = icsValue(block, 'DTEND');
   if (!end && icsValue(block, 'DURATION')) {
     return undefined;
   }
-  const value = (end || icsValue(block, 'DTSTART')).trim();
-  const m = /^(\d{4})(\d{2})(\d{2})(T\d{6}(Z)?)?$/i.exec(value);
+  const value = end || icsValue(block, 'DTSTART');
+  const at = zone ? icsUtcInstant(value) : undefined;
+  if (at && zone) {
+    return dayKey(at, zone);
+  }
+  const m = /^(\d{4})(\d{2})(\d{2})(T\d{6}Z?)?$/i.exec(value);
   if (!m) {
     return undefined;
   }
-  if (m[5] && zone) {
-    const local = icsWallClock(value, zone);
-    return local ? `${local.slice(0, 4)}-${local.slice(4, 6)}-${local.slice(6, 8)}` : undefined;
-  }
   const day = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  const last = end && !m[4] ? day - 86_400_000 : day;
-  return new Date(last).toISOString().slice(0, 10);
+  return new Date(end && !m[4] ? day - 86_400_000 : day).toISOString().slice(0, 10);
 }
 
 /**
@@ -1178,10 +1192,8 @@ function feedEntries(page: FetchedPage): unknown[] | null {
   if (!page.contentType.includes('json')) {
     return null;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(page.raw);
-  } catch {
+  const parsed = pageJson(page);
+  if (parsed === undefined) {
     return null;
   }
   const bare = entryArray(parsed);
@@ -1277,92 +1289,45 @@ function plainText(value: string): string {
   return MARKUP_RE.test(value) ? flatten(textFromMarkup(value)) : value;
 }
 
-const ZONE_CLOCKS = new Map<string, Intl.DateTimeFormat>();
+/** A region zone (`Area/City`); offsets such as `+05:30` and the `Etc/` aliases are not. */
+const REGION_ZONE_RE = /^(?!Etc\/)[A-Z][\w+-]*(?:\/[\w+-]+)+$/i;
 
 /**
- * A formatter for a zone `Intl` knows, or undefined for any other name.
- * @param zone - an IANA time zone name.
- */
-function zoneClock(zone: string): Intl.DateTimeFormat | undefined {
-  const cached = ZONE_CLOCKS.get(zone);
-  if (cached) {
-    return cached;
-  }
-  try {
-    const clock = new Intl.DateTimeFormat('en-US', {
-      timeZone: zone,
-      hourCycle: 'h23',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-    ZONE_CLOCKS.set(zone, clock);
-    return clock;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * A declared zone name, kept only when it names a real zone.
- * @param value - whatever the feed wrote where a zone name belongs.
+ * A zone name a feed declared, kept only when it is a region zone the runtime
+ * knows: an offset would break a TZID parameter, and UTC needs no rewrite.
+ * @param value - Whatever the feed wrote where a zone name belongs.
  */
 function knownTimeZone(value: unknown): string | undefined {
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-  const zone = value.trim();
-  return zone.length > 0 && zone.length <= 64 && zoneClock(zone) ? zone : undefined;
+  const zone = typeof value === 'string' ? value.trim() : '';
+  return REGION_ZONE_RE.test(zone) && isValidTimeZone(zone) ? zone : undefined;
 }
 
-/**
- * An instant as the wall clock in a zone shows it, with that zone's offset.
- * @param ms - milliseconds since the epoch.
- * @param zone - an IANA time zone name.
- */
-function wallClock(ms: number, zone: string): { date: string; time: string; offset: string } | undefined {
-  const clock = zoneClock(zone);
-  if (!clock) {
-    return undefined;
-  }
-  const parts = Object.fromEntries(clock.formatToParts(new Date(ms)).map(part => [part.type, part.value]));
-  const seconds = Math.floor(ms / 1000) * 1000;
-  const asUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
-  const minutes = Math.round((asUtc - seconds) / 60_000);
-  const sign = minutes < 0 ? '-' : '+';
-  const abs = Math.abs(minutes);
-  return {
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-    time: `${parts.hour}:${parts.minute}:${parts.second}`,
-    offset: `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`,
-  };
-}
+const PARSED_BODIES = new WeakMap<FetchedPage, unknown>();
 
 /**
- * A millisecond timestamp as an ISO instant, local to the zone when there is one.
- * @param ms - milliseconds since the epoch.
- * @param zone - the zone to write it in, if any.
+ * The page's body parsed as JSON, once per page, or undefined when it does not parse.
+ * @param page - The fetched page.
  */
-function instantText(ms: number, zone?: string): string {
-  const local = zone ? wallClock(ms, zone) : undefined;
-  return local ? `${local.date}T${local.time}${local.offset}` : new Date(ms).toISOString();
+function pageJson(page: FetchedPage): unknown {
+  if (!PARSED_BODIES.has(page)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(page.raw);
+    } catch {
+      parsed = undefined;
+    }
+    PARSED_BODIES.set(page, parsed);
+  }
+  return PARSED_BODIES.get(page);
 }
 
 /**
  * The time zone a JSON feed declares for itself: Squarespace writes it under
  * `website.timeZone`, other feeds at the top level.
- * @param page - the fetched feed.
+ * @param page - The fetched feed.
  */
 function feedTimeZone(page: FetchedPage): string | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(page.raw);
-  } catch {
-    return undefined;
-  }
+  const parsed = pageJson(page);
   if (!isRecord(parsed)) {
     return undefined;
   }
@@ -1400,7 +1365,10 @@ function readable(value: unknown, key?: string, zone?: string): unknown {
       && Number.isInteger(value)
       && value >= EPOCH_MS_MIN
       && value <= EPOCH_MS_MAX;
-    return isInstant ? instantText(value, zone) : value;
+    if (!isInstant) {
+      return value;
+    }
+    return zone ? isoInZone(new Date(value), zone) : new Date(value).toISOString();
   }
   if (Array.isArray(value)) {
     return value.map(entry => readable(entry, key, zone));
@@ -1419,7 +1387,7 @@ function readable(value: unknown, key?: string, zone?: string): unknown {
  * never by its position in the array.
  * @param page - the fetched feed.
  * @param items - the entries, as `feedEntries` found them.
- * @param zone - the time zone the feed declares, if any.
+ * @param zone - The time zone the feed declares, if any.
  */
 function splitJsonArray(page: FetchedPage, items: unknown[], zone?: string): IngestDoc[] | null {
   if (!items.length) {

@@ -26,7 +26,7 @@ import type { CandidateExtractorConfig } from './config';
 import type { ExtractedRecord } from './model';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { normaliseForKey } from '@/libs/actions/objects-propose-candidate';
-import { calendarDayOf } from './knownCards';
+import { calendarDayOf, dayPlus } from './knownCards';
 
 /** An adopted rule a record cites, with the text the model was shown. */
 export type CitedRule = { id: string; title?: string; text: string; evidence?: string };
@@ -134,12 +134,12 @@ export function calendarToday(timezone: string | undefined, now: Date = new Date
 }
 
 /**
- * A calendar day moved by a number of days.
- * @param day - `YYYY-MM-DD`.
- * @param days - how many days forward, or back when negative.
+ * Text with the escapes of a calendar file and of JSON undone (`\,` `\;` `\"`
+ * `\\` and `\n`), so a value is compared with what a reader sees.
+ * @param text - Document text.
  */
-export function shiftDay(day: string, days: number): string {
-  return new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+function unescaped(text: string): string {
+  return text.replace(/\\n/gi, ' ').replace(/\\([,;"\\])/g, '$1');
 }
 
 /**
@@ -163,10 +163,10 @@ function isBlank(value: unknown): boolean {
  * A URL with its whitespace removed, which is how both sides of the gate are
  * compared.
  *
- * A calendar feed folds a long line, and the model is shown the document as it
- * was written, folds and all, while the connector declares the value joined
- * back up. Comparing the two literally would drop exactly the long URLs a fold
- * exists for. No real URL carries whitespace, so removing it costs nothing and
+ * A calendar feed folds a long line, and a document stored before the
+ * connector joined folds for the model still shows them, while the connector
+ * declares the value joined back up. Comparing the two literally would drop
+ * exactly the long URLs a fold exists for. No real URL carries whitespace, so removing it costs nothing and
  * makes the comparison independent of how the model handled the fold.
  * @param url - either side's URL.
  */
@@ -322,15 +322,19 @@ export function validateRecords(opts: {
 
   const kept: ValidatedRecord[] = [];
   let pageHaystack: string | null = null;
+  let quotedHaystack: string | null = null;
+  const horizon = dayPlus(opts.today, config.recurrenceHorizonDays);
   for (const raw of opts.records) {
     const { scores: rawScores, matchedRules: rawRules, ...rest } = raw;
     const record: ValidatedRecord = { ...rest, fields: { ...raw.fields }, issues: [] };
 
     // Defaults first: they are what a venue site's page leaves unsaid, and the
     // identity check below has to see them.
+    const defaulted = new Set<string>();
     for (const [field, value] of Object.entries(config.defaults ?? {})) {
       if (isBlank(record.fields[field])) {
         record.fields[field] = value;
+        defaulted.add(field);
       }
     }
 
@@ -364,7 +368,7 @@ export function validateRecords(opts: {
     const series = config.seriesLabel;
     if (series?.evidenceField && !isBlank(record.fields[series.evidenceField])) {
       const day = calendarDayOf(record.fields[series.differsOn]);
-      if (day && day > shiftDay(opts.today, config.recurrenceHorizonDays)) {
+      if (day && day > horizon) {
         bump('skipped.beyond_horizon');
         continue;
       }
@@ -418,13 +422,14 @@ export function validateRecords(opts: {
       }
     }
 
+    // A value the operator supplied is not the document's to print.
     for (const field of config.quotedFields ?? []) {
       const value = record.fields[field];
-      if (typeof value !== 'string' || isBlank(value)) {
+      if (typeof value !== 'string' || isBlank(value) || defaulted.has(field)) {
         continue;
       }
-      pageHaystack ??= squash(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`);
-      if (!pageHaystack.includes(squash(value))) {
+      quotedHaystack ??= squash(unescaped(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`));
+      if (!quotedHaystack.includes(squash(value))) {
         record.issues.push(`${field}: "${value}" is not written this way in the document; check it against the source`);
       }
     }

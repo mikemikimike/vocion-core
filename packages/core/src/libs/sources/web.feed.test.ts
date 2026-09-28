@@ -1559,6 +1559,61 @@ END:VCALENDAR`;
     expect(stored.endDate).toBe('2026-11-08T07:30:00-05:00');
   });
 
+  it('reads a parameterised zone header, and ignores offsets and UTC aliases', async () => {
+    stubFetch(() => typed(zonedIcs('X-WR-TIMEZONE;VALUE=TEXT:America/New_York\r\n'), 'text/calendar'));
+    const withParam = await run({ urls: [ICS_URL] });
+
+    expect(byId(withParam.docs, 'late-show@venue.test').content).toContain('DTSTART;TZID=America/New_York:20260929T203000');
+
+    for (const header of ['X-WR-TIMEZONE:+05:30\n', 'X-WR-TIMEZONE:UTC\n', 'X-WR-TIMEZONE:Etc/UTC\n']) {
+      stubFetch(() => typed(zonedIcs(header), 'text/calendar'));
+      const { docs } = await run({ urls: [ICS_URL] });
+
+      expect(byId(docs, 'late-show@venue.test').content).toContain('DTSTART:20260930T003000Z');
+    }
+  });
+
+  it('leaves a time the clocks show twice in UTC, and gives a this-and-future override no end day', async () => {
+    const ics = `BEGIN:VCALENDAR
+X-WR-TIMEZONE:America/New_York
+BEGIN:VEVENT
+UID:night-owl@venue.test
+SUMMARY:Night Owl Set
+DTSTART:20261101T053000Z
+DTEND:20261101T073000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:series@venue.test
+RECURRENCE-ID;RANGE=THISANDFUTURE:20260901T230000Z
+SUMMARY:Series, new time from here on
+DTSTART:20260901T220000Z
+END:VEVENT
+END:VCALENDAR`;
+    stubFetch(() => typed(ics, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const owl = byId(docs, 'night-owl@venue.test').content;
+
+    expect(owl).toContain('DTSTART:20261101T053000Z');
+    expect(owl).toContain('DTEND;TZID=America/New_York:20261101T023000');
+
+    const override = docs.find(d => d.externalId.includes('#series@venue.test#'));
+
+    expect((override?.metadata as { endsOn?: string }).endsOn).toBeUndefined();
+  });
+
+  it('keys a JSON entry the same with or without a declared zone, and reads a top-level zone', async () => {
+    const entry = { id: 'run-3', title: 'Noon Run', startDate: Date.UTC(2026, 9, 2, 16, 0) };
+    stubFetch(() => Response.json({ timeZone: 'America/New_York', upcoming: [entry] }));
+    const zoned = await run({ urls: ['https://venue.test/events.json'] });
+    stubFetch(() => Response.json({ upcoming: [entry] }));
+    const plain = await run({ urls: ['https://venue.test/events.json'] });
+
+    expect(zoned.docs.map(d => d.externalId)).toEqual(plain.docs.map(d => d.externalId));
+    expect((JSON.parse(zoned.docs[0]!.content) as Record<string, unknown>).startDate).toBe('2026-10-02T12:00:00-04:00');
+  });
+
   it('keeps UTC for a JSON feed whose declared zone is not a real zone', async () => {
     stubFetch(() => Response.json({
       website: { timeZone: 'Nowhere/Special' },
