@@ -168,8 +168,9 @@ function isBlank(value: unknown): boolean {
  * A calendar feed folds a long line, and a document stored before the
  * connector joined folds for the model still shows them, while the connector
  * declares the value joined back up. Comparing the two literally would drop
- * exactly the long URLs a fold exists for. No real URL carries whitespace, so removing it costs nothing and
- * makes the comparison independent of how the model handled the fold.
+ * exactly the long URLs a fold exists for. No real URL carries whitespace, so
+ * removing it costs nothing and makes the comparison independent of how the
+ * model handled the fold.
  * @param url - either side's URL.
  */
 function squashUrl(url: string): string {

@@ -255,9 +255,10 @@ describe('candidate extractor validation', () => {
   });
 
   it('accepts a folded URL however the model rejoined it, and stores the document\'s spelling', () => {
-    // The connector declares the URL joined back up, but the model is shown the
-    // document as written, folds and all. Comparing literally would drop
-    // exactly the long URLs a fold exists for, so both sides lose whitespace.
+    // The connector declares the URL joined back up, and a document stored
+    // before it joined folds for the model still shows them. Comparing
+    // literally would drop exactly the long URLs a fold exists for, so both
+    // sides lose whitespace.
     // What is kept is the declared string, never the model's: the stored value
     // becomes the href on a reviewer's card, and a newline in it is a dead
     // link that passed the gate.
