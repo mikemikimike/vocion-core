@@ -134,6 +134,15 @@ export function calendarToday(timezone: string | undefined, now: Date = new Date
 }
 
 /**
+ * A calendar day moved by a number of days.
+ * @param day - `YYYY-MM-DD`.
+ * @param days - how many days forward, or back when negative.
+ */
+export function shiftDay(day: string, days: number): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+
+/**
  * Digit runs in a value, which are what a document has to corroborate.
  * @param value - The field value.
  */
@@ -349,6 +358,18 @@ export function validateRecords(opts: {
       }
     }
 
+    // The prompt asks for series occurrences inside the horizon only; this
+    // holds the model to it. A dated one-off carries no series evidence and
+    // is never cut, however far ahead it is.
+    const series = config.seriesLabel;
+    if (series?.evidenceField && !isBlank(record.fields[series.evidenceField])) {
+      const day = calendarDayOf(record.fields[series.differsOn]);
+      if (day && day > shiftDay(opts.today, config.recurrenceHorizonDays)) {
+        bump('skipped.beyond_horizon');
+        continue;
+      }
+    }
+
     let dropped = false;
     for (const [field, allowed] of Object.entries(config.allowedValues ?? {})) {
       const value = record.fields[field];
@@ -394,6 +415,17 @@ export function validateRecords(opts: {
       if (runs.length > 0 && !runs.every(run => opts.pageText.includes(run))) {
         delete record.fields[field];
         record.issues.push(`${field}: dropped, its digits do not appear anywhere in the document`);
+      }
+    }
+
+    for (const field of config.quotedFields ?? []) {
+      const value = record.fields[field];
+      if (typeof value !== 'string' || isBlank(value)) {
+        continue;
+      }
+      pageHaystack ??= squash(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`);
+      if (!pageHaystack.includes(squash(value))) {
+        record.issues.push(`${field}: "${value}" is not written this way in the document; check it against the source`);
       }
     }
 

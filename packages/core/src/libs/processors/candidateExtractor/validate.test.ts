@@ -119,6 +119,41 @@ describe('candidate extractor validation', () => {
     expect(out.records.map(kept => kept.fields.title)).toEqual(['Winter Market']);
   });
 
+  it('drops a series occurrence past the horizon, and keeps a one-off however far ahead', () => {
+    const config = configWith({
+      recurrenceHorizonDays: 60,
+      seriesLabel: { sameOn: ['title', 'venueName'], differsOn: 'startDate', evidenceField: 'recurrence', flagField: 'seriesMatch' },
+    });
+
+    const out = run([
+      record({ fields: { startDate: '2027-01-12', recurrence: 'every second Tuesday' } }),
+      record({ fields: { title: 'New Year Gala', startDate: '2027-01-12' } }),
+      record({ fields: { startDate: '2026-12-08', recurrence: 'every second Tuesday' } }),
+    ], config);
+
+    expect(out.counts['skipped.beyond_horizon']).toBe(1);
+    expect(out.records.map(kept => `${kept.fields.title} ${kept.fields.startDate}`)).toEqual(['New Year Gala 2027-01-12', 'Open Mic Night 2026-12-08']);
+  });
+
+  it('keeps every series occurrence when no series evidence field is configured', () => {
+    const out = run([record({ fields: { startDate: '2027-06-08', recurrence: 'every second Tuesday' } })]);
+
+    expect(out.records).toHaveLength(1);
+  });
+
+  it('notes a quoted field the document does not print as written, and keeps the value', () => {
+    const config = configWith({ quotedFields: ['price'] });
+
+    const out = run([
+      record({ fields: { price: '$10 to $12' } }),
+      record({ fields: { title: 'Late Set', price: 'Tickets $12' } }),
+    ], config);
+
+    expect(out.records[0]?.fields.price).toBe('$10 to $12');
+    expect(out.records[0]?.issues.join(' ')).toContain('price: "$10 to $12" is not written this way in the document');
+    expect(out.records[1]?.issues).toEqual([]);
+  });
+
   it('drops an out-of-enum value and keeps the card, noting what went', () => {
     const config = configWith({ allowedValues: { categories: ['Music', 'Comedy'] } });
 
