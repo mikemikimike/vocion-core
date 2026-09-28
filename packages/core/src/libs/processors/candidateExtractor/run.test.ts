@@ -193,7 +193,7 @@ describe('candidate extractor, one document end to end', () => {
   it('reads an entry whose end day is not a calendar day', async () => {
     invoke.mockResolvedValue(answer());
 
-    await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: 'last week' } } }));
+    await run(context({ document: { ...document, metadata: { ...document.metadata, endsOn: '1999' } } }));
 
     expect(invoke).toHaveBeenCalledTimes(1);
   });

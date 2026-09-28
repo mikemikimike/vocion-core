@@ -26,7 +26,8 @@ import type { CandidateExtractorConfig } from './config';
 import type { ExtractedRecord } from './model';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { normaliseForKey } from '@/libs/actions/objects-propose-candidate';
-import { calendarDayOf, dayPlus } from './knownCards';
+import { dayPlus } from '@/libs/time/zone';
+import { calendarDayOf } from './knownCards';
 
 /** An adopted rule a record cites, with the text the model was shown. */
 export type CitedRule = { id: string; title?: string; text: string; evidence?: string };
@@ -134,12 +135,13 @@ export function calendarToday(timezone: string | undefined, now: Date = new Date
 }
 
 /**
- * Text with the escapes of a calendar file and of JSON undone (`\,` `\;` `\"`
- * `\\` and `\n`), so a value is compared with what a reader sees.
+ * Text with the escapes of a calendar file and of JSON undone in one pass
+ * (`\,` `\;` `\"` `\\` and the `\n` `\r` `\t` breaks), so a value is compared
+ * with what a reader sees.
  * @param text - Document text.
  */
 function unescaped(text: string): string {
-  return text.replace(/\\n/gi, ' ').replace(/\\([,;"\\])/g, '$1');
+  return text.replace(/\\([nrt,;"\\])/gi, (_, c: string) => ('nrtNRT'.includes(c) ? ' ' : c));
 }
 
 /**
@@ -321,6 +323,7 @@ export function validateRecords(opts: {
   };
 
   const kept: ValidatedRecord[] = [];
+  const pageBlob = () => `${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`;
   let pageHaystack: string | null = null;
   let quotedHaystack: string | null = null;
   const horizon = dayPlus(opts.today, config.recurrenceHorizonDays);
@@ -428,7 +431,7 @@ export function validateRecords(opts: {
       if (typeof value !== 'string' || isBlank(value) || defaulted.has(field)) {
         continue;
       }
-      quotedHaystack ??= squash(unescaped(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`));
+      quotedHaystack ??= squash(unescaped(pageBlob()));
       if (!quotedHaystack.includes(squash(value))) {
         record.issues.push(`${field}: "${value}" is not written this way in the document; check it against the source`);
       }
@@ -495,7 +498,7 @@ export function validateRecords(opts: {
 
     const known = opts.rules ?? [];
     if (rawRules !== undefined && known.length > 0) {
-      pageHaystack ??= squash(`${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`);
+      pageHaystack ??= squash(pageBlob());
       const cited: CitedRule[] = [];
       for (const answer of rawRules) {
         const rule = resolveRule(answer.id, known);

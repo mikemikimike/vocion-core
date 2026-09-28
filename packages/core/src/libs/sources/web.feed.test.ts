@@ -1483,11 +1483,66 @@ END:VCALENDAR`;
     expect(late).toContain('DTEND;TZID=America/New_York:20260929T230000');
     expect(late).not.toContain('20260930T003000Z');
 
+    // A repeating component keeps UTC: its occurrences repeat in UTC, so a
+    // local start would move every one after the clocks change.
     const weekly = byId(docs, 'weekly@venue.test').content;
 
-    expect(weekly).toContain('DTSTART;TZID=America/New_York:20261104T180000');
-    expect(weekly).toContain('EXDATE;TZID=America/New_York:20261111T180000,20261125T180000');
-    expect(weekly).toContain('RRULE:FREQ=WEEKLY');
+    expect(weekly).toContain('DTSTART:20261104T230000Z');
+    expect(weekly).toContain('EXDATE:20261111T230000Z,20261125T230000Z');
+  });
+
+  it('writes RDATE lists in the zone, and leaves periods and mixed lists as written', async () => {
+    const ics = `BEGIN:VCALENDAR
+X-WR-TIMEZONE:America/New_
+ York
+BEGIN:VEVENT
+UID:extra-dates@venue.test
+SUMMARY:Extra Dates
+DTSTART:20261003T160000Z
+RDATE:20261010T160000Z,20261017T160000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:periods@venue.test
+SUMMARY:Periods
+DTSTART:20261003T160000Z
+RDATE;VALUE=PERIOD:20261010T160000Z/PT1H
+EXDATE:20261010T160000Z,20261017T120000
+END:VEVENT
+END:VCALENDAR`;
+    stubFetch(() => typed(ics, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const extra = byId(docs, 'extra-dates@venue.test');
+
+    expect(extra.content).toContain('RDATE;TZID=America/New_York:20261010T120000,20261017T120000');
+    expect((extra.metadata as { endsOn?: string }).endsOn).toBeUndefined();
+
+    const periods = byId(docs, 'periods@venue.test').content;
+
+    expect(periods).toContain('DTSTART;TZID=America/New_York:20261003T120000');
+    expect(periods).toContain('RDATE;VALUE=PERIOD:20261010T160000Z/PT1H');
+    expect(periods).toContain('EXDATE:20261010T160000Z,20261017T120000');
+  });
+
+  it('leaves a wall time a two-hour clock change repeats in UTC', async () => {
+    const ics = `BEGIN:VCALENDAR
+X-WR-TIMEZONE:Antarctica/Troll
+BEGIN:VEVENT
+UID:station@venue.test
+SUMMARY:Station Night
+DTSTART:20261025T010000Z
+DTEND:20261025T040000Z
+END:VEVENT
+END:VCALENDAR`;
+    stubFetch(() => typed(ics, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const station = byId(docs, 'station@venue.test').content;
+
+    expect(station).toContain('DTSTART:20261025T010000Z');
+    expect(station).toContain('DTEND;TZID=Antarctica/Troll:20261025T040000');
   });
 
   it('keys an override on its RECURRENCE-ID as written, whatever the text says', async () => {

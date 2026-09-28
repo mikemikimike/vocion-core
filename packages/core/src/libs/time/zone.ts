@@ -49,12 +49,17 @@ export function resolveTimeZone(...candidates: Array<string | null | undefined>)
 
 type Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
 
+// Keyed by the spelling a caller passed, which a browser controls, so it is capped.
 const WALL_CLOCKS = new Map<string, Intl.DateTimeFormat>();
+const WALL_CLOCKS_CAP = 64;
 
 function wallClock(d: Date, tz: string): Parts {
   let f = WALL_CLOCKS.get(tz);
   if (!f) {
     f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+    if (WALL_CLOCKS.size >= WALL_CLOCKS_CAP) {
+      WALL_CLOCKS.clear();
+    }
     WALL_CLOCKS.set(tz, f);
   }
   const out: Record<string, number> = {};
@@ -64,6 +69,17 @@ function wallClock(d: Date, tz: string): Parts {
     }
   }
   return { year: out.year!, month: out.month!, day: out.day!, hour: out.hour! % 24, minute: out.minute!, second: out.second! };
+}
+
+/**
+ * A calendar day N days after another; negative moves back.
+ * @param day - The starting day, `YYYY-MM-DD`.
+ * @param days - Days to add.
+ */
+export function dayPlus(day: string, days: number): string {
+  const at = new Date(`${day}T00:00:00Z`);
+  at.setUTCDate(at.getUTCDate() + days);
+  return at.toISOString().slice(0, 10);
 }
 
 /**

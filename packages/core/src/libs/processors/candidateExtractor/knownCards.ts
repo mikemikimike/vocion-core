@@ -32,6 +32,7 @@
 import type { ProcessorSyncContext } from '../types';
 import type { CandidateExtractorConfig } from './config';
 import { candidateKeySegments, normaliseForKey } from '@/libs/actions/objects-propose-candidate';
+import { dayPlus } from '@/libs/time/zone';
 
 /**
  * Rows read per sync. The query cannot be narrowed further by index today, so
@@ -100,17 +101,6 @@ export function calendarDayOf(value: unknown): string | null {
     return null;
   }
   return parsed.toISOString().slice(0, 10);
-}
-
-/**
- * A calendar day N days after another.
- * @param day - The starting day, `YYYY-MM-DD`.
- * @param days - Days to add.
- */
-export function dayPlus(day: string, days: number): string {
-  const at = new Date(`${day}T00:00:00Z`);
-  at.setUTCDate(at.getUTCDate() + days);
-  return at.toISOString().slice(0, 10);
 }
 
 /**

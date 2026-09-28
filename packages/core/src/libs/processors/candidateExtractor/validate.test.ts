@@ -135,6 +135,20 @@ describe('candidate extractor validation', () => {
     expect(out.records.map(kept => `${kept.fields.title} ${kept.fields.startDate}`)).toEqual(['New Year Gala 2027-01-12', 'Open Mic Night 2026-12-08']);
   });
 
+  it('keeps a series occurrence on the last day of the horizon and drops the day after', () => {
+    const config = configWith({
+      recurrenceHorizonDays: 60,
+      seriesLabel: { sameOn: ['title', 'venueName'], differsOn: 'startDate', evidenceField: 'recurrence', flagField: 'seriesMatch' },
+    });
+
+    const out = run([
+      record({ fields: { startDate: '2027-01-09', recurrence: 'every Saturday' } }),
+      record({ fields: { startDate: '2027-01-10', recurrence: 'every Saturday' } }),
+    ], config);
+
+    expect(out.records.map(kept => kept.fields.startDate)).toEqual(['2027-01-09']);
+  });
+
   it('keeps every series occurrence when no series evidence field is configured', () => {
     const out = run([record({ fields: { startDate: '2027-06-08', recurrence: 'every second Tuesday' } })]);
 
@@ -166,6 +180,16 @@ describe('candidate extractor validation', () => {
     );
 
     expect(escaped.records.map(kept => kept.issues)).toEqual([[], []]);
+  });
+
+  it('undoes line-break escapes in one pass, so a price printed across lines still matches', () => {
+    const out = run(
+      [record({ fields: { price: 'Adults $20 Kids $10' } })],
+      configWith({ quotedFields: ['price'] }),
+      { pageText: JSON.stringify({ tiers: 'Adults $20\r\nKids $10', path: 'C:\\new' }) },
+    );
+
+    expect(out.records[0]?.issues).toEqual([]);
   });
 
   it('drops an out-of-enum value and keeps the card, noting what went', () => {
