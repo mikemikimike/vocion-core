@@ -77,5 +77,6 @@ describe('instantInZone', () => {
     expect(Number.isNaN(instantInZone('2026-13-40T19:30:00', 'America/New_York').getTime())).toBe(true);
     expect(Number.isNaN(instantInZone('2026-02-31T19:30:00', 'America/New_York').getTime())).toBe(true);
     expect(Number.isNaN(instantInZone('2026-10-01T24:00:00', 'America/New_York').getTime())).toBe(true);
+    expect(Number.isNaN(instantInZone('0050-01-05T15:00:00', 'America/New_York').getTime())).toBe(true);
   });
 });

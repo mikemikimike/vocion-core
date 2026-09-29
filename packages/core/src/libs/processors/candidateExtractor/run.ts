@@ -28,7 +28,7 @@ import type { DocumentProcessor, ProcessorResult } from '../types';
 import type { CandidateExtractorConfig } from './config';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { pushScore } from '@/libs/Langfuse';
-import { icsRecurrence, icsUtcInstant } from '@/libs/sources/web';
+import { icsOverriddenInstant, icsRecurrence } from '@/libs/sources/web';
 import { expandRecurrence } from '@/libs/time/recurrence';
 import { dayPlus, isoInZone, resolveTimeZone, startOfDay } from '@/libs/time/zone';
 import { keepIdentity, loadDocumentCards } from './identity';
@@ -108,11 +108,11 @@ async function learningStepsFor(orgId: string, config: CandidateExtractorConfig)
  * @param metadata - the entry's stored metadata.
  * @param metadata.feedUrl - the feed a split entry came from.
  * @param metadata.calendarZone - the zone the calendar declares.
- * @param metadata.overridden - the instances the feed writes as components of their own.
+ * @param metadata.overridden - the instances the feed writes as components of their own, as `splitIcs` stored them.
  * @param config - the processor config.
  * @param today - the run's day.
  */
-function repeatingEntryDates(content: string, metadata: { feedUrl?: string; calendarZone?: string; overridden?: string[] }, config: CandidateExtractorConfig, today: string): string[] | undefined {
+function repeatingEntryDates(content: string, metadata: { feedUrl?: string; calendarZone?: string; overridden?: unknown }, config: CandidateExtractorConfig, today: string): string[] | undefined {
   // A split calendar component, recognised by its text the way `splitFeed` in the web connector recognises the feed.
   if (typeof metadata.feedUrl !== 'string' || !/^BEGIN:VEVENT/i.test(content)) {
     return undefined;
@@ -124,7 +124,8 @@ function repeatingEntryDates(content: string, metadata: { feedUrl?: string; cale
   }
   const from = startOfDay(today, zone);
   const to = new Date(startOfDay(dayPlus(today, config.recurrenceHorizonDays + 1), zone).getTime() - 1);
-  const replaced = new Set((metadata.overridden ?? []).map(v => icsUtcInstant(v)?.getTime()).filter((t): t is number => t !== undefined));
+  const stored = Array.isArray(metadata.overridden) ? metadata.overridden.filter((v): v is string => typeof v === 'string') : [];
+  const replaced = new Set(stored.map(v => icsOverriddenInstant(v, rec)?.getTime()).filter((t): t is number => t !== undefined));
   const dates = expandRecurrence({ ...rec, from, to }).filter(d => !replaced.has(d.getTime()));
   if (dates.length === 0) {
     return undefined;
@@ -152,7 +153,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     feedUrl?: string;
     endsOn?: string;
     calendarZone?: string;
-    overridden?: string[];
+    overridden?: unknown;
   };
 
   // A one-off entry that ended two days ago or more can only yield past

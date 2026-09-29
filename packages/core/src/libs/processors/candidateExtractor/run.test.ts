@@ -7,7 +7,7 @@
  * its place only where the capture itself is the thing under test.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isoInZone } from '@/libs/time/zone';
+import { instantInZone, isoInZone } from '@/libs/time/zone';
 import { createSyncBudget } from '../budget';
 
 const invoke = vi.fn();
@@ -534,6 +534,35 @@ describe('candidate extractor, one document end to end', () => {
       expect(block()).toContain(at23(0));
       expect(block()).not.toContain(at23(7));
       expect(block()).toContain(at23(14));
+    });
+
+    it('leaves out an instance overridden in the local form a zoned series writes', async () => {
+      invoke.mockResolvedValue(answer());
+      const at19 = (offset: number) => isoInZone(instantInZone(`${day(offset)}T19:00:00`, 'America/New_York'), 'America/New_York');
+
+      await run(context({ document: entry([`DTSTART;TZID=America/New_York:${compact(day(-7))}T190000`, 'RRULE:FREQ=WEEKLY'], { overridden: [`${compact(day(7))}T190000`] }) }));
+
+      expect(block()).toContain(at19(0));
+      expect(block()).not.toContain(at19(7));
+      expect(block()).toContain(at19(14));
+    });
+
+    it('leaves out an instance overridden as a date on an all-day series', async () => {
+      invoke.mockResolvedValue(answer());
+
+      await run(context({ document: entry([`DTSTART;VALUE=DATE:${compact(day(-7))}`, 'RRULE:FREQ=WEEKLY'], { overridden: [compact(day(7))] }) }));
+
+      expect(block()).toContain(day(0));
+      expect(block()).not.toContain(day(7));
+      expect(block()).toContain(day(14));
+    });
+
+    it('reads the dates when the stored overrides are not a list', async () => {
+      invoke.mockResolvedValue(answer());
+
+      await expect(run(context({ document: entry(weeklyAt23, { overridden: `${compact(day(7))}T230000Z` }) }))).resolves.toBeDefined();
+
+      expect(block()).toContain(at23(7));
     });
 
     it('writes an all-day entry\'s dates as calendar days', async () => {

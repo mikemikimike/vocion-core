@@ -69,6 +69,7 @@ describe('expandRecurrence', () => {
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=WEEKLY;BYDAY=TU;BYMONTH=6,7,8', exdates: [], rdates: [], ...window })).toEqual([]);
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR', exdates: [], rdates: [], ...window })).toEqual([]);
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=WEEKLY;UNTIL=20261340', exdates: [], rdates: [], ...window })).toEqual([]);
+    expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=WEEKLY;BYDAY=TU,SU;WKST=XX', exdates: [], rdates: [], ...window })).toEqual([]);
   });
 
   it('reads INTERVAL and COUNT only as whole numbers, and an UNTIL only as a real date', () => {

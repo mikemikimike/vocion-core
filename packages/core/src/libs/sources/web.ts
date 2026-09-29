@@ -984,7 +984,7 @@ function calendarTimeZone(raw: string): string | undefined {
  * A UTC date-time as a Date.
  * @param value - `YYYYMMDDTHHMMSSZ`.
  */
-export function icsUtcInstant(value: string): Date | undefined {
+function icsUtcInstant(value: string): Date | undefined {
   const m = ICS_UTC_TIME_RE.exec(value);
   return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))) : undefined;
 }
@@ -1086,18 +1086,19 @@ function icsEndsOn(block: string[], zone?: string): string | undefined {
 
 /**
  * A repeating component's rule and anchor, for a caller that expands it.
- * Undefined when the component has no RRULE of its own, or when its start or
- * any EXDATE or RDATE line cannot be read, or is a date where the start is a
- * time (or the reverse): a cancelled date the reader skipped would otherwise
- * stay in the list as if it were certain.
+ * Undefined when the component has no RRULE of its own, more than one, or an
+ * EXRULE, or when its start or any EXDATE or RDATE line cannot be read, or is
+ * a date where the start is a time (or the reverse): a cancelled date the
+ * reader skipped would otherwise stay in the list as if it were certain.
  * @param lines - the component's lines, as written or as the model reads them.
  * @param fallbackZone - the zone an all-day or floating start runs in.
  */
 export function icsRecurrence(lines: string[], fallbackZone = 'UTC'): { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; allDay: boolean } | undefined {
-  const rule = icsOwnValue(lines, 'RRULE');
-  if (!rule) {
+  const rules = icsProperties(lines, 'RRULE').filter(p => p.own);
+  if (rules.length !== 1 || icsProperties(lines, 'EXRULE').some(p => p.own)) {
     return undefined;
   }
+  const rule = rules[0]!.value;
   const unfolded = unfoldIcs(lines);
   const startLine = unfolded.find(line => /^DTSTART[;:]/i.test(line));
   const read = startLine ? icsInstants(startLine, fallbackZone) : undefined;
@@ -1147,22 +1148,49 @@ function icsInstants(line: string, fallbackZone: string): { instants: Date[]; an
   const instants: Date[] = [];
   const kinds = new Set<'date' | 'local' | 'utc'>();
   for (const value of line.slice(colon + 1).split(',')) {
-    const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/i.exec(value);
-    if (!m) {
+    const read = icsValueInstant(value, zone ?? fallbackZone);
+    if (!read) {
       return undefined;
     }
-    const kind = m[4] === undefined ? 'date' : m[7] ? 'utc' : 'local';
-    kinds.add(kind);
-    const at = instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4] ?? '12'}:${m[5] ?? '00'}:${m[6] ?? '00'}`, kind === 'utc' ? 'UTC' : (zone ?? fallbackZone));
-    if (Number.isNaN(at.getTime())) {
-      return undefined;
-    }
-    instants.push(at);
+    kinds.add(read.kind);
+    instants.push(read.at);
   }
   if (kinds.has('date') && kinds.size > 1) {
     return undefined;
   }
   return { instants, anchorZone: kinds.size === 1 && kinds.has('utc') ? 'UTC' : (zone ?? fallbackZone), allDay: kinds.has('date') };
+}
+
+/**
+ * One date or date-time value as an instant: `Z` is UTC, a local time is on
+ * the zone's clock, and a bare date is noon there. Undefined for any other
+ * form, or a date or time that does not exist.
+ * @param value - `YYYYMMDD`, `YYYYMMDDTHHMMSS` or `YYYYMMDDTHHMMSSZ`.
+ * @param zone - the clock a date or a local time runs on.
+ */
+function icsValueInstant(value: string, zone: string): { at: Date; kind: 'date' | 'local' | 'utc' } | undefined {
+  const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/i.exec(value);
+  if (!m) {
+    return undefined;
+  }
+  const kind = m[4] === undefined ? 'date' : m[7] ? 'utc' : 'local';
+  const at = instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4] ?? '12'}:${m[5] ?? '00'}:${m[6] ?? '00'}`, kind === 'utc' ? 'UTC' : zone);
+  return Number.isNaN(at.getTime()) ? undefined : { at, kind };
+}
+
+/**
+ * The instant a stored `overridden` value names, read the way `icsRecurrence`
+ * reads the series: RFC 5545 writes a RECURRENCE-ID in its start's own form, so
+ * a local time runs on the series' clock and a date is noon there. Undefined
+ * for a date on a timed series, a time on an all-day one, or any other form.
+ * @param value - one value `splitIcs` stored, as the feed wrote it.
+ * @param series - the series as `icsRecurrence` read it.
+ * @param series.anchorZone - the clock the series runs on.
+ * @param series.allDay - whether the series is all-day.
+ */
+export function icsOverriddenInstant(value: string, series: { anchorZone: string; allDay: boolean }): Date | undefined {
+  const read = icsValueInstant(value, series.anchorZone);
+  return read && (read.kind === 'date') === series.allDay ? read.at : undefined;
 }
 
 /**

@@ -62,10 +62,10 @@ export function expandRecurrence(input: { start: Date; anchorZone: string; rule:
   const end = r.has('UNTIL') ? until(r.get('UNTIL')!, input.anchorZone) : undefined;
   const byDay = (r.get('BYDAY') ?? '').split(',').filter(Boolean);
   const known = WEEKDAYS as readonly string[];
-  if (interval < 1 || interval > SAFETY_CAP || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d))) {
+  if (interval < 1 || interval > SAFETY_CAP || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d)) || !known.includes(r.get('WKST') ?? 'MO')) {
     return [];
   }
-  const wkst = Math.max(0, known.indexOf(r.get('WKST') ?? 'MO'));
+  const wkst = known.indexOf(r.get('WKST') ?? 'MO');
   const local = isoInZone(input.start, input.anchorZone);
   const startDay = local.slice(0, 10);
   const clock = local.slice(11, 19);

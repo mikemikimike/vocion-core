@@ -23,7 +23,7 @@ import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { isoInZone } from '@/libs/time/zone';
-import { icsRecurrence, webConnector } from './web';
+import { icsOverriddenInstant, icsRecurrence, webConnector } from './web';
 
 type Progress = { kind: string; uri?: string; message?: string };
 
@@ -1817,5 +1817,23 @@ END:VCALENDAR`;
     expect(weekly('EXDATE:20261111T230000Z,20261118')).toBeUndefined();
     expect(weekly('EXDATE;VALUE=DATE:20261111')).toBeUndefined();
     expect(weekly('RDATE;VALUE=PERIOD:20261112T230000Z/PT1H')).toBeUndefined();
+    expect(weekly('RRULE:FREQ=WEEKLY;BYDAY=SA')).toBeUndefined();
+    expect(weekly('EXRULE:FREQ=MONTHLY')).toBeUndefined();
+  });
+
+  it('reads a stored override on the series\' own clock, in the form the feed wrote it', async () => {
+    stubFetch(() => typed(TWO_EVENT_ICS, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const master = docs.find(d => d.externalId === `${ICS_URL}#evt-1@venue.test`)!;
+    const stored = master.metadata?.overridden as string[];
+    const series = icsRecurrence(master.content.split('\n'), 'America/New_York')!;
+
+    expect(stored).toEqual(['20261108T193000']);
+    expect(icsOverriddenInstant(stored[0]!, series)?.toISOString()).toBe('2026-11-09T00:30:00.000Z');
+    expect(icsOverriddenInstant('20261109T003000Z', series)?.toISOString()).toBe('2026-11-09T00:30:00.000Z');
+    expect(icsOverriddenInstant('20261108', series)).toBeUndefined();
+    expect(icsOverriddenInstant('20261108', { anchorZone: 'America/New_York', allDay: true })?.toISOString()).toBe('2026-11-08T17:00:00.000Z');
   });
 });
