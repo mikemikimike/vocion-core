@@ -599,7 +599,7 @@ const PROCESSOR_TIMEOUT_MS = 25_000;
  * The timeout in force for one document.
  *
  * The env override wins over everything, including a processor's own
- * declaration, so a test need not wait out a two-and-a-half-minute budget.
+ * declaration, so a test need not wait out a four-and-a-half-minute budget.
  * @param declared - The processor's own `documentTimeoutMs`, when it has one.
  */
 function processorTimeoutMs(declared?: number): number {

@@ -41,11 +41,6 @@
  * call site of ours to pass the option at. Hence a subclass: it fills the
  * option in on the way through when the caller left it out.
  *
- * A model with no row in `MINIMUM_CACHEABLE_TOKENS` is one this file does not
- * know how to cache, and it is called plainly: no option, no marks. Bedrock
- * rejects a `cachePoint` for a model without prompt caching before the model
- * runs, which is how DeepSeek on Bedrock (`deepseek.v3.2`) surfaced this.
- *
  * Note that this is a DIFFERENT mechanism from the one the raw adapters use.
  * `libs/llm/anthropic.ts` and `libs/llm/bedrock.ts` talk to the vendor SDKs
  * directly and mark their own system block, because they build the request
@@ -124,16 +119,6 @@ export function withCacheControl<T extends object>(options: T): T {
   return { ...options, cache_control: DEFAULT_CACHE_CONTROL };
 }
 
-/**
- * `withCacheControl` for a model this file knows how to cache, and the options
- * untouched for any other.
- * @param model - Model id as the provider spells it.
- * @param options - The call options the graph handed the model.
- */
-function cacheOptionsFor<T extends object>(model: string, options: T): T {
-  return minimumCacheableTokens(model) === null ? options : withCacheControl(options);
-}
-
 /** ChatAnthropic that caches the prompt prefix by default. */
 export class CachingChatAnthropic extends ChatAnthropic {
   override _generate(
@@ -141,7 +126,7 @@ export class CachingChatAnthropic extends ChatAnthropic {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): Promise<ChatResult> {
-    return super._generate(messages, cacheOptionsFor(this.model, options), runManager);
+    return super._generate(messages, withCacheControl(options), runManager);
   }
 
   override async* _streamResponseChunks(
@@ -149,7 +134,7 @@ export class CachingChatAnthropic extends ChatAnthropic {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatGenerationChunk> {
-    yield* super._streamResponseChunks(messages, cacheOptionsFor(this.model, options), runManager);
+    yield* super._streamResponseChunks(messages, withCacheControl(options), runManager);
   }
 
   override async* _streamChatModelEvents(
@@ -157,7 +142,7 @@ export class CachingChatAnthropic extends ChatAnthropic {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatModelStreamEvent> {
-    yield* super._streamChatModelEvents(messages, cacheOptionsFor(this.model, options), runManager);
+    yield* super._streamChatModelEvents(messages, withCacheControl(options), runManager);
   }
 }
 
@@ -168,7 +153,7 @@ export class CachingChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): Promise<ChatResult> {
-    return super._generate(messages, cacheOptionsFor(this.model, options), runManager);
+    return super._generate(messages, withCacheControl(options), runManager);
   }
 
   override async* _streamResponseChunks(
@@ -176,7 +161,7 @@ export class CachingChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatGenerationChunk> {
-    yield* super._streamResponseChunks(messages, cacheOptionsFor(this.model, options), runManager);
+    yield* super._streamResponseChunks(messages, withCacheControl(options), runManager);
   }
 
   override async* _streamChatModelEvents(
@@ -184,7 +169,7 @@ export class CachingChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatModelStreamEvent> {
-    yield* super._streamChatModelEvents(messages, cacheOptionsFor(this.model, options), runManager);
+    yield* super._streamChatModelEvents(messages, withCacheControl(options), runManager);
   }
 }
 
@@ -196,8 +181,8 @@ export class CachingChatBedrockConverse extends ChatBedrockConverse {
  * For a prompt whose head repeats and whose tail does not, that writes the
  * tail to the cache on every call and never reads it back. Marking the shared
  * head instead reads it back and leaves the tail at the plain input rate. Only
- * the caching classes get marks, and only for a model with a caching figure,
- * so `VOCION_PROMPT_CACHE=0` and `promptCache: false` still mean no caching.
+ * the caching classes get marks, so `VOCION_PROMPT_CACHE=0` and
+ * `promptCache: false` still mean no caching.
  * @param model - The model the messages are for.
  * @param system - The system prompt.
  * @param prefix - The opening of the human turn that every call repeats.
@@ -209,9 +194,6 @@ export function cachedThroughPrefix(
   prefix: string,
   rest: string,
 ): { messages: BaseMessage[]; callOptions: Record<string, unknown> } {
-  if ((model instanceof CachingChatBedrockConverse || model instanceof CachingChatAnthropic) && minimumCacheableTokens(model.model) === null) {
-    return { messages: [new SystemMessage(system), new HumanMessage(prefix + rest)], callOptions: { cache_control: undefined } };
-  }
   if (model instanceof CachingChatBedrockConverse) {
     return {
       messages: [

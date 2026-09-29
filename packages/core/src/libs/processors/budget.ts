@@ -88,14 +88,11 @@ export type SyncBudgetCaps = {
  * this ceiling changes nothing for an ordinary page and lets a long one
  * through whole.
  *
- * `modelTimeoutMs` is 120,000 because 60,000 cut off a 51-event calendar page on
- * Sonnet 4.6 on every attempt (Haiku 4.5 needed 45s for it), and 60,000 had
- * replaced 20,000, a number that came from
- * nowhere: the first dev shadow of this pipeline (2026-09-15) measured six
- * Bedrock calls averaging 18.2s and topping out at 19.8s, none of which
- * failed, and ALL of which were cut off by the 20s deadline. A cap set below
- * what a healthy call costs is not a cap, it is a guaranteed failure, and it
- * costs the retry and then the whole document.
+ * `modelTimeoutMs` is 120,000. A cap below what a healthy call costs is not a
+ * cap, it is a guaranteed failure that costs the retry and then the whole
+ * document: 20,000 cut off every call of the first dev shadow (2026-09-15,
+ * calls averaged 18.2s), and 60,000 cut off a page of 51 records on Sonnet
+ * 4.6 on every attempt (2026-09-29).
  */
 export const SYNC_BUDGET_DEFAULTS: SyncBudgetCaps = {
   maxPages: 300,

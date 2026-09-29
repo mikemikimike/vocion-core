@@ -174,9 +174,6 @@ describe('the sync budget', () => {
   });
 
   it('lets a source lower modelTimeoutMs but never raise it', () => {
-    // The deadline is a cap like any other: the 60s default is the ceiling,
-    // and it is 60s because 20s was below what a healthy call costs and so
-    // abandoned every real extraction mid-flight.
     expect(SYNC_BUDGET_DEFAULTS.modelTimeoutMs).toBe(120_000);
     expect(createSyncBudget({ limits: { modelTimeoutMs: 30_000 } }).caps.modelTimeoutMs).toBe(30_000);
     expect(createSyncBudget({ limits: { modelTimeoutMs: 600_000 } }).caps.modelTimeoutMs).toBe(120_000);

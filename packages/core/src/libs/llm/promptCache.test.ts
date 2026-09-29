@@ -195,14 +195,6 @@ describe('cachingChatAnthropic', () => {
 
     expect(seen.stop).toEqual(['DONE']);
   });
-
-  it.each(ENTRY_POINTS)('sends no cache instruction through %s for a model with no caching figure', async (method) => {
-    const model = new CachingChatAnthropic({ model: 'unlisted-model' });
-
-    const seen = await optionsSeenByVendor(model, method, { stop: ['DONE'] });
-
-    expect(seen).toEqual({ stop: ['DONE'] });
-  });
 });
 
 describe('cachingChatBedrockConverse', () => {
@@ -220,15 +212,6 @@ describe('cachingChatBedrockConverse', () => {
     const seen = await optionsSeenByVendor(model, '_streamChatModelEvents', { cache_control: undefined });
 
     expect(seen.cache_control).toBeUndefined();
-  });
-
-  it.each(ENTRY_POINTS)('sends no cache instruction through %s for a model with no caching figure', async (method) => {
-    // Bedrock rejects a cachePoint for DeepSeek before the model runs.
-    const model = new CachingChatBedrockConverse({ model: 'deepseek.v3.2', region: 'us-west-2' });
-
-    const seen = await optionsSeenByVendor(model, method, { stop: ['DONE'] });
-
-    expect(seen).toEqual({ stop: ['DONE'] });
   });
 });
 
@@ -252,7 +235,6 @@ describe('minimumCacheableTokens', () => {
   it('is null for a model with no published figure, rather than a guess', () => {
     expect(minimumCacheableTokens('gpt-6-astra')).toBeNull();
     expect(minimumCacheableTokens('amazon.titan-embed-text-v1')).toBeNull();
-    expect(minimumCacheableTokens('deepseek.v3.2')).toBeNull();
   });
 
   it('holds Haiku above Sonnet, which is the trap the classifier role falls into', () => {
@@ -305,52 +287,6 @@ describe('cachedThroughPrefix', () => {
     const { messages, callOptions } = cachedThroughPrefix(model, 'system prompt', 'shared head', ' this document');
 
     expect(messages[1]?.content).toBe('shared head this document');
-    expect(callOptions).toEqual({});
-  });
-
-  it('sends DeepSeek on Bedrock no cache point anywhere, and switches the call-level one off', async () => {
-    const model = new CachingChatBedrockConverse({ model: 'deepseek.v3.2', region: 'us-west-2' });
-    const send = vi.fn(async () => ({
-      output: { message: { role: 'assistant', content: [{ text: 'ok' }] } },
-      stopReason: 'end_turn',
-      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-      $metadata: {},
-    }));
-    (model as unknown as { client: { send: typeof send } }).client.send = send;
-
-    const { messages, callOptions } = cachedThroughPrefix(model, 'system prompt', 'shared head', ' this document');
-    await model.invoke(messages, callOptions);
-
-    const input = (send.mock.calls[0] as unknown as [{ input: unknown }])[0].input;
-
-    expect(messages[0]?.content).toBe('system prompt');
-    expect(messages[1]?.content).toBe('shared head this document');
-    expect(JSON.stringify(messages)).not.toMatch(/cachePoint|cache_control/);
-    expect('cache_control' in callOptions).toBe(true);
-    expect(callOptions.cache_control).toBeUndefined();
-    expect(JSON.stringify(input)).not.toContain('cachePoint');
-  });
-
-  it('gives an Anthropic model with no caching figure one plain human turn', () => {
-    const model = new CachingChatAnthropic({ model: 'unlisted-model', apiKey: 'test-key' });
-
-    const { messages, callOptions } = cachedThroughPrefix(model, 'system prompt', 'shared head', ' this document');
-
-    expect(messages[0]?.content).toBe('system prompt');
-    expect(messages[1]?.content).toBe('shared head this document');
-    expect(callOptions).toEqual({ cache_control: undefined });
-  });
-
-  it('still puts the cache point after the prefix for Haiku 4.5 on Bedrock', () => {
-    const model = new CachingChatBedrockConverse({ model: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', region: 'us-east-1' });
-
-    const { messages, callOptions } = cachedThroughPrefix(model, 'system prompt', 'shared head', 'this document');
-
-    expect(messages[1]?.content).toEqual([
-      { type: 'text', text: 'shared head' },
-      { cachePoint: { type: 'default' } },
-      { type: 'text', text: 'this document' },
-    ]);
     expect(callOptions).toEqual({});
   });
 });
