@@ -252,7 +252,7 @@ describe('candidate extractor model call', () => {
   it('gives the call the model deadline from the budget, which a source may lower', async () => {
     // The old 20s literal was below what a healthy Bedrock call costs (18.2s
     // average on the first dev shadow), so the deadline is a cap now: the
-    // default is 60s and this source asked for 20ms, which it gets.
+    // default is 120s and this source asked for 20ms, which it gets.
     invoke.mockImplementation(async (_messages: unknown, options: { signal: AbortSignal }) =>
       new Promise((_resolve, reject) => {
         options.signal.addEventListener('abort', () => {

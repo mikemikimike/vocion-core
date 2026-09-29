@@ -17,6 +17,7 @@ import process from 'node:process';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { ChatOpenAI } from '@langchain/openai';
+import { bedrockTakesCachePoint } from './bedrock';
 import { bedrockRegion, resolveBedrockCredentials } from './bedrockCredentials';
 import { thinkingBudgetFor } from './modelPrefs';
 import { resolveOrgProviderKey } from './orgKey';
@@ -371,7 +372,7 @@ export function buildChatModel(
   // Replay mode builds a model it never calls, so the choice is moot there.
   const caching = (opts.promptCache ?? true) && promptCacheAllowed();
   const Anthropic = caching ? CachingChatAnthropic : ChatAnthropic;
-  const Bedrock = caching ? CachingChatBedrockConverse : ChatBedrockConverse;
+  const Bedrock = caching && bedrockTakesCachePoint(model) ? CachingChatBedrockConverse : ChatBedrockConverse;
 
   switch (provider) {
     case 'anthropic': {

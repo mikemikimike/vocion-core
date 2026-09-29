@@ -590,7 +590,7 @@ async function announceSyncCompleted(orgId: string, payload: SourceSyncCompleted
  * The abandoned work is signalled to stop and its document is counted as a
  * processor failure; the sync carries on.
  *
- * The per-SYNC wall clock (`SYNC_BUDGET_DEFAULTS.maxWallClockMs`, 600s) is
+ * The per-SYNC wall clock (`SYNC_BUDGET_DEFAULTS.maxWallClockMs`) is
  * unchanged and still bounds the whole processor side of a run.
  */
 const PROCESSOR_TIMEOUT_MS = 25_000;
@@ -599,7 +599,7 @@ const PROCESSOR_TIMEOUT_MS = 25_000;
  * The timeout in force for one document.
  *
  * The env override wins over everything, including a processor's own
- * declaration, so a test need not wait out a two-and-a-half-minute budget.
+ * declaration, so a test need not wait out a processor's whole budget.
  * @param declared - The processor's own `documentTimeoutMs`, when it has one.
  */
 function processorTimeoutMs(declared?: number): number {

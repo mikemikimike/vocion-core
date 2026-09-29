@@ -24,7 +24,7 @@
  * How long a call may take is `budget.caps.modelTimeoutMs`, a cap like any
  * other: the default lives in `libs/processors/budget.ts` and a source may
  * only lower it. The outer per-document cap is the processor's own
- * `documentTimeoutMs`, 150s, not the generic 25s.
+ * `documentTimeoutMs`, not the generic 25s.
  */
 
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
