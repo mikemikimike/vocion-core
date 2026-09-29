@@ -88,7 +88,9 @@ export type SyncBudgetCaps = {
  * this ceiling changes nothing for an ordinary page and lets a long one
  * through whole.
  *
- * `modelTimeoutMs` is 60,000 because it was 20,000 and that number came from
+ * `modelTimeoutMs` is 120,000 because 60,000 cut off a 51-event calendar page on
+ * Sonnet 4.6 on every attempt (Haiku 4.5 needed 45s for it), and 60,000 had
+ * replaced 20,000, a number that came from
  * nowhere: the first dev shadow of this pipeline (2026-09-15) measured six
  * Bedrock calls averaging 18.2s and topping out at 19.8s, none of which
  * failed, and ALL of which were cut off by the 20s deadline. A cap set below
@@ -100,7 +102,7 @@ export const SYNC_BUDGET_DEFAULTS: SyncBudgetCaps = {
   maxDetailHops: 200,
   maxModelCalls: 600,
   maxInputTokensPerCall: 60_000,
-  modelTimeoutMs: 60_000,
+  modelTimeoutMs: 120_000,
   maxInputTokensPerSync: 5_000_000,
   maxProposalsPerSync: 600,
   maxWallClockMs: 1_800_000,

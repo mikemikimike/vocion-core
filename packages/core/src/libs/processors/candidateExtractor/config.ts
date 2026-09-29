@@ -28,13 +28,15 @@ import { z } from 'zod';
  * anything derived from the model stage: importing that would drag LangChain
  * into the Temporal worker, which is the whole reason this file exists.
  *
- * 150s is what the work actually costs when it goes well: two model attempts
- * at the 60s default (`SYNC_BUDGET_DEFAULTS.modelTimeoutMs`), the one ticket
+ * 270s is what the work actually costs when it goes well: two model attempts
+ * at the 120s default (`SYNC_BUDGET_DEFAULTS.modelTimeoutMs`), the one ticket
  * hop a record may ask for, and writing the proposals. The generic 25s cap it
  * replaces was below a single healthy model call, so every real extraction
- * was abandoned mid-flight.
+ * was abandoned mid-flight. The 60s call cap that preceded 120s cut off a
+ * 51-event calendar page on Sonnet 4.6 on every attempt (Haiku 4.5 finished
+ * it in 45s), so a page with many events could never be read by that model.
  */
-export const CANDIDATE_EXTRACTOR_DOCUMENT_TIMEOUT_MS = 150_000;
+export const CANDIDATE_EXTRACTOR_DOCUMENT_TIMEOUT_MS = 270_000;
 
 /**
  * A field name on the object type being extracted.
