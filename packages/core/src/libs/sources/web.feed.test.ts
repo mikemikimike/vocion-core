@@ -1813,6 +1813,7 @@ END:VCALENDAR`;
 
     expect(weekly('EXDATE:20261111T230000Z')?.exdates).toHaveLength(1);
     expect(weekly('EXDATE;TZID=Eastern Standard Time:20261111T180000')).toBeUndefined();
+    expect(weekly('EXDATE:20261111T230000Z,garbage')).toBeUndefined();
     expect(weekly('EXDATE:20261111T230000Z,20261118')).toBeUndefined();
     expect(weekly('EXDATE;VALUE=DATE:20261111')).toBeUndefined();
     expect(weekly('RDATE;VALUE=PERIOD:20261112T230000Z/PT1H')).toBeUndefined();

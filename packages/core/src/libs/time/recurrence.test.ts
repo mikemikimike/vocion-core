@@ -76,4 +76,29 @@ describe('expandRecurrence', () => {
       expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
     }
   });
+
+  it('returns nothing, and never throws, for a runaway interval or a start outside four-digit years', () => {
+    const expand = (rule: string, start = ny('2026-09-01T18:00:00'), anchorZone = NY) => () => expandRecurrence({ start, anchorZone, rule, exdates: [], rdates: [], ...window });
+
+    for (const rule of ['FREQ=WEEKLY;INTERVAL=500000', 'FREQ=WEEKLY;INTERVAL=1001', 'FREQ=DAILY;INTERVAL=3000000']) {
+      expect(expand(rule)).not.toThrow();
+      expect(expand(rule)()).toEqual([]);
+    }
+
+    expect(expand('FREQ=WEEKLY;INTERVAL=1001', ny('2026-10-06T18:00:00'))()).toEqual([]);
+    expect(expand('FREQ=WEEKLY;INTERVAL=1000')).not.toThrow();
+    expect(expand('FREQ=WEEKLY;INTERVAL=1000', ny('2026-10-06T18:00:00'))()).toHaveLength(1);
+
+    for (const rule of ['FREQ=WEEKLY', 'FREQ=DAILY']) {
+      expect(expand(rule, new Date('0999-01-05T15:00:00Z'), 'UTC')).not.toThrow();
+      expect(expand(rule, new Date('0999-01-05T15:00:00Z'), 'UTC')()).toEqual([]);
+    }
+  });
+
+  it('stops walking at the last day a four-digit year can name', () => {
+    const far = () => expandRecurrence({ start: new Date('9999-12-01T15:00:00Z'), anchorZone: 'UTC', rule: 'FREQ=WEEKLY;INTERVAL=1000', exdates: [], rdates: [], from: new Date('9999-12-15T00:00:00Z'), to: new Date('+020000-01-01T00:00:00Z') });
+
+    expect(far).not.toThrow();
+    expect(far()).toEqual([]);
+  });
 });

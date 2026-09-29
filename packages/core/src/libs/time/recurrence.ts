@@ -62,7 +62,7 @@ export function expandRecurrence(input: { start: Date; anchorZone: string; rule:
   const end = r.has('UNTIL') ? until(r.get('UNTIL')!, input.anchorZone) : undefined;
   const byDay = (r.get('BYDAY') ?? '').split(',').filter(Boolean);
   const known = WEEKDAYS as readonly string[];
-  if (interval < 1 || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d))) {
+  if (interval < 1 || interval > SAFETY_CAP || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d))) {
     return [];
   }
   const wkst = Math.max(0, known.indexOf(r.get('WKST') ?? 'MO'));
@@ -70,6 +70,10 @@ export function expandRecurrence(input: { start: Date; anchorZone: string; rule:
   const startDay = local.slice(0, 10);
   const clock = local.slice(11, 19);
   const at = (day: string) => instantInZone(`${day}T${clock}`, input.anchorZone);
+  // A start outside four-digit years does not read back on its own clock, and nothing after it can be walked.
+  if (Number.isNaN(at(startDay).getTime())) {
+    return [];
+  }
   const weekday = (day: string) => (new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7; // 0 = MO
   const fromStart = (wd: number) => (wd - wkst + 7) % 7;
   const step = freq === 'DAILY' ? interval : 7 * interval;
@@ -86,7 +90,8 @@ export function expandRecurrence(input: { start: Date; anchorZone: string; rule:
   const days: string[] = [];
   for (let k = first; days.length < SAFETY_CAP; k += 1) {
     const base = dayPlus(origin, k * step);
-    if (at(base) > input.to || (end && at(base) > end)) {
+    const when = at(base);
+    if (Number.isNaN(when.getTime()) || when > input.to || (end && when > end)) {
       break;
     }
     if (freq === 'DAILY') {
