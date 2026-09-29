@@ -17,6 +17,7 @@ import process from 'node:process';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { ChatOpenAI } from '@langchain/openai';
+import { bedrockTakesCachePoint } from './bedrock';
 import { bedrockRegion, resolveBedrockCredentials } from './bedrockCredentials';
 import { thinkingBudgetFor } from './modelPrefs';
 import { resolveOrgProviderKey } from './orgKey';
@@ -231,16 +232,6 @@ function resolveModel(role: ModelRole, provider: LangChainProvider): string {
  * The model id `buildChatModel(role)` would construct — for audit stamps (e.g. `classifier_version`).
  * @param role
  */
-/**
- * Whether Bedrock takes a prompt-cache mark for this model. Anthropic and
- * Amazon models do; a model from any other vendor is refused before it runs,
- * so it is called plainly. An ARN names no vendor and keeps the marks.
- * @param model - The model or inference profile id, as Bedrock spells it.
- */
-function bedrockAcceptsCacheMarks(model: string): boolean {
-  return model.startsWith('arn:') || /^(?:[a-z-]+\.)?(?:anthropic|amazon)\./.test(model);
-}
-
 export function resolvedModelId(role: ModelRole): string {
   return resolveModel(role, resolveProvider(role));
 }
@@ -381,7 +372,7 @@ export function buildChatModel(
   // Replay mode builds a model it never calls, so the choice is moot there.
   const caching = (opts.promptCache ?? true) && promptCacheAllowed();
   const Anthropic = caching ? CachingChatAnthropic : ChatAnthropic;
-  const Bedrock = caching && bedrockAcceptsCacheMarks(model) ? CachingChatBedrockConverse : ChatBedrockConverse;
+  const Bedrock = caching && bedrockTakesCachePoint(model) ? CachingChatBedrockConverse : ChatBedrockConverse;
 
   switch (provider) {
     case 'anthropic': {

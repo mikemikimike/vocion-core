@@ -28,11 +28,11 @@ import { z } from 'zod';
  * anything derived from the model stage: importing that would drag LangChain
  * into the Temporal worker, which is the whole reason this file exists.
  *
- * 270s leaves the model stage its whole 120s deadline
+ * It leaves the model stage its whole deadline
  * (`SYNC_BUDGET_DEFAULTS.modelTimeoutMs`, shared by both attempts), plus the
- * page fetch, the known-cards read and writing the proposals. The generic 25s
- * cap it replaces was below a single healthy model call, so every real
- * extraction was abandoned mid-flight.
+ * known-cards read and writing the proposals. The generic 25s cap it replaces
+ * was below a single healthy model call, so every real extraction was
+ * abandoned mid-flight.
  */
 export const CANDIDATE_EXTRACTOR_DOCUMENT_TIMEOUT_MS = 270_000;
 

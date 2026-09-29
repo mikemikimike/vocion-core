@@ -119,6 +119,18 @@ export function bedrockModelId(model: string, region: string): string {
   return `${geo}.anthropic.${versioned}`;
 }
 
+/**
+ * Whether Bedrock accepts a `cachePoint` for this model. Mirror of core's
+ * `bedrockTakesCachePoint` (libs/llm/bedrock.ts), kept in step by
+ * `promptCache.parity.test.ts`: another vendor's model refuses a request that
+ * carries one.
+ * @param model - The model id, inference profile id or ARN, as Bedrock spells it.
+ */
+export function bedrockTakesCachePoint(model: string): boolean {
+  const id = model.slice(model.lastIndexOf('/') + 1);
+  return !id.includes('.') || /^(?:[a-z0-9-]+\.)?(?:anthropic|amazon)\./i.test(id);
+}
+
 export async function buildChatModel(opts: {
   model?: string;
   temperature?: number;
@@ -155,11 +167,11 @@ export async function buildChatModel(opts: {
 
   const { ChatBedrockConverse } = await import('@langchain/aws');
   const { CachingChatBedrockConverse } = await import('./promptCache.js');
-  const Bedrock = caching ? CachingChatBedrockConverse : ChatBedrockConverse;
+  const model = resolvedModelId(opts.model);
+  const Bedrock = caching && bedrockTakesCachePoint(model) ? CachingChatBedrockConverse : ChatBedrockConverse;
   const credentials = opts.readAwsSession
     ? bedrockCredentialProvider(opts.readAwsSession)
     : undefined;
-  const model = resolvedModelId(opts.model);
   const { preserveReasoningSignatures } = await import('./reasoningSignatures.js');
   // A model that thinks before a tool call needs its thinking signature back
   // on the next request, and the library's event-stream path drops it — see

@@ -34,7 +34,7 @@ const registry = new Map<string, RegisteredProcessor>([
     name: 'Candidate extractor',
     description: 'Reads each changed document and proposes review candidates of a configured object type.',
     configSchema: candidateExtractorConfigSchema,
-    // Two model attempts, a ticket hop and the proposals, see the constant.
+    // The model deadline plus the reads and writes around it, see the constant.
     documentTimeoutMs: CANDIDATE_EXTRACTOR_DOCUMENT_TIMEOUT_MS,
     load: () => import('./candidateExtractor/run'),
   }],

@@ -197,6 +197,13 @@ describe('buildChatModel and prompt caching', () => {
     expect(model).toBeInstanceOf(CachingChatAnthropic);
   });
 
+  it('builds the plain class for a model from a vendor Bedrock cannot cache', async () => {
+    const model = await buildChatModel({ readAwsSession: () => SESSION_A, model: 'deepseek.v3.2' });
+
+    expect(model).not.toBeInstanceOf(CachingChatBedrockConverse);
+    expect((model as unknown as { model: string }).model).toBe('deepseek.v3.2');
+  });
+
   it('builds the plain class when the caller opts out', async () => {
     const model = await buildChatModel({ readAwsSession: () => SESSION_A, promptCache: false });
 

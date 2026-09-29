@@ -88,11 +88,8 @@ export type SyncBudgetCaps = {
  * this ceiling changes nothing for an ordinary page and lets a long one
  * through whole.
  *
- * `modelTimeoutMs` is 120,000. A cap below what a healthy call costs is not a
- * cap, it is a guaranteed failure that costs the retry and then the whole
- * document: 20,000 cut off every call of the first dev shadow (2026-09-15,
- * calls averaged 18.2s), and 60,000 cut off a page of 51 records on Sonnet
- * 4.6 on every attempt (2026-09-29).
+ * `modelTimeoutMs`: a cap below what a healthy call costs is not a cap, it is
+ * a guaranteed failure that costs the retry and then the whole document.
  */
 export const SYNC_BUDGET_DEFAULTS: SyncBudgetCaps = {
   maxPages: 300,
