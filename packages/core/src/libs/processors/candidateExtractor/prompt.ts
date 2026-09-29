@@ -200,6 +200,14 @@ function referencedObjectsPolicy(config: CandidateExtractorConfig): string | nul
 }
 
 /**
+ * The weekday a calendar day falls on, in English.
+ * @param day - A calendar day, as `YYYY-MM-DD`.
+ */
+function weekdayOf(day: string): string {
+  return new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+}
+
+/**
  * The operator's own policy, as the system message states it.
  *
  * Both halves are operator-authored, and both are labelled as policy rather
@@ -208,17 +216,17 @@ function referencedObjectsPolicy(config: CandidateExtractorConfig): string | nul
  * system rule.
  * @param config - The source's processor config.
  * @param rules - Rendered learning rules, already capped.
- * @param today - The calendar day the run treats as today.
+ * @param today - Today as a calendar day in the config's timezone.
  */
 function operatorPolicy(config: CandidateExtractorConfig, rules: string, today?: string): string[] {
   const sections: string[] = [];
 
   sections.push([
     '## The record type (operator policy)',
-    `Field names to use: the operator's own. The record's identity is ${config.dedupOn.join(', ')}, always fill those.`,
+    `Field names to use: the operator's own. The record's identity is ${config.dedupOn.join(', ')}, always fill those the document prints.`,
     `The record's title goes in "${config.titleFrom}".`,
     `Return at most ${config.maxRecordsPerDocument} records from one document.`,
-    today ? `Today is ${today}.` : '',
+    today ? `Today is ${today}, a ${weekdayOf(today)}.` : '',
     `Expand a repeating record to one record per occurrence up to ${config.recurrenceHorizonDays} days from today, and no further.`,
     config.timezone ? `Dates are local to ${config.timezone} unless the document says otherwise.` : '',
     config.allowedValues && Object.keys(config.allowedValues).length > 0
@@ -272,7 +280,7 @@ function operatorPolicy(config: CandidateExtractorConfig, rules: string, today?:
  * @param opts.uri - The document's own URL, stated on the page block.
  * @param opts.ogImage - The image the document published for itself, if any.
  * @param opts.maxInputTokens - The per-call budget; blocks are trimmed to fit.
- * @param opts.today - The calendar day the run treats as today, in the run's zone.
+ * @param opts.today - Today as a calendar day in the config's timezone.
  */
 export function buildExtractionPrompt(opts: {
   config: CandidateExtractorConfig;

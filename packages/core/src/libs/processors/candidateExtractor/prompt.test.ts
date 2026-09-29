@@ -152,6 +152,7 @@ describe('the fields contract', () => {
 
     expect(system).toContain('The identity fields are never omitted');
     expect(system).toContain('a "reject" or "snooze" is said beside them, never instead of them');
+    expect(system).toContain('The record\'s identity is title, startDate, venueName, always fill those the document prints.');
   });
 
   it('states today\'s date when the caller knows it', () => {
@@ -165,7 +166,7 @@ describe('the fields contract', () => {
       today: '2026-09-29',
     });
 
-    expect(built.system).toContain('Today is 2026-09-29.');
+    expect(built.system).toContain('Today is 2026-09-29, a Tuesday.');
     expect(build().system).not.toContain('Today is');
   });
 });

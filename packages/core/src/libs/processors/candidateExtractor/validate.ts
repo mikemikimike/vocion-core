@@ -349,8 +349,7 @@ export function validateRecords(opts: {
 
     const blankIdentity = config.dedupOn.filter(field => isBlank(record.fields[field]));
     if (blankIdentity.length > 0) {
-      // Judged on the raw answer: a default filled in above is not a value the model gave.
-      bump(config.dedupOn.every(field => isBlank(raw.fields[field])) ? 'skipped.no_fields' : 'skipped.incomplete');
+      bump(config.dedupOn.every(field => isBlank(raw.fields[field])) ? 'skipped.no_identity' : 'skipped.incomplete');
       continue;
     }
 
