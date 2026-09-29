@@ -680,6 +680,7 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     }
     seen.add(externalId);
     const published = icsPublishedUrls(block, page.url);
+    const entryUrl = icsPublishedValues(block, 'URL').find(isFetchableUrl);
     const endsOn = icsEndsOn(block, zone);
     const overridden = recurrenceId ? [] : [...(overrides.get(uid) ?? [])].sort().slice(-OVERRIDDEN_CAP);
     docs.push({
@@ -696,6 +697,7 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
         // Omitted when empty: an entry that publishes no URL must keep writing
         // the metadata it wrote before, or every sync reports a refresh.
         ...(published.length ? { publishedUrls: published } : {}),
+        ...(entryUrl ? { entryUrl } : {}),
         ...(endsOn ? { endsOn } : {}),
         ...(zone ? { calendarZone: zone } : {}),
         ...(overridden.length ? { overridden } : {}),
@@ -1591,6 +1593,7 @@ function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null
     }
     seen.add(externalId);
     const published = declaredUrls(item, page.url);
+    const entryUrl = declaredPageUrl(item, page.url);
     const declared = declaredTitle(item);
     docs.push({
       externalId,
@@ -1603,6 +1606,7 @@ function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null
         contentType: page.contentType,
         feedUrl: page.url,
         ...(published.length ? { publishedUrls: published } : {}),
+        ...(entryUrl ? { entryUrl } : {}),
       },
     });
   }
@@ -1641,6 +1645,9 @@ const ITEM_URL_FIELDS = [
   'assetUrl',
   'photo_url',
 ] as const;
+
+/** The keys of `ITEM_URL_FIELDS` that name the item's own page. */
+const ITEM_PAGE_FIELDS = ['url', 'link'] as const satisfies ReadonlyArray<typeof ITEM_URL_FIELDS[number]>;
 
 /**
  * A value with no `/`, `.` or `:` cannot be a link, whatever key it sits under.
@@ -1759,26 +1766,36 @@ function declaredUrls(item: unknown, baseUrl: string): string[] {
   if (!fields) {
     return [];
   }
-  const out: string[] = [];
-  for (const field of ITEM_URL_FIELDS) {
-    const value = fields[field];
-    if (typeof value !== 'string') {
-      continue;
-    }
-    // Resolved against the feed's own URL, which is where the entry was
-    // published. A base that will not parse leaves the value as written, and
-    // a path that stays a path then fails the fetchable test below.
-    if (UNLINKABLE_VALUE_RE.test(value.trim())) {
-      continue;
-    }
-    const url = absoluteUrl(value, baseUrl) ?? '';
-    if (isFetchableUrl(url)) {
-      out.push(url);
-    }
-  }
+  const out = ITEM_URL_FIELDS.map(field => declaredUrl(fields[field], baseUrl)).filter(url => url !== undefined);
   // A CMS export routinely repeats one link under two keys, so the dedupe is
   // what keeps the stored row honest rather than a formality.
   return dedupe(out).slice(0, PUBLISHED_URL_CAP);
+}
+
+/**
+ * The page the item names as its own, read the way `declaredUrls` reads it.
+ * @param item - one entry from the array.
+ * @param baseUrl - the feed's own URL, which a relative value resolves against.
+ */
+function declaredPageUrl(item: unknown, baseUrl: string): string | undefined {
+  const fields = entryFields(item);
+  return fields ? ITEM_PAGE_FIELDS.map(field => declaredUrl(fields[field], baseUrl)).find(url => url !== undefined) : undefined;
+}
+
+/**
+ * One top-level value of an item as a fetchable URL, or undefined.
+ * @param value - the value under one of `ITEM_URL_FIELDS`.
+ * @param baseUrl - the feed's own URL, which a relative value resolves against.
+ */
+function declaredUrl(value: unknown, baseUrl: string): string | undefined {
+  // Resolved against the feed's own URL, which is where the entry was
+  // published. A base that will not parse leaves the value as written, and
+  // a path that stays a path then fails the fetchable test below.
+  if (typeof value !== 'string' || UNLINKABLE_VALUE_RE.test(value.trim())) {
+    return undefined;
+  }
+  const url = absoluteUrl(value, baseUrl) ?? '';
+  return isFetchableUrl(url) ? url : undefined;
 }
 
 /* ------------------------------------------------------------------ */

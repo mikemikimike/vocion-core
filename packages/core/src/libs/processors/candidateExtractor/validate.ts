@@ -269,6 +269,7 @@ function documentUrls(
  * @param opts.baseUrl - The document's own address, so a URL the model hands
  * back as a path can be resolved before the gate compares it.
  * @param opts.ownUrl - The document's own URI, as stored; a link field that resolves to it is dropped.
+ * @param opts.entryUrl - `metadata.entryUrl`, the page a feed entry named as its own; a link field that resolves to it is dropped.
  * @param opts.knownIds - Run ids the prompt actually carried.
  * @param opts.today - Today as a calendar day in the config's timezone.
  * @param opts.rules - The adopted rules the prompt carried, by `step#id`.
@@ -283,6 +284,7 @@ export function validateRecords(opts: {
   ogImage?: string;
   baseUrl?: string;
   ownUrl?: string;
+  entryUrl?: string;
   knownIds: Set<number>;
   today: string;
   rules?: Array<{ id: string; text: string }>;
@@ -331,6 +333,7 @@ export function validateRecords(opts: {
   let quotedHaystack: string | null = null;
   const horizon = dayPlus(opts.today, config.recurrenceHorizonDays);
   const ownKey = pageKey(opts.ownUrl);
+  const entryKey = pageKey(opts.entryUrl);
   for (const raw of opts.records) {
     const { scores: rawScores, matchedRules: rawRules, ...rest } = raw;
     const record: ValidatedRecord = { ...rest, fields: { ...raw.fields }, issues: [] };
@@ -487,6 +490,11 @@ export function validateRecords(opts: {
       if (linkKey !== null && (linkKey === ownKey || linkKey === recordKey)) {
         delete record.fields[field];
         record.issues.push(`${field}: dropped, it is the page itself`);
+        continue;
+      }
+      if (linkKey !== null && linkKey === entryKey) {
+        delete record.fields[field];
+        record.issues.push(`${field}: dropped, it is the entry's own page`);
         continue;
       }
       record.fields[field] = declared;

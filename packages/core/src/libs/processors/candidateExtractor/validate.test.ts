@@ -600,6 +600,44 @@ describe('link fields', () => {
     expect(out.records[0]?.issues.join(' ')).toContain('ticketUrl: dropped, it is the page itself');
   });
 
+  describe('on a feed entry', () => {
+    const entryUrl = 'https://bellwaterhall.example/events/open-mic/';
+    const ownUrl = 'https://bellwaterhall.example/feed.ics#open-mic@bellwaterhall.example';
+
+    it('drops a link that is the entry\'s own page', () => {
+      const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: entryUrl } })], config, {
+        publishedUrls: [entryUrl],
+        ownUrl,
+        entryUrl,
+      });
+
+      expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+      expect(out.records[0]?.issues).toEqual(['ticketUrl: dropped, it is the entry\'s own page']);
+    });
+
+    it('keeps a different published link', () => {
+      const tickets = 'https://tickets.example/open-mic';
+      const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: tickets } })], config, {
+        publishedUrls: [entryUrl, tickets],
+        ownUrl,
+        entryUrl,
+      });
+
+      expect(out.records[0]?.fields.ticketUrl).toBe(tickets);
+      expect(out.records[0]?.issues).toEqual([]);
+    });
+
+    it('changes nothing when no entry page is named', () => {
+      const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: entryUrl } })], config, {
+        publishedUrls: [entryUrl],
+        ownUrl,
+      });
+
+      expect(out.records[0]?.fields.ticketUrl).toBe(entryUrl);
+      expect(out.records[0]?.issues).toEqual([]);
+    });
+  });
+
   it('leaves a field alone when the config names no link fields', () => {
     const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: 'https://evil.example/buy' } })]);
 
