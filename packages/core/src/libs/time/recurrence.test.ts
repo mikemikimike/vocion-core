@@ -70,4 +70,10 @@ describe('expandRecurrence', () => {
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR', exdates: [], rdates: [], ...window })).toEqual([]);
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=WEEKLY;UNTIL=20261340', exdates: [], rdates: [], ...window })).toEqual([]);
   });
+
+  it('reads INTERVAL and COUNT only as whole numbers, and an UNTIL only as a real date', () => {
+    for (const rule of ['FREQ=WEEKLY;INTERVAL=abc', 'FREQ=WEEKLY;INTERVAL=1.5', 'FREQ=WEEKLY;INTERVAL=0', 'FREQ=WEEKLY;COUNT=1.5', 'FREQ=WEEKLY;UNTIL=20261231T250000Z', 'FREQ=WEEKLY;UNTIL=20261131']) {
+      expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
+    }
+  });
 });

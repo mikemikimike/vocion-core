@@ -24,18 +24,20 @@ function parts(rule: string): Map<string, string> {
 
 /**
  * The `UNTIL` value as an instant: a UTC date-time, or a date read as the end
- * of that day on the anchor's clock.
+ * of that day on the anchor's clock. Undefined for any other form, or for a
+ * date or time that does not exist.
  * @param value - `YYYYMMDDTHHMMSSZ` or `YYYYMMDD`.
  * @param anchorZone - the rule's own zone.
  */
 function until(value: string, anchorZone: string): Date | undefined {
-  const dt = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(value);
-  if (dt) {
-    return new Date(Date.UTC(+dt[1]!, +dt[2]! - 1, +dt[3]!, +dt[4]!, +dt[5]!, +dt[6]!));
+  const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z)?$/.exec(value);
+  if (!m) {
+    return undefined;
   }
-  const d = /^(\d{4})(\d{2})(\d{2})$/.exec(value);
-  const at = d ? instantInZone(`${d[1]}-${d[2]}-${d[3]}T23:59:59`, anchorZone) : undefined;
-  return at && !Number.isNaN(at.getTime()) ? at : undefined;
+  const at = m[4] === undefined
+    ? instantInZone(`${m[1]}-${m[2]}-${m[3]}T23:59:59`, anchorZone)
+    : instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`, 'UTC');
+  return Number.isNaN(at.getTime()) ? undefined : at;
 }
 
 /**
@@ -52,12 +54,15 @@ function until(value: string, anchorZone: string): Date | undefined {
 export function expandRecurrence(input: { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; from: Date; to: Date }): Date[] {
   const r = parts(input.rule);
   const freq = r.get('FREQ');
-  const interval = Math.max(1, Number(r.get('INTERVAL') ?? '1') || 1);
-  const count = r.get('COUNT') ? Number(r.get('COUNT')) : undefined;
-  const end = r.get('UNTIL') ? until(r.get('UNTIL')!, input.anchorZone) : undefined;
+  if ((freq !== 'DAILY' && freq !== 'WEEKLY') || [...r.keys()].some(k => !READ_PARTS.has(k)) || ['INTERVAL', 'COUNT'].some(k => r.has(k) && !/^\d+$/.test(r.get(k)!))) {
+    return [];
+  }
+  const interval = Number(r.get('INTERVAL') ?? '1');
+  const count = r.has('COUNT') ? Number(r.get('COUNT')) : undefined;
+  const end = r.has('UNTIL') ? until(r.get('UNTIL')!, input.anchorZone) : undefined;
   const byDay = (r.get('BYDAY') ?? '').split(',').filter(Boolean);
   const known = WEEKDAYS as readonly string[];
-  if ((freq !== 'DAILY' && freq !== 'WEEKLY') || [...r.keys()].some(k => !READ_PARTS.has(k)) || (freq === 'DAILY' && byDay.length) || byDay.some(d => !known.includes(d)) || (r.get('UNTIL') && !end) || (count !== undefined && !(count > 0 && count <= SAFETY_CAP))) {
+  if (interval < 1 || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d))) {
     return [];
   }
   const wkst = Math.max(0, known.indexOf(r.get('WKST') ?? 'MO'));

@@ -605,6 +605,16 @@ function splitFeed(page: FetchedPage): IngestDoc[] | null {
 const ICS_EXPORT_STAMP = 'DTSTAMP';
 
 /**
+ * How many overridden instances a repeating entry's metadata keeps, the
+ * latest when a feed writes more, so one broken or hostile feed cannot write
+ * an arbitrarily large row and a long series keeps the ones still ahead. Only
+ * a value shaped like a date or a date-time counts, which bounds each one at
+ * sixteen characters.
+ */
+const OVERRIDDEN_CAP = 50;
+const ICS_INSTANCE_RE = /^\d{8}(?:T\d{6}Z?)?$/i;
+
+/**
  * Split an ICS body on `BEGIN:VEVENT` … `END:VEVENT`.
  *
  * A text split with no RRULE expansion. Every property read as a value is
@@ -645,12 +655,12 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     return null;
   }
 
-  const overrides = new Map<string, string[]>();
+  const overrides = new Map<string, Set<string>>();
   for (const block of blocks) {
     const rid = icsValue(block, 'RECURRENCE-ID');
-    if (rid) {
+    if (ICS_INSTANCE_RE.test(rid)) {
       const uid = icsValue(block, 'UID');
-      overrides.set(uid, [...(overrides.get(uid) ?? []), rid]);
+      overrides.set(uid, (overrides.get(uid) ?? new Set<string>()).add(rid));
     }
   }
 
@@ -671,6 +681,7 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     seen.add(externalId);
     const published = icsPublishedUrls(block, page.url);
     const endsOn = icsEndsOn(block, zone);
+    const overridden = recurrenceId ? [] : [...(overrides.get(uid) ?? [])].sort().slice(-OVERRIDDEN_CAP);
     docs.push({
       externalId,
       uri: externalId,
@@ -687,7 +698,7 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
         ...(published.length ? { publishedUrls: published } : {}),
         ...(endsOn ? { endsOn } : {}),
         ...(zone ? { calendarZone: zone } : {}),
-        ...(!recurrenceId && overrides.get(uid)?.length ? { overridden: overrides.get(uid) } : {}),
+        ...(overridden.length ? { overridden } : {}),
       },
     });
   }
@@ -1075,7 +1086,10 @@ function icsEndsOn(block: string[], zone?: string): string | undefined {
 
 /**
  * A repeating component's rule and anchor, for a caller that expands it.
- * Undefined when the component has no RRULE of its own.
+ * Undefined when the component has no RRULE of its own, or when its start or
+ * any EXDATE or RDATE line cannot be read, or is a date where the start is a
+ * time (or the reverse): a cancelled date the reader skipped would otherwise
+ * stay in the list as if it were certain.
  * @param lines - the component's lines, as written or as the model reads them.
  * @param fallbackZone - the zone an all-day or floating start runs in.
  */
@@ -1084,22 +1098,35 @@ export function icsRecurrence(lines: string[], fallbackZone = 'UTC'): { start: D
   if (!rule) {
     return undefined;
   }
-  const startLine = unfoldIcs(lines).find(line => /^DTSTART[;:]/i.test(line));
-  if (!startLine) {
-    return undefined;
-  }
-  const read = icsInstants(startLine, fallbackZone);
+  const unfolded = unfoldIcs(lines);
+  const startLine = unfolded.find(line => /^DTSTART[;:]/i.test(line));
+  const read = startLine ? icsInstants(startLine, fallbackZone) : undefined;
   if (!read || read.instants.length !== 1) {
     return undefined;
   }
-  const list = (name: string) => unfoldIcs(lines).filter(line => new RegExp(`^${name}[;:]`, 'i').test(line)).flatMap(line => icsInstants(line, fallbackZone)?.instants ?? []);
-  return { start: read.instants[0]!, anchorZone: read.anchorZone, rule, exdates: list('EXDATE'), rdates: list('RDATE'), allDay: read.allDay };
+  const exdates: Date[] = [];
+  const rdates: Date[] = [];
+  for (const line of unfolded) {
+    const name = /^(EXDATE|RDATE)[;:]/i.exec(line)?.[1]?.toUpperCase();
+    if (!name) {
+      continue;
+    }
+    const extra = icsInstants(line, fallbackZone);
+    if (!extra || extra.allDay !== read.allDay) {
+      return undefined;
+    }
+    (name === 'EXDATE' ? exdates : rdates).push(...extra.instants);
+  }
+  return { start: read.instants[0]!, anchorZone: read.anchorZone, rule, exdates, rdates, allDay: read.allDay };
 }
 
 /**
  * The instants one date or date-time property line names, with the clock they
- * run on: `Z` is UTC, `TZID=` is that zone, a bare date is midnight in the
- * fallback zone. Undefined for a period or a form the reader does not know.
+ * run on: `Z` is UTC, `TZID=` is that zone, a floating time is the fallback
+ * zone, and a bare date is noon there, so a zone whose clocks jump at
+ * midnight still names that day. Undefined for a period, a zone the runtime
+ * does not know, a list that mixes dates and date-times, a date or time that
+ * does not exist, or any other form.
  * @param line - one unfolded content line.
  * @param fallbackZone - the zone a date or a floating time runs in.
  */
@@ -1117,27 +1144,25 @@ function icsInstants(line: string, fallbackZone: string): { instants: Date[]; an
   if (tzid && !zone) {
     return undefined;
   }
-  const values = line.slice(colon + 1).split(',');
   const instants: Date[] = [];
-  let allDay = false;
-  for (const value of values) {
-    const utc = icsUtcInstant(value);
-    if (utc) {
-      instants.push(utc);
-      continue;
-    }
-    const local = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/.exec(value);
-    if (!local) {
+  const kinds = new Set<'date' | 'local' | 'utc'>();
+  for (const value of line.slice(colon + 1).split(',')) {
+    const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/i.exec(value);
+    if (!m) {
       return undefined;
     }
-    allDay = allDay || local[4] === undefined;
-    const at = instantInZone(`${local[1]}-${local[2]}-${local[3]}T${local[4] ?? '00'}:${local[5] ?? '00'}:${local[6] ?? '00'}`, zone ?? fallbackZone);
+    const kind = m[4] === undefined ? 'date' : m[7] ? 'utc' : 'local';
+    kinds.add(kind);
+    const at = instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4] ?? '12'}:${m[5] ?? '00'}:${m[6] ?? '00'}`, kind === 'utc' ? 'UTC' : (zone ?? fallbackZone));
     if (Number.isNaN(at.getTime())) {
       return undefined;
     }
     instants.push(at);
   }
-  return { instants, anchorZone: values.every(v => icsUtcInstant(v)) ? 'UTC' : (zone ?? fallbackZone), allDay };
+  if (kinds.has('date') && kinds.size > 1) {
+    return undefined;
+  }
+  return { instants, anchorZone: kinds.size === 1 && kinds.has('utc') ? 'UTC' : (zone ?? fallbackZone), allDay: kinds.has('date') };
 }
 
 /**

@@ -154,6 +154,16 @@ function capped(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[truncated]`;
 }
 
+/**
+ * A capped list of lines, cut after the last whole line that fits, so no
+ * line reaches the model half written.
+ * @param text - The block body, one entry per line.
+ * @param limit - Characters to keep.
+ */
+function cappedLines(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, Math.max(0, text.lastIndexOf('\n', limit)))}\n[truncated]`;
+}
+
 /** One block of the human turn, before any trimming. */
 type Block = {
   name: 'rules' | 'jsonld' | 'known' | 'occurrences' | 'page';
@@ -292,7 +302,7 @@ export function buildExtractionPrompt(opts: {
     { name: 'rules', text: capped(scrubMarkers(opts.rules), RULES_CHAR_CAP) },
     { name: 'jsonld', text: capped(scrubMarkers(opts.jsonLd), JSON_LD_CHAR_CAP) },
     { name: 'known', text: capped(scrubMarkers(opts.known), KNOWN_CHAR_CAP) },
-    { name: 'occurrences', text: capped(scrubMarkers((opts.occurrences ?? []).join('\n')), OCCURRENCES_CHAR_CAP) },
+    { name: 'occurrences', text: cappedLines(scrubMarkers((opts.occurrences ?? []).join('\n')), OCCURRENCES_CHAR_CAP) },
     { name: 'page', text: scrubMarkers(opts.pageText) },
   ];
 

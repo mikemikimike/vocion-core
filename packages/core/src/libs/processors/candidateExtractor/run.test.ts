@@ -501,22 +501,73 @@ describe('candidate extractor, one document end to end', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 
-  it('hands a repeating calendar entry its computed dates and reads one record per date', async () => {
-    const entry = {
+  describe('a repeating calendar entry', () => {
+    const feedUrl = 'https://bellwaterhall.example/feed.ics';
+    const compact = (d: string) => d.replaceAll('-', '');
+    const entry = (lines: string[], metadata: Record<string, unknown> = {}) => ({
       ...document,
-      externalId: 'https://bellwaterhall.example/feed.ics#weekly@bellwaterhall.example',
-      uri: 'https://bellwaterhall.example/feed.ics#weekly@bellwaterhall.example',
-      content: ['BEGIN:VEVENT', 'UID:weekly@bellwaterhall.example', 'SUMMARY:Open Mic Night', `DTSTART:${day(-7).replaceAll('-', '')}T230000Z`, 'RRULE:FREQ=WEEKLY', 'END:VEVENT'].join('\n'),
-      metadata: { contentType: 'text/calendar; charset=utf-8', feedUrl: 'https://bellwaterhall.example/feed.ics', calendarZone: 'America/New_York' },
-    };
-    invoke.mockResolvedValue(answer());
+      externalId: `${feedUrl}#weekly@bellwaterhall.example`,
+      uri: `${feedUrl}#weekly@bellwaterhall.example`,
+      content: ['BEGIN:VEVENT', 'UID:weekly@bellwaterhall.example', 'SUMMARY:Open Mic Night', ...lines, 'END:VEVENT'].join('\n'),
+      metadata: { contentType: 'text/calendar; charset=utf-8', feedUrl, calendarZone: 'America/New_York', ...metadata },
+    });
+    const weeklyAt23 = [`DTSTART:${compact(day(-7))}T230000Z`, 'RRULE:FREQ=WEEKLY'];
+    const at23 = (offset: number, zone = 'America/New_York') => isoInZone(new Date(`${day(offset)}T23:00:00Z`), zone);
+    const human = () => String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
+    const block = () => human().slice(human().indexOf('<occurrences>\n') + 14, human().indexOf('\n</occurrences>')).split('\n');
 
-    await run(context({ document: entry }) as never);
+    it('gets an occurrences block of its dates inside the horizon, none before today', async () => {
+      invoke.mockResolvedValue(answer());
 
-    const human = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
+      await run(context({ document: entry(weeklyAt23) }));
 
-    expect(human).toContain('<occurrences>');
-    expect(human).toContain(isoInZone(new Date(`${day(0)}T23:00:00Z`), 'America/New_York'));
-    expect(human).not.toContain(`${day(-7)}T`);
+      expect(human()).toContain('<occurrences>');
+      expect(human()).toContain(at23(0));
+      expect(human()).not.toContain(`${day(-7)}T`);
+    });
+
+    it('leaves out an instance the feed writes as a component of its own', async () => {
+      invoke.mockResolvedValue(answer());
+
+      await run(context({ document: entry(weeklyAt23, { overridden: [`${compact(day(7))}T230000Z`] }) }));
+
+      expect(block()).toContain(at23(0));
+      expect(block()).not.toContain(at23(7));
+      expect(block()).toContain(at23(14));
+    });
+
+    it('writes an all-day entry\'s dates as calendar days', async () => {
+      invoke.mockResolvedValue(answer());
+
+      await run(context({ document: entry([`DTSTART;VALUE=DATE:${compact(day(-7))}`, 'RRULE:FREQ=WEEKLY']) }));
+
+      expect(block()).toContain(day(0));
+      expect(block().every(line => /^\d{4}-\d{2}-\d{2}$/.test(line))).toBe(true);
+    });
+
+    it('falls back to the configured zone when the stored calendar zone is not one', async () => {
+      invoke.mockResolvedValue(answer());
+
+      await run(context({ document: entry(weeklyAt23, { calendarZone: 'Nowhere/Special' }) }));
+
+      expect(block()).toContain(at23(0, 'America/New_York'));
+    });
+
+    it('gets no block unless it is a split calendar component', async () => {
+      invoke.mockResolvedValue(answer());
+      const whole = entry(weeklyAt23);
+      whole.content = `BEGIN:VCALENDAR\n${whole.content}\nEND:VCALENDAR`;
+      const page = entry(weeklyAt23);
+      delete (page.metadata as { feedUrl?: string }).feedUrl;
+
+      await run(context({ document: whole }));
+      await run(context({ document: page }));
+
+      for (const call of invoke.mock.calls) {
+        expect(String((call[0] as Array<{ content: unknown }>)[1]?.content)).not.toContain('<occurrences>');
+      }
+
+      expect(invoke).toHaveBeenCalledTimes(2);
+    });
   });
 });
