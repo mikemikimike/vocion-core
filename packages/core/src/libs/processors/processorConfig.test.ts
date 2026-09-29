@@ -74,6 +74,7 @@ describe('candidate-extractor config', () => {
       onViolation: 'dropRecord',
       mustAppearInDocument: ['price'],
       quotedFields: ['price'],
+      linkFields: ['ticketUrl'],
       collapseWithinDocument: true,
       resolveAgainst: [{
         objectType: 'venue-candidate',

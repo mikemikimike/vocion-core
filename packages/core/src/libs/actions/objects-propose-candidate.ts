@@ -351,7 +351,7 @@ const PIPELINE_REF_PREFIX = 'knowledge_document:';
  * trailing slash. Null for anything that is not a URL.
  * @param url - A stored or proposed URL.
  */
-function pageKey(url: unknown): string | null {
+export function pageKey(url: unknown): string | null {
   if (typeof url !== 'string' || url.trim() === '') {
     return null;
   }

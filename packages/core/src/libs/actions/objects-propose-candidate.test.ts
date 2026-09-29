@@ -16,7 +16,7 @@ vi.mock('@/libs/DB');
 
 const { db } = await import('@/libs/DB');
 const { actionRunSchema, businessObjectSchema, businessObjectTypeSchema, trustRuleSchema } = await import('@/models/Schema');
-const { forgetCachedObjectTypes, objectProposeCandidateAction } = await import('./objects-propose-candidate');
+const { forgetCachedObjectTypes, objectProposeCandidateAction, pageKey } = await import('./objects-propose-candidate');
 const { listActions } = await import('./registry');
 const { proposeAction, executeAction, rejectAction } = await import('@/services/ActionService');
 const { and, eq } = await import('drizzle-orm');
@@ -1021,5 +1021,19 @@ describe('an internal record files itself (Chris, 2026-09-28: "it should probabl
     const [event] = await db.select().from(eventLogSchema).where(and(eq(eventLogSchema.orgId, ORG), eq(eventLogSchema.dedupeKey, `object.created:${objectId}`)));
 
     expect(event?.payload).toMatchObject({ objectType: 'request', source: 'proposal', conversationId: 12, actor: 'user_1', byPerson: true });
+  });
+});
+
+describe('pageKey', () => {
+  it('reads two spellings of one page as the same key', () => {
+    expect(pageKey('https://bellwaterhall.example/events/open-mic/')).toBe('https://bellwaterhall.example/events/open-mic');
+    expect(pageKey('https://bellwaterhall.example/events/open-mic#tickets')).toBe('https://bellwaterhall.example/events/open-mic');
+    expect(pageKey('https://bellwaterhall.example/events/open-mic?x=1')).toBe('https://bellwaterhall.example/events/open-mic?x=1');
+  });
+
+  it('is null for anything that is not a URL', () => {
+    expect(pageKey('/events/open-mic')).toBeNull();
+    expect(pageKey('')).toBeNull();
+    expect(pageKey(42)).toBeNull();
   });
 });
