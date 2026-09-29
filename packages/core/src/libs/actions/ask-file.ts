@@ -238,7 +238,7 @@ export const askFileAction: Action<typeof askFileInput> = {
   },
   async execute(ctx: ActionContext, input) {
     const { askUrlFor, normaliseOptions, upsertAsk } = await import('@/services/AskService');
-    const { projectSlugById } = await import('@/services/ProjectService');
+    const { workspaceAddressById } = await import('@/services/ProjectService');
     const agentSlug = agentSlugFromInvoker(ctx.invokedBy) ?? input.agentSlug ?? null;
     // The run that asked is the idempotency key, so a retried execution
     // updates the ask it already filed instead of asking twice.
@@ -289,13 +289,13 @@ export const askFileAction: Action<typeof askFileInput> = {
       }
     }
     const answeredLabel = answered ? ask.options.find(o => o.id === answered)?.label ?? answered : null;
-    const slug = await projectSlugById(ctx.orgId);
+    const workspace = await workspaceAddressById(ctx.orgId);
     return {
       answered,
       answeredLabel,
       answeredBy,
       askId: ask.id,
-      url: slug ? askUrlFor(slug, ask.id) : null,
+      url: workspace ? askUrlFor(workspace, ask.id) : null,
       created,
       kind: ask.kind,
       status: ask.status,

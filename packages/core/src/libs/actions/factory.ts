@@ -104,7 +104,10 @@ const gitMergeHandoff = manualAction({
   },
 });
 
-/** The pull request a merge card is about: its externalRef, else its first step's link. */
+/**
+ * The pull request a merge card is about: its externalRef, else its first step's link.
+ * @param input
+ */
 function pullUrlOf(input: Record<string, unknown>): string | null {
   const ref = input.externalRef as { url?: unknown } | undefined;
   if (typeof ref?.url === 'string') {
