@@ -21,27 +21,20 @@ import { clockLine, DEFAULT_TIME_ZONE } from '@/libs/time/zone';
 import { versionLinksDelta } from '@/libs/versions/versionRef';
 import { agentSchema } from '@/models/Schema';
 import { flatHistory, historyMessages, withLiveCardState } from '@/services/chat/historyTools';
-import { preambleOnly } from '@/services/chat/turnStatus';
 import { composeAnswerWithModel, evidenceBlock, runAnswerBackstop } from './agents/answerBackstop';
 import { AnswerStreamer } from './agents/answerStream';
 import { composeArtifactWithModel, runDeliverableBackstop } from './agents/deliverableBackstop';
 import { normalizeHarnessTarget } from './agents/harnessTarget';
-import { announcedAction, asksForAction, DECIDE_TOOLS, decidedInTurn, decideOwed, decisionNamed, describeOpenDecisions, mergeDecisions, openDecisionsOn, pendingCards, personWords } from './agents/owedDecision';
-import { answerNamesFiled, asksToChange, asksToFile, attemptedChange, changedInTurn, changeOwedRecord, fileOwedWrite, owedChangeTarget, owedWriteTool } from './agents/owedWriteBackstop';
+import { DECIDE_TOOLS, decidedInTurn, decideOwed, describeOpenDecisions, mergeDecisions, openDecisionsOn, pendingCards } from './agents/owedDecision';
+import { answerNamesFiled, attemptedChange, changedInTurn, changeOwedRecord, fileOwedWrite, owedChangeTarget, owedWriteTool } from './agents/owedWriteBackstop';
 import { labelStep } from './agents/stepLabeler';
 import { describeTurnFailure, stepLimitStreamConfig } from './agents/stepLimit';
 import { persistToolCall } from './agents/toolCallRecord';
 import { extractChunk, parseJsonArgs, toolErrorMessage, toolNodeId, toolOutputContent, toolResultStatus, TraceEmitter } from './agents/traceEmitter';
+import { judgeAnswer, NO_INTENT, NO_JUDGEMENT, readIntent, stepLines } from './agents/turnJudge';
 import { TurnRefusedError } from './agents/turnRefusal';
-import { cardClaim, unbackedWriteNotice, writeClaim, writeLanded, wroteInTurn } from './agents/writeClaim';
+import { writeLanded, wroteInTurn } from './agents/writeClaim';
 
-/**
- * A tool's name written as the turn's last word — narrated, not called — or a
- * whole call imitated as text at the end of the message: production turn 608
- * (2026-09-24) ended with "CARD" and a fenced block beginning
- * `recommend_action id: …`. Either way the person saw words where a card
- * should have been.
- */
 /**
  * A tool call the tool itself refused for its arguments — retryable, not fatal.
  * @param err
@@ -51,28 +44,11 @@ function isToolInputError(err: unknown): boolean {
   return /did not match expected schema|Received tool input|invalid arguments/i.test(m);
 }
 
-const TOOL_NAMES = 'recommend_action|propose_action|file_ask|update_object|withdraw_proposal|decide_proposal|decide_ask';
-/**
- * A call written out instead of made. Three shapes seen in production:
- *   1. a fenced block that STARTS with the tool's name, at the end of the answer;
- *   2. the bare tool name as the last word;
- *   3. a heading naming the tool — "**update_object — request 30**" — followed
- *      by a ```json block of its arguments (mission run 4905, 2026-09-25:
- *      three of them, nothing written; finding 19).
- */
-const NARRATED_TOOL = new RegExp(`(?:^|\\n)\\s*(?:(?:CARD|Card)\\s*)?\`\`\`[a-z]*\\s*(${TOOL_NAMES})\\b[\\s\\S]*?\`\`\`\\s*$|(?:^|[\\s*_\`])(${TOOL_NAMES})[*_\`]*\\s*$|(?:^|\\n)\\s*(?:\\*\\*|#{1,4}\\s*)?\`?(${TOOL_NAMES})\\b[^\\n]*\\n\\s*\`\`\`[a-z]*\\n[\\s\\S]*?\`\`\``);
-/**
- * A card written out as prose: a heading line beginning "CARD —" (or "Card:")
- * and everything under it to the end of the answer. Stripped only when a real
- * card is on screen, so a turn is never left with neither.
- */
-const NARRATED_CARD = /\n\s*(?:\*\*|#{1,4}\s*)?CARD\s*(?:[—–:-]|\*\*)[\s\S]*$/i;
 /** How long one turn may run before it is stopped: `VOCION_TURN_DEADLINE_MS`, default eight minutes. Read per turn so a test can shorten it. */
 function turnDeadlineMs(): number {
   const raw = Number(process.env.VOCION_TURN_DEADLINE_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 8 * 60 * 1000;
 }
-const NARRATED_TOOL_TAIL = new RegExp(`\\n\\s*(?:(?:CARD|Card)\\s*)?\`\`\`[a-z]*\\s*(?:${TOOL_NAMES})\\b[\\s\\S]*?\`\`\`\\s*$|[\\s*_\`]*(?:${TOOL_NAMES})[*_\`]*\\s*$|\\n\\s*(?:\\*\\*|#{1,4}\\s*)?\`?(?:${TOOL_NAMES})\\b[^\\n]*\\n\\s*\`\`\`[a-z]*\\n[\\s\\S]*$`);
 
 /* ------------------------------------------------------------------ */
 /* Load agent config                                                   */
@@ -210,8 +186,6 @@ export type FailedDelegation = { name: string; message: string };
 
 /** Words a model uses when it HAS owned up to a failure. */
 
-const ADMITS_FAILURE = /\b(?:fail(?:ed|ure)?|could ?n[o']t|was ?n[o']t able|unable|errored|error|did ?n[o']t (?:complete|finish|work)|broke)\b/i;
-
 /**
  * The sentence a person gets when a hand-off failed and the answer did not say
  * so.
@@ -227,15 +201,11 @@ const ADMITS_FAILURE = /\b(?:fail(?:ed|ure)?|could ?n[o']t|was ?n[o']t able|unab
  * @param failed - Delegations that did not complete.
  * @param answer - The answer text as it stands.
  */
-export function delegationFailureNotice(failed: ReadonlyArray<FailedDelegation>, answer: string): string | null {
+export function delegationFailureNotice(failed: ReadonlyArray<FailedDelegation>): string | null {
   if (failed.length === 0) {
     return null;
   }
-  const text = answer ?? '';
-  const named = failed.filter(f => !(text.toLowerCase().includes(f.name.toLowerCase()) && ADMITS_FAILURE.test(text)));
-  if (named.length === 0) {
-    return null;
-  }
+  const named = failed;
   const names = named.map(f => f.name);
   const who = names.length === 1
     ? names[0]!
@@ -268,6 +238,8 @@ export type TurnGuaranteeInput = {
   compose?: Parameters<typeof runDeliverableBackstop>[0]['compose'];
   /** The answer pass for a stalled turn; injected in tests. */
   answer?: AnswerComposer;
+  /** The reply's judge (`agents/turnJudge.ts`); injected in tests. */
+  judge?: typeof judgeAnswer;
   /** The conversation before this turn, so the answer pass reads what the turn could. */
   history?: ReadonlyArray<{ role: 'user' | 'assistant'; content: string }>;
   /** The graph's own messages for the turn, for the answer pass to continue from. */
@@ -350,18 +322,31 @@ export async function applyTurnGuarantees(input: TurnGuaranteeInput): Promise<st
     console.warn(`answer backstop failed for org ${input.orgId} agent ${input.agentSlug}: ${(err as Error).message}`);
   }
 
-  const notice = delegationFailureNotice(input.failedDelegations, text);
-  if (notice) {
-    append(notice);
-  }
-
-  // A WRITE CLAIMED WITH NO WRITE BEHIND IT is corrected here, after the
-  // answer pass, so a claim that pass made is checked too (finding 23,
-  // services/agents/writeClaim.ts).
-  const unbacked = unbackedWriteNotice(text, input.toolCalls, input.cardsShown);
-  if (unbacked) {
-    console.warn(`turn claimed a write with none behind it for org ${input.orgId} agent ${input.agentSlug}: "${writeClaim(text) ?? cardClaim(text)}"`);
-    append(unbacked);
+  // A WRITE CLAIMED WITH NO WRITE BEHIND IT (finding 23), after the answer
+  // pass so a claim it made is checked too. Whether the reply claims work the
+  // steps do not show is a model's reading, never a word match; the
+  // correction is the agent's own sentence, written by its model from the
+  // claim and the steps, not a line core appends (Chris, 2026-09-29).
+  try {
+    const failed = input.failedDelegations.map(f => `the hand-off to ${f.name} did not complete${f.message.trim() ? ` (${f.message.trim()})` : ''}`);
+    const judged = await (input.judge ?? judgeAnswer)({ orgId: input.orgId, message: input.request, reply: text, steps: stepLines(input.toolCalls), cards: input.cardsShown ?? 0, failed });
+    if (judged.claims_unrecorded_work || judged.hides_failure) {
+      console.warn(`turn reply needs a correction for org ${input.orgId} agent ${input.agentSlug}`, { claim: judged.claim, hidesFailure: judged.hides_failure });
+      const owed = [
+        judged.claims_unrecorded_work ? `your reply says "${judged.claim ?? 'that something was done'}", and the steps you took do not show it done` : '',
+        judged.hides_failure ? `a step failed and your reply does not say so: ${failed.join('; ')}` : '',
+      ].filter(Boolean).join('; and ');
+      const correction = (await (input.answer ?? composeAnswerWithModel)({
+        orgId: input.orgId,
+        system: `${input.systemPrompt ?? ''}\n\nThis turn, ${owed}. In one or two sentences, tell the person plainly what did not happen and what happens next. Do not repeat the rest of your reply.`.trim(),
+        human: `Steps you took:\n${stepLines(input.toolCalls).join('\n') || '(none)'}\n\nYour reply:\n${text.slice(-3_000)}`,
+      })).trim();
+      if (correction) {
+        append(correction);
+      }
+    }
+  } catch (err) {
+    console.warn(`claim check failed for org ${input.orgId} agent ${input.agentSlug}: ${(err as Error).message}`);
   }
 
   if (input.deliverable === 'artifact') {
@@ -927,8 +912,25 @@ export async function runAgentDeep(opts: {
   let thoughtOnlyRetried = false;
   // The late narrated-call re-entry runs at most once (see below).
   let narratedNudged = false;
-  // Set while the mid-sentence continuation streams (see below).
-  let continuationJoin: import('./agents/truncation').ContinuationJoin | null = null;
+  // The last reading of the reply (`agents/turnJudge.ts`), for the owed passes below.
+  let lastJudgement: import('./agents/turnJudge').AnswerJudgement = NO_JUDGEMENT;
+  // WHAT THE PERSON WANTS, read by a model at the start of the turn and in
+  // parallel with it — never by matching their words (`agents/turnJudge.ts`).
+  // The passes below route on it: a change to the page's record, a filing,
+  // a decision on something waiting, an act rather than an answer.
+  const intentP = !opts.missionRunId
+    ? readIntent({
+        orgId: opts.orgId,
+        message: opts.message,
+        page: opts.pageContext?.record?.label ?? null,
+        recordTypes: (boundCtx.filingTypes ?? []).map(t => t.slug),
+        previous: {
+          person: [...(opts.conversationHistory ?? [])].reverse().find(t => t.role === 'user')?.content,
+          agent: [...(opts.conversationHistory ?? [])].reverse().find(t => t.role === 'assistant')?.content,
+        },
+      })
+    : Promise.resolve(NO_INTENT);
+  boundCtx.turnIntent = intentP;
   // A RE-ENTRY CARRIES WHAT THE TOOLS RETURNED. `runGraph` starts a fresh
   // graph from text messages, so the previous pass's tool calls and results
   // were not in the new pass's context at all: mission run 5081 (2026-09-25,
@@ -1088,12 +1090,9 @@ export async function runAgentDeep(opts: {
                   emit(node);
                 }
               }
-              // A continuation that restarts inside what was already said
-              // is joined without the repeat (`ContinuationJoin`).
-              const released = continuationJoin ? continuationJoin.push(answer) : answer;
-              if (released) {
-                finalText += released;
-                emit({ type: 'response_delta', delta: released });
+              if (answer) {
+                finalText += answer;
+                emit({ type: 'response_delta', delta: answer });
               }
             }
           }
@@ -1188,55 +1187,49 @@ export async function runAgentDeep(opts: {
         emit({ type: 'response_delta', delta: held.answer });
       }
       const soFar = normalizeAnswerHtml(finalText).trim();
-      // The other way a turn ends without doing what it said: the model
-      // writes a tool's NAME as its last word instead of calling it —
-      // production turn 595 (2026-09-24) ended "…the card is below.
-      // recommend_action" and no card existed. That word is not an answer
-      // either; it is stripped, and the loop re-enters once to make the call.
-      const narrated = NARRATED_TOOL.exec(soFar);
-      // The seventh shape: NOTHING — no words, no tool call, no error
-      // (reference run 4, cases 1, 8 and 13: an empty completion the loop
-      // accepted). An empty turn is not an answer either.
+      // HOW THE PASS ENDED IS READ BY A MODEL, NEVER BY MATCHING WORDS
+      // (Chris, 2026-09-29). Nothing at all is the one structural case: no
+      // words and no call (reference run 4). Everything else — an answer or
+      // only a promise, a tool call written out as text, a fragment — is the
+      // judge's typed reading of the reply against the steps actually taken
+      // (`agents/turnJudge.ts`), and the words stay as the model wrote them.
       const empty = soFar.length === 0 && toolCallLog.length === 0;
-      // A FRAGMENT IS NOT AN ANSWER. Conversation 382 (2026-09-29): after a
-      // full reasoning pass the model's whole reply was "Pic" — three
-      // characters, no sentence — and the turn was saved complete. A few
-      // characters with no sentence end is continued like an empty turn. The
-      // words stay as written: the turn goes on, the copy is not edited
-      // (Chris, 2026-09-29: never post-process the copy).
-      const fragment = soFar.length > 0 && soFar.length < 16 && !/[.!?)\]*`]$/.test(soFar);
+      const intent = await intentP;
+      const judged = empty
+        ? NO_JUDGEMENT
+        : await judgeAnswer({ orgId: opts.orgId, message: opts.message, reply: soFar, steps: stepLines(toolCallLog), cards: emittedCards.length });
       const callsBeforeContinuation = toolCallLog.length;
-      // THE EIGHTH SHAPE: an answer that explains, then ENDS on the move it
-      // announces — "Let me write the plan now." — after the person said
-      // what to do ("approve, fix and run", conversation 378, 2026-09-29).
-      // Every sentence is not a promise, so `preambleOnly` let it through;
-      // the last one is, and the person asked for the act, not the plan of
-      // it. A call the model wrote out as text is the act, and runs below.
-      const announced = !empty && !narrated && !preambleOnly(soFar) && textCalls.length === 0 && asksForAction(opts.message) ? announcedAction(soFar) : null;
-      const continued = empty || fragment || (soFar.length > 0 && (preambleOnly(soFar) || narrated || announced !== null));
+      const narratedName = textCalls.length === 0 ? judged.wrote_call_as_text : null;
+      // THE EIGHTH SHAPE (conversation 378): the person asked for the act and
+      // the pass ended on announcing it. A call the model wrote out as text is
+      // the act, and runs below.
+      const announced = !empty && !narratedName && textCalls.length === 0 && intent.wants_action && judged.ends_on_promise ? (judged.promise ?? soFar.slice(-200)) : null;
+      const continued = empty || !judged.answered || judged.ends_on_promise || narratedName !== null;
       if (continued) {
-        const narratedName = narrated ? (narrated[1] ?? narrated[2] ?? narrated[3] ?? 'a tool') : null;
-        const why = empty ? 'returned nothing' : fragment ? `returned a fragment ("${soFar}")` : narratedName ? `wrote the tool's name "${narratedName}" instead of calling it` : announced ? 'announced an action it did not take' : 'ended on a promise';
-        console.warn(`agent turn: ${why}, continuing once`, { orgId: opts.orgId, agentSlug: opts.agentSlug, toolCalls: toolCallLog.length, text: soFar.slice(0, 80) });
-        emit({ type: 'status', label: narrated ? `Making the ${narratedName} call it described` : toolCallLog.length > 0 ? `Reading what ${toolCallLog.length} step${toolCallLog.length === 1 ? '' : 's'} found` : 'Looking up what it needs' });
-        if (narrated) {
+        const why = empty ? 'returned nothing' : narratedName ? `wrote the ${narratedName} call out as text` : announced ? 'announced an action it did not take' : !judged.answered ? 'did not answer' : 'ended on a promise';
+        console.warn(`agent turn: ${why}, continuing once`, { orgId: opts.orgId, agentSlug: opts.agentSlug, toolCalls: toolCallLog.length, text: soFar.slice(0, 80), judged });
+        emit({ type: 'status', label: narratedName ? `Making the ${narratedName} call it described` : toolCallLog.length > 0 ? `Reading what ${toolCallLog.length} step${toolCallLog.length === 1 ? '' : 's'} found` : 'Looking up what it needs' });
+        if (narratedName) {
           narratedNudged = true;
-          finalText = finalText.replace(NARRATED_TOOL_TAIL, '');
         }
-        finalText += '\n\n';
-        emit({ type: 'response_delta', delta: '\n\n' });
+        if (soFar.length > 0) {
+          finalText += '\n\n';
+          emit({ type: 'response_delta', delta: '\n\n' });
+        }
         // What is waiting on the person, so "approve" meets the call that decides it.
         const waiting = announced ? await turnDecisions() : [];
-        const nudge = empty || fragment
-          ? 'You returned nothing — no words and no tool call. Answer the person now: run the lookups you need and reply in one screen.'
+        const nudge = empty
+          ? 'You returned nothing — no words and no tool call. Answer the person now: run the lookups you need and reply.'
           : announced
-            ? `You ended your turn on "${announced}" — an announcement, not the action — and the person told you what to do: "${personWords(opts.message).slice(0, 300)}". Do it now, with your tools: make the calls it takes${waiting.length > 0 ? `; what is waiting on them, and the call that decides each:\n${describeOpenDecisions(waiting)}\n` : '. '}Then say in one screen what you did and what it started. Do not repeat that sentence, and never write a tool call as text.`
-            : narrated
-              ? `Your last message wrote "${narratedName}" as text — the name of a tool, or a block shaped like a call — instead of calling it. Call ${narratedName} now with the arguments your message described, then reply in one sentence. Never write a tool call as text.`
-              : `You wrote only "${soFar.slice(0, 200)}" and ended your turn. That is a promise, not an answer. Do what you said — run the lookups you need — and answer now, in one screen. Do not repeat that sentence.`;
+            ? `You ended your turn on "${announced}" — an announcement, not the action — and the person told you what to do: "${opts.message.slice(0, 300)}". Do it now, with your tools: make the calls it takes${waiting.length > 0 ? `; what is waiting on them, and the call that decides each:\n${describeOpenDecisions(waiting)}\n` : '. '}Then say what you did and what it started. Do not repeat that sentence, and never write a tool call as text.`
+            : narratedName
+              ? `Your last message wrote a ${narratedName} call out as text instead of calling it, so nothing happened. Call ${narratedName} now with the arguments your message described, then reply in one sentence. Never write a tool call as text.`
+              : judged.ends_on_promise
+                ? `You ended your turn on "${judged.promise ?? soFar.slice(-200)}" — a promise, not an answer. Do what you said, with your tools, and answer now. Do not repeat that sentence.`
+                : 'That was not an answer to the person. Answer them now: run the lookups you need, then reply.';
         await runGraph({
           ...input,
-          messages: continueWith(nudge, [...input.messages, ...(empty || fragment ? [] : [{ role: 'assistant', content: narrated ? soFar.replace(NARRATED_TOOL_TAIL, '').trim() : soFar }])]),
+          messages: continueWith(nudge, [...input.messages, ...(empty ? [] : [{ role: 'assistant', content: soFar }])]),
         } as typeof input);
       }
       // A CONTINUATION THAT WORKED AND STOPPED AGAIN KEEPS GOING. The one
@@ -1264,29 +1257,26 @@ export async function runAgentDeep(opts: {
           } as typeof input);
         }
       }
+      // The reply as it stands after any continuation, judged once more
+      // only when it changed.
+      const after = continued
+        ? await judgeAnswer({ orgId: opts.orgId, message: opts.message, reply: normalizeAnswerHtml(finalText).trim(), steps: stepLines(toolCallLog), cards: emittedCards.length })
+        : judged;
+      lastJudgement = after;
       // AN ANSWER CUT OFF MID-SENTENCE is not an answer (mission run 5364,
       // 2026-09-26: the QA verdict ended at "Head read at `"). Once, the
       // turn re-enters with where it stopped and finishes from there.
       {
-        const { ContinuationJoin, cutOffMidSentence } = await import('./agents/truncation');
         const shown = normalizeAnswerHtml(finalText).trim();
-        if (cutOffMidSentence(shown) && !NARRATED_TOOL.test(shown)) {
+        if (after.cut_off && !after.wrote_call_as_text) {
           console.warn('agent turn: the answer stopped mid-sentence; finishing it', { orgId: opts.orgId, agentSlug: opts.agentSlug, tail: shown.slice(-80) });
           emit({ type: 'status', label: 'Finishing the answer' });
-          continuationJoin = new ContinuationJoin(finalText);
-          try {
-            await runGraph({
-              ...input,
-              messages: continueWith(`Your answer stopped mid-sentence at "${shown.slice(-120)}". Continue exactly from where it stopped and finish it. Do not repeat what you already wrote and do not read again what you already read.`, [...input.messages, { role: 'assistant', content: shown }]),
-            } as typeof input);
-          } finally {
-            const held = continuationJoin.flush();
-            continuationJoin = null;
-            if (held) {
-              finalText += held;
-              emit({ type: 'response_delta', delta: held });
-            }
-          }
+          // The continuation reads its own last message in the real
+          // conversation and goes on from it; its words stream as written.
+          await runGraph({
+            ...input,
+            messages: continueWith(`Your answer stopped mid-sentence at "${shown.slice(-120)}". Continue exactly from where it stopped and finish it. Do not repeat what you already wrote and do not read again what you already read.`, [...input.messages, { role: 'assistant', content: shown }]),
+          } as typeof input);
         }
       }
       // A CALL WRITTEN OUT AFTER THE CONTINUATION. The one continuation can
@@ -1300,11 +1290,9 @@ export async function runAgentDeep(opts: {
       // naming the tool.
       {
         const tail = normalizeAnswerHtml(finalText).trim();
-        const late = NARRATED_TOOL.exec(tail);
-        const lateName = late ? (late[1] ?? late[2] ?? late[3] ?? null) : null;
+        const lateName = textCalls.length === 0 ? after.wrote_call_as_text : null;
         if (lateName && !narratedNudged && toolCallLog.at(-1)?.tool !== lateName) {
           narratedNudged = true;
-          finalText = finalText.replace(NARRATED_TOOL_TAIL, '');
           console.warn(`agent turn: wrote a ${lateName} call out after continuing; once more to make it`, { orgId: opts.orgId, agentSlug: opts.agentSlug, toolCalls: toolCallLog.length });
           await runGraph({
             ...input,
@@ -1408,7 +1396,7 @@ export async function runAgentDeep(opts: {
       }
       // There will be no answer, so the words have to go into the transcript
       // here — a badge in the trace is not the person being told.
-      const notice = delegationFailureNotice(failedDelegations, finalText);
+      const notice = delegationFailureNotice(failedDelegations);
       if (notice) {
         emit({ type: 'response_delta', delta: `${finalText.trim().length > 0 ? '\n\n' : ''}${notice}` });
       }
@@ -1460,12 +1448,6 @@ export async function runAgentDeep(opts: {
       }
     }
   }
-  // Whatever happened above, a tool's bare name is never the last word of an
-  // answer: if the continuation narrated it again, it goes, and the log says so.
-  if (NARRATED_TOOL.test(finalText)) {
-    console.warn('agent turn: narrated tool name stripped from the answer', { orgId: opts.orgId, agentSlug: opts.agentSlug });
-    finalText = finalText.replace(NARRATED_TOOL_TAIL, '').trim();
-  }
   // THE PERSON ASKED FOR A RECORD; THE TURN ENDS WITH ONE. Conversation 349
   // (2026-09-28): "File a feature request…", a broken call, no retry; then
   // "Please file it now." and no call at all — two turns, no record. When the
@@ -1477,13 +1459,14 @@ export async function runAgentDeep(opts: {
   // the record needs no second announcement of it (journey 4: "Filed from
   // this conversation: request #214." over "Filed as request #214.").
   let owedReceipt: { line: string; output: string } | null = null;
-  if (asksToFile(opts.message) && !wroteInTurn(toolCallLog)) {
+  const intent = await intentP;
+  if (intent.files_new_record && !wroteInTurn(toolCallLog)) {
     try {
       const { buildDomainTools } = await import('./agents/tools/registry');
       // The typed filing tool when the agent has one (file_request), so the
       // pass fills the type's own schema; else propose_action (conversation 353).
       const history = opts.conversationHistory ?? [];
-      const proposeTool = owedWriteTool(buildDomainTools(boundCtx), [opts.message, ...history.map(t => t.content)].join('\n'));
+      const proposeTool = owedWriteTool(buildDomainTools(boundCtx), intent.record_type);
       if (proposeTool) {
         emit({ type: 'status', label: 'Filing what you asked for' });
         const { buildChatModelForOrg } = await import('@/libs/llm');
@@ -1524,7 +1507,7 @@ export async function runAgentDeep(opts: {
   // Asked for in the person's words, or claimed in the answer: "two edits
   // written to the record" with no write behind it (conversation 362) is
   // the same owed change, whoever answered on the page.
-  if (pageRecordId !== null && (asksToChange(opts.message) || attemptedChange(toolCallLog, pageRecordId) || (writeClaim(finalText) !== null && !wroteInTurn(toolCallLog))) && !changedInTurn(toolCallLog, pageRecordId)) {
+  if (pageRecordId !== null && (intent.changes_page_record || attemptedChange(toolCallLog, pageRecordId) || lastJudgement.claims_unrecorded_work) && !changedInTurn(toolCallLog, pageRecordId)) {
     try {
       const { buildDomainTools } = await import('./agents/tools/registry');
       const updateTool = buildDomainTools(boundCtx).find(t => t.name === 'update_object');
@@ -1580,8 +1563,9 @@ export async function runAgentDeep(opts: {
   // gate on the person's own words, so the pass cannot decide what they did
   // not say.
   if (opts.userId && !opts.missionRunId && !decidedInTurn(toolCallLog)) {
-    const previous = [...(opts.conversationHistory ?? [])].reverse().find(t => t.role === 'user')?.content;
-    const standing = decisionNamed(opts.message) ?? (asksForAction(opts.message) ? decisionNamed(previous) : null);
+    // Whether they took a decision is the intent read's (it saw the message
+    // before, so "write it" after "approve…" counts).
+    const standing = intent.decides ? intent.summary || 'a decision' : null;
     if (standing) {
       try {
         const waiting = await turnDecisions();
@@ -1707,7 +1691,6 @@ export async function runAgentDeep(opts: {
   // suppress the pass when the answer names several owed touches. The pass
   // sees what's already carded and only tops up the missing ones.
   const backstopOn = (compiled.agentRow.harnessConfig as { recommendActionBackstop?: boolean } | null)?.recommendActionBackstop === true;
-  let cardsOnScreen = emittedCards.length;
   if (backstopOn && emittedCards.length < 3 && finalText.length > 300) {
     try {
       // TWO STEPS, IN SECONDS (services/agents/cardBackstop.ts): a fast call
@@ -1723,12 +1706,13 @@ export async function runAgentDeep(opts: {
           agentPrompt: compiled.agentRow.systemPrompt ?? '',
           // A filing card is written from the conversation, not the answer alone.
           conversation: [...(opts.conversationHistory ?? []).slice(-8).map(t => `${t.role === 'user' ? 'Person' : 'You'}: ${String(t.content ?? '').slice(0, 3_000)}`), `Person: ${opts.message.split('\n\n--- ')[0]!.slice(0, 3_000)}`].join('\n\n'),
-          // The person's words this turn: an instruction is never answered with a question card.
+          // The person's words this turn, and whether they were an instruction
+          // (the intent read): an instruction is never answered with a question card.
           instruction: opts.message,
+          instructed: (await intentP).wants_action,
         },
         await realCardBackstopDeps({ ctx: compiled.ctx, orgId: opts.orgId, agentSlug: opts.agentSlug, userId: opts.userId, emit }),
       );
-      cardsOnScreen += out.emitted;
       // A decision that could not be a card is dropped from what the person
       // sees — no dead card, and no "— not a card: its input does not fit…"
       // line under the answer either (Chris, 2026-09-29). Its tool_call row
@@ -1743,14 +1727,6 @@ export async function runAgentDeep(opts: {
     }
   } else if (emittedCards.length === 0 && finalText.length > 300) {
     console.warn('card backstop skipped', { orgId: opts.orgId, agentSlug: opts.agentSlug, backstopOn, textChars: finalText.length });
-  }
-  // A card is a tool call, never prose. With a real card on screen, a "CARD —
-  // Approve build: …" block the model wrote out by hand (production turn 642,
-  // 2026-09-24: the whole card as markdown, then the real one under it) is
-  // the same card twice, once un-pressable. It goes; `done` carries the text.
-  if (cardsOnScreen > 0 && NARRATED_CARD.test(finalText)) {
-    console.warn('agent turn: narrated card stripped from the answer', { orgId: opts.orgId, agentSlug: opts.agentSlug, cardsOnScreen });
-    finalText = finalText.replace(NARRATED_CARD, '').trim();
   }
 
   // A record the answer names ("#201", "request 201") links to its page —
