@@ -544,6 +544,7 @@ describe('link fields', () => {
     });
 
     expect(out.records[0]?.fields.ticketUrl).toBe('https://bellwaterhall.example/tickets/42');
+    expect(out.records[0]?.issues).toEqual([]);
   });
 
   it('drops a link that is the document\'s own page, in any spelling', () => {
@@ -561,6 +562,16 @@ describe('link fields', () => {
   it('drops a link that is the record\'s own page', () => {
     const out = run([record({ sourceUrl: 'https://bellwaterhall.example/e/open-mic', fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: 'https://bellwaterhall.example/e/open-mic/' } })], config, {
       links: [{ url: 'https://bellwaterhall.example/e/open-mic', text: 'Open Mic Night' }, { url: 'https://bellwaterhall.example/e/open-mic/', text: 'Tickets' }],
+    });
+
+    expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+    expect(out.records[0]?.issues.join(' ')).toContain('ticketUrl: dropped, it is the page itself');
+  });
+
+  it('drops a link written as a path that resolves to the document\'s own page', () => {
+    const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: '/events/open-mic' } })], config, {
+      jsonLd: [{ '@type': 'Event', 'url': '/events/open-mic' }],
+      ownUrl: 'https://bellwaterhall.example/events/open-mic',
     });
 
     expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
