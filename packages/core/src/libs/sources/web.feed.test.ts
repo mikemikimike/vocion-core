@@ -22,7 +22,7 @@ import type { SourceContext } from './types';
 import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { webConnector } from './web';
+import { icsRecurrence, webConnector } from './web';
 
 type Progress = { kind: string; uri?: string; message?: string };
 
@@ -1723,5 +1723,48 @@ END:VCALENDAR`;
     const { docs } = await run({ urls: ['https://venue.test/events.json'] });
 
     expect((JSON.parse(docs[0]!.content) as Record<string, unknown>).startDate).toBe('2026-10-18T22:00:00.000Z');
+  });
+
+  it('stores the calendar zone and the instances a repeating entry has overrides for, and leaves its text as written', async () => {
+    stubFetch(() => typed(zonedIcs('X-WR-TIMEZONE:America/New_York\n'), 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const master = byId(docs, 'weekly@venue.test');
+
+    expect(master.metadata?.calendarZone).toBe('America/New_York');
+    expect(master.metadata?.overridden).toEqual(['20261118T230000Z']);
+    expect(master.content).toContain('RRULE:FREQ=WEEKLY');
+
+    const override = docs.find(d => d.externalId.includes('#weekly@venue.test#'))!;
+
+    expect(override.metadata?.overridden).toBeUndefined();
+  });
+
+  it('reads a repeating entry\'s rule and anchor from its text', async () => {
+    stubFetch(() => typed(zonedIcs('X-WR-TIMEZONE:America/New_York\n'), 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    const master = byId(docs, 'weekly@venue.test');
+    const rec = icsRecurrence(master.content.split('\n'), 'America/New_York')!;
+
+    expect(rec.rule).toBe('FREQ=WEEKLY');
+    expect(rec.anchorZone).toBe('UTC');
+    expect(rec.start.toISOString()).toBe('2026-11-04T23:00:00.000Z');
+    expect(rec.exdates.map(d => d.toISOString())).toEqual(['2026-11-11T23:00:00.000Z', '2026-11-25T23:00:00.000Z']);
+    expect(rec.allDay).toBe(false);
+    expect(icsRecurrence(byId(docs, 'late-show@venue.test').content.split('\n'), 'America/New_York')).toBeUndefined();
+
+    const zoned = icsRecurrence(['BEGIN:VEVENT', 'DTSTART;TZID=America/Chicago:20261101T193000', 'RRULE:FREQ=WEEKLY', 'END:VEVENT'])!;
+
+    expect(zoned.anchorZone).toBe('America/Chicago');
+    expect(zoned.start.toISOString()).toBe('2026-11-02T01:30:00.000Z');
+
+    const allDay = icsRecurrence(['BEGIN:VEVENT', 'DTSTART;VALUE=DATE:20261010', 'RRULE:FREQ=WEEKLY', 'END:VEVENT'], 'America/New_York')!;
+
+    expect(allDay).toMatchObject({ anchorZone: 'America/New_York', allDay: true });
+    expect(allDay.start.toISOString()).toBe('2026-10-10T04:00:00.000Z');
+    expect(icsRecurrence(['BEGIN:VEVENT', 'DTSTART;TZID=America/Chicago:20261340T193000', 'RRULE:FREQ=WEEKLY', 'END:VEVENT'])).toBeUndefined();
   });
 });

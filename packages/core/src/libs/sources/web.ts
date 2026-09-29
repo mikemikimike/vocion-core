@@ -43,7 +43,7 @@ import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { load } from 'cheerio';
 import { z } from 'zod';
-import { dayKey, dayPlus, isoInZone, isValidTimeZone } from '@/libs/time/zone';
+import { dayKey, dayPlus, instantInZone, isoInZone, isValidTimeZone } from '@/libs/time/zone';
 import { JSON_LD_BLOCK_CAP, pageMetadata } from './pageMetadata';
 
 const urlsFromSchema = z.object({
@@ -645,6 +645,15 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     return null;
   }
 
+  const overrides = new Map<string, string[]>();
+  for (const block of blocks) {
+    const rid = icsValue(block, 'RECURRENCE-ID');
+    if (rid) {
+      const uid = icsValue(block, 'UID');
+      overrides.set(uid, [...(overrides.get(uid) ?? []), rid]);
+    }
+  }
+
   const docs: IngestDoc[] = [];
   const seen = new Set<string>();
   for (const block of blocks) {
@@ -677,6 +686,8 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
         // the metadata it wrote before, or every sync reports a refresh.
         ...(published.length ? { publishedUrls: published } : {}),
         ...(endsOn ? { endsOn } : {}),
+        ...(zone ? { calendarZone: zone } : {}),
+        ...(!recurrenceId && overrides.get(uid)?.length ? { overridden: overrides.get(uid) } : {}),
       },
     });
   }
@@ -962,7 +973,7 @@ function calendarTimeZone(raw: string): string | undefined {
  * A UTC date-time as a Date.
  * @param value - `YYYYMMDDTHHMMSSZ`.
  */
-function icsUtcInstant(value: string): Date | undefined {
+export function icsUtcInstant(value: string): Date | undefined {
   const m = ICS_UTC_TIME_RE.exec(value);
   return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))) : undefined;
 }
@@ -1060,6 +1071,73 @@ function icsEndsOn(block: string[], zone?: string): string | undefined {
   }
   const day = `${m[1]}-${m[2]}-${m[3]}`;
   return end && !m[4] ? dayPlus(day, -1) : day;
+}
+
+/**
+ * A repeating component's rule and anchor, for a caller that expands it.
+ * Undefined when the component has no RRULE of its own.
+ * @param lines - the component's lines, as written or as the model reads them.
+ * @param fallbackZone - the zone an all-day or floating start runs in.
+ */
+export function icsRecurrence(lines: string[], fallbackZone = 'UTC'): { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; allDay: boolean } | undefined {
+  const rule = icsOwnValue(lines, 'RRULE');
+  if (!rule) {
+    return undefined;
+  }
+  const startLine = unfoldIcs(lines).find(line => /^DTSTART[;:]/i.test(line));
+  if (!startLine) {
+    return undefined;
+  }
+  const read = icsInstants(startLine, fallbackZone);
+  if (!read || read.instants.length !== 1) {
+    return undefined;
+  }
+  const list = (name: string) => unfoldIcs(lines).filter(line => new RegExp(`^${name}[;:]`, 'i').test(line)).flatMap(line => icsInstants(line, fallbackZone)?.instants ?? []);
+  return { start: read.instants[0]!, anchorZone: read.anchorZone, rule, exdates: list('EXDATE'), rdates: list('RDATE'), allDay: read.allDay };
+}
+
+/**
+ * The instants one date or date-time property line names, with the clock they
+ * run on: `Z` is UTC, `TZID=` is that zone, a bare date is midnight in the
+ * fallback zone. Undefined for a period or a form the reader does not know.
+ * @param line - one unfolded content line.
+ * @param fallbackZone - the zone a date or a floating time runs in.
+ */
+function icsInstants(line: string, fallbackZone: string): { instants: Date[]; anchorZone: string; allDay: boolean } | undefined {
+  const { colon, guessed } = icsValueColon(line);
+  if (colon < 0 || guessed) {
+    return undefined;
+  }
+  const params = line.slice(0, colon).split(';').slice(1);
+  if (params.some(p => /^VALUE=PERIOD$/i.test(p))) {
+    return undefined;
+  }
+  const tzid = params.find(p => /^TZID=/i.test(p))?.slice(5);
+  const zone = tzid ? knownTimeZone(tzid) : undefined;
+  if (tzid && !zone) {
+    return undefined;
+  }
+  const values = line.slice(colon + 1).split(',');
+  const instants: Date[] = [];
+  let allDay = false;
+  for (const value of values) {
+    const utc = icsUtcInstant(value);
+    if (utc) {
+      instants.push(utc);
+      continue;
+    }
+    const local = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/.exec(value);
+    if (!local) {
+      return undefined;
+    }
+    allDay = allDay || local[4] === undefined;
+    const at = instantInZone(`${local[1]}-${local[2]}-${local[3]}T${local[4] ?? '00'}:${local[5] ?? '00'}:${local[6] ?? '00'}`, zone ?? fallbackZone);
+    if (Number.isNaN(at.getTime())) {
+      return undefined;
+    }
+    instants.push(at);
+  }
+  return { instants, anchorZone: values.every(v => icsUtcInstant(v)) ? 'UTC' : (zone ?? fallbackZone), allDay };
 }
 
 /**

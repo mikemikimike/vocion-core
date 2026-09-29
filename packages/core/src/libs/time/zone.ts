@@ -154,6 +154,23 @@ export function startOfDay(day: string, tz: string): Date {
 }
 
 /**
+ * The instant a zone's wall clock names, as UTC. Two passes so a time inside
+ * a clock change still lands on the offset in force. A time the clocks skip
+ * resolves to the offset after the jump; a time they show twice, to the first.
+ * A string that names no time (month 13) is an invalid date, as `new Date` has it.
+ * @param local - `YYYY-MM-DDTHH:MM:SS` on the zone's clock.
+ * @param tz - The zone.
+ */
+export function instantInZone(local: string, tz: string): Date {
+  const guess = new Date(`${local}Z`).getTime();
+  if (Number.isNaN(guess)) {
+    return new Date(Number.NaN);
+  }
+  const first = new Date(guess - zoneOffsetMinutes(new Date(guess), tz) * 60_000);
+  return new Date(guess - zoneOffsetMinutes(first, tz) * 60_000);
+}
+
+/**
  * `Fri, Sep 18, 2026`.
  * @param d
  * @param tz

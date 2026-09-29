@@ -7,6 +7,7 @@
  * its place only where the capture itself is the thing under test.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { isoInZone } from '@/libs/time/zone';
 import { createSyncBudget } from '../budget';
 
 const invoke = vi.fn();
@@ -498,5 +499,24 @@ describe('candidate extractor, one document end to end', () => {
     await run(context());
 
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands a repeating calendar entry its computed dates and reads one record per date', async () => {
+    const entry = {
+      ...document,
+      externalId: 'https://bellwaterhall.example/feed.ics#weekly@bellwaterhall.example',
+      uri: 'https://bellwaterhall.example/feed.ics#weekly@bellwaterhall.example',
+      content: ['BEGIN:VEVENT', 'UID:weekly@bellwaterhall.example', 'SUMMARY:Open Mic Night', `DTSTART:${day(-7).replaceAll('-', '')}T230000Z`, 'RRULE:FREQ=WEEKLY', 'END:VEVENT'].join('\n'),
+      metadata: { contentType: 'text/calendar; charset=utf-8', feedUrl: 'https://bellwaterhall.example/feed.ics', calendarZone: 'America/New_York' },
+    };
+    invoke.mockResolvedValue(answer());
+
+    await run(context({ document: entry }) as never);
+
+    const human = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
+
+    expect(human).toContain('<occurrences>');
+    expect(human).toContain(isoInZone(new Date(`${day(0)}T23:00:00Z`), 'America/New_York'));
+    expect(human).not.toContain(`${day(-7)}T`);
   });
 });
