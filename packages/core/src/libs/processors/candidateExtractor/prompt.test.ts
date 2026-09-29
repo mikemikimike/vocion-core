@@ -146,6 +146,30 @@ describe('the known block rule', () => {
   });
 });
 
+describe('the fields contract', () => {
+  it('tells the model that a suggestion travels beside the identifying fields, never instead of them', () => {
+    const { system } = build();
+
+    expect(system).toContain('The identity fields are never omitted');
+    expect(system).toContain('a "reject" or "snooze" is said beside them, never instead of them');
+  });
+
+  it('states today\'s date when the caller knows it', () => {
+    const built = buildExtractionPrompt({
+      config,
+      rules: REAL_RULES,
+      known: '',
+      jsonLd: '',
+      pageText: HOSTILE_PAGE,
+      maxInputTokens: 10_000,
+      today: '2026-09-29',
+    });
+
+    expect(built.system).toContain('Today is 2026-09-29.');
+    expect(build().system).not.toContain('Today is');
+  });
+});
+
 describe('extraction prompt containment', () => {
   beforeEach(() => {
     invoke.mockReset();

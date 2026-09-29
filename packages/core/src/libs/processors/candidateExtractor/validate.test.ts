@@ -107,6 +107,28 @@ describe('candidate extractor validation', () => {
     expect(out.counts['skipped.incomplete']).toBe(1);
   });
 
+  it('counts a record with no fields apart from one missing an identity value', () => {
+    const none = { title: undefined, startDate: undefined, venueName: undefined };
+    const out = run([
+      record({ fields: none, suggestedDecision: 'snooze', suggestedDecisionReason: 'no time specified' }),
+      record({ fields: { ...none, title: '  ' }, suggestedDecision: 'reject', suggestedDecisionReason: 'past' }),
+      record({ fields: { startDate: undefined } }),
+    ]);
+
+    expect(out.records).toHaveLength(0);
+    expect(out.counts['skipped.no_fields']).toBe(2);
+    expect(out.counts['skipped.incomplete']).toBe(1);
+  });
+
+  it('counts a record with no fields even when a default would fill one of them', () => {
+    const none = { title: undefined, startDate: undefined, venueName: undefined };
+    const out = run([record({ fields: none })], configWith({ defaults: { venueName: 'Bellwater Hall' } }));
+
+    expect(out.records).toHaveLength(0);
+    expect(out.counts['skipped.no_fields']).toBe(1);
+    expect(out.counts['skipped.incomplete']).toBeUndefined();
+  });
+
   it('drops a past record by calendar day, and keeps a multi-day one still running', () => {
     const config = configWith({ dropIfPast: { field: 'startDate', keepIfField: 'end' } });
 

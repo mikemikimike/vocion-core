@@ -151,6 +151,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     uri: ctx.document.uri,
     ogImage: metadata.ogImage,
     maxInputTokens: ctx.budget.caps.maxInputTokensPerCall,
+    today,
   });
   if (prompt.trimmed.length > 0) {
     notes.push(`the call did not fit its token budget, so these were trimmed: ${prompt.trimmed.join(', ')}`);
