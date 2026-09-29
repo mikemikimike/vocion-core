@@ -491,6 +491,32 @@ describe('candidate extractor, one document end to end', () => {
     expect(String((event?.input as { extractionNotes?: string })?.extractionNotes)).toContain('ticketUrl: dropped, it is the page itself');
   });
 
+  it('drops a link field that is a split entry\'s own page', async () => {
+    const linked = candidateExtractorConfigSchema.parse({ ...config, linkFields: ['ticketUrl'] });
+    const page = 'https://venue.test/events/opening/';
+    const entry = {
+      externalId: 'https://venue.test/events.ics#evt-31@venue.test',
+      uri: 'https://venue.test/events.ics#evt-31@venue.test',
+      title: 'Opening Night',
+      content: `BEGIN:VEVENT\nSUMMARY:Opening Night\nURL:${page}\nEND:VEVENT`,
+      metadata: { contentType: 'text/calendar', feedUrl: 'https://venue.test/events.ics', publishedUrls: [page], entryUrl: page },
+    };
+    invoke.mockResolvedValue({
+      content: JSON.stringify({ records: [{ fields: { title: 'Opening Night', startDate: day(3), venueName: 'Bellwater Hall', ticketUrl: page }, confidence: 0.9, suggestedDecision: 'approve', suggestedDecisionReason: 'listed' }] }),
+      usage_metadata: { input_tokens: 900, output_tokens: 120 },
+    });
+
+    const result = await run(context({ config: linked, document: entry }));
+
+    expect(result.produced).toBe(1);
+
+    const rows = await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG));
+    const event = rows.find(row => (row.input as { objectType?: string }).objectType === 'event-candidate');
+
+    expect((event?.input as { fields?: Record<string, unknown> })?.fields?.ticketUrl).toBeUndefined();
+    expect(String((event?.input as { extractionNotes?: string })?.extractionNotes)).toContain('ticketUrl: dropped, it is the entry\'s own page');
+  });
+
   it('reports a skip instead of throwing when the model never answers', async () => {
     invoke.mockResolvedValue({ content: 'I could not read that page.' });
 

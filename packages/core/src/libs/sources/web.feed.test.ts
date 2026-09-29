@@ -87,6 +87,25 @@ URL:https:not a url at all
 END:VEVENT
 END:VCALENDAR`;
 
+const OWN_PAGE_ICS = `BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:evt-31@venue.test
+SUMMARY:Opening
+URL:https://venue.test/events/opening/
+ATTACH;FMTTYPE=image/jpeg:https://cdn.venue.test/opening.jpg
+END:VEVENT
+BEGIN:VEVENT
+UID:evt-32@venue.test
+SUMMARY:No Page
+ATTACH;FMTTYPE=image/jpeg:https://cdn.venue.test/no-page.jpg
+END:VEVENT
+BEGIN:VEVENT
+UID:evt-33@venue.test
+SUMMARY:Mail Only
+URL:mailto:x@venue.test
+END:VEVENT
+END:VCALENDAR`;
+
 const NESTED_ALARM_ICS = `BEGIN:VCALENDAR
 BEGIN:VEVENT
 UID:evt-4@venue.test
@@ -725,6 +744,30 @@ END:VCALENDAR`;
     // That is worse than dropping it: the gate would bless the wrong link.
     expect(docs[0]?.metadata?.publishedUrls).toEqual(['https://cdn.venue.test/right.png']);
   });
+
+  it('names the entry\'s own page from its URL line', async () => {
+    stubFetch(() => typed(OWN_PAGE_ICS, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    expect(docs[0]?.metadata?.entryUrl).toBe('https://venue.test/events/opening/');
+  });
+
+  it('names no page for an entry with no URL line', async () => {
+    stubFetch(() => typed(OWN_PAGE_ICS, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    expect(docs[1]?.metadata).not.toHaveProperty('entryUrl');
+  });
+
+  it('names no page for an entry whose URL is not fetchable', async () => {
+    stubFetch(() => typed(OWN_PAGE_ICS, 'text/calendar'));
+
+    const { docs } = await run({ urls: [ICS_URL] });
+
+    expect(docs[2]?.metadata).not.toHaveProperty('entryUrl');
+  });
 });
 
 describe('the JSON per-event split', () => {
@@ -1089,6 +1132,20 @@ describe('the JSON per-event split', () => {
     // publishing it under that exact name losing it would be the whole defect
     // this list exists to fix, reproduced.
     expect(docs[0]?.metadata?.publishedUrls).toEqual(['https://cdn.venue.test/poster.jpg']);
+  });
+
+  it('names the entry\'s own page from its url or link, and none when it has neither', async () => {
+    stubFetch(() => Response.json([
+      { id: 'c1', title: 'Opening', url: '/events/opening/', image: 'https://cdn.venue.test/opening.jpg' },
+      { id: 'c2', title: 'Talk', link: 'https://venue.test/events/talk/' },
+      { id: 'c3', title: 'No Page', url: 'None', image: 'https://cdn.venue.test/no-page.jpg' },
+    ]));
+
+    const { docs } = await run({ urls: ['https://venue.test/events.json'] });
+
+    expect(docs[0]?.metadata?.entryUrl).toBe('https://venue.test/events/opening/');
+    expect(docs[1]?.metadata?.entryUrl).toBe('https://venue.test/events/talk/');
+    expect(docs[2]?.metadata).not.toHaveProperty('entryUrl');
   });
 });
 

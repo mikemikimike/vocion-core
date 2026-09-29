@@ -151,6 +151,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     publishedUrls?: string[];
     ogImage?: string;
     feedUrl?: string;
+    entryUrl?: unknown;
     endsOn?: string;
     calendarZone?: string;
     overridden?: unknown;
@@ -236,6 +237,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     // already resolves its own links in the connector.
     baseUrl: metadata.feedUrl,
     ownUrl: ctx.document.uri,
+    entryUrl: typeof metadata.entryUrl === 'string' ? metadata.entryUrl : undefined,
     // The document's own image, declared to the gate so a model that returned
     // it is believed. The same value is stated in the prompt above, because
     // the connector keeps it out of `content`: that text is hashed to decide
