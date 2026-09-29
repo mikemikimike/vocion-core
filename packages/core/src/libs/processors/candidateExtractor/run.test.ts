@@ -28,6 +28,7 @@ const { actionRunSchema, businessObjectSchema, businessObjectTypeSchema } = awai
 const { forgetCachedObjectTypes } = await import('@/libs/actions/objects-propose-candidate');
 const { candidateExtractorConfigSchema } = await import('./config');
 const { run } = await import('./run');
+const { calendarToday } = await import('./validate');
 const { eq } = await import('drizzle-orm');
 
 const ORG = 'org_run';
@@ -178,6 +179,17 @@ describe('candidate extractor, one document end to end', () => {
     const human = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[1]?.content);
 
     expect(human).toContain('<jsonld>');
+  });
+
+  it('tells the model which day is today', async () => {
+    invoke.mockResolvedValue(answer());
+    await run(context());
+
+    const system = String((invoke.mock.calls[0]?.[0] as Array<{ content: unknown }>)[0]?.content);
+    const today = calendarToday(config.timezone);
+    const weekday = new Date(`${today}T00:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+
+    expect(system).toContain(`Today is ${today}, a ${weekday}.`);
   });
 
   it('does not call the model for a one-off entry that ended two days ago or more', async () => {

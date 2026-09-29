@@ -349,7 +349,7 @@ export function validateRecords(opts: {
 
     const blankIdentity = config.dedupOn.filter(field => isBlank(record.fields[field]));
     if (blankIdentity.length > 0) {
-      bump('skipped.incomplete');
+      bump(config.dedupOn.every(field => isBlank(raw.fields[field])) ? 'skipped.no_identity' : 'skipped.incomplete');
       continue;
     }
 

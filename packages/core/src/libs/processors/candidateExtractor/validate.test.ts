@@ -54,6 +54,8 @@ function run(records: ReturnType<typeof record>[], config = configWith(), over: 
 }
 
 describe('candidate extractor validation', () => {
+  const none = { title: undefined, startDate: undefined, venueName: undefined };
+
   it('blesses a link the document published as a path', () => {
     // A JSON feed states an entry's own page relatively. The connector resolves
     // it before declaring it, because the gate compares exactly, but the model
@@ -105,6 +107,26 @@ describe('candidate extractor validation', () => {
 
     expect(out.records).toHaveLength(0);
     expect(out.counts['skipped.incomplete']).toBe(1);
+  });
+
+  it('counts a record with no fields apart from one missing an identity value', () => {
+    const out = run([
+      record({ fields: none, suggestedDecision: 'snooze', suggestedDecisionReason: 'no time specified' }),
+      record({ fields: { ...none, title: '  ' }, suggestedDecision: 'reject', suggestedDecisionReason: 'past' }),
+      record({ fields: { startDate: undefined } }),
+    ]);
+
+    expect(out.records).toHaveLength(0);
+    expect(out.counts['skipped.no_identity']).toBe(2);
+    expect(out.counts['skipped.incomplete']).toBe(1);
+  });
+
+  it('counts a record with no fields even when a default would fill one of them', () => {
+    const out = run([record({ fields: none })], configWith({ defaults: { venueName: 'Bellwater Hall' } }));
+
+    expect(out.records).toHaveLength(0);
+    expect(out.counts['skipped.no_identity']).toBe(1);
+    expect(out.counts['skipped.incomplete']).toBeUndefined();
   });
 
   it('drops a past record by calendar day, and keeps a multi-day one still running', () => {
