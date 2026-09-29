@@ -91,6 +91,8 @@ export const candidateExtractorConfigSchema = z.object({
   recurrenceHorizonDays: z.number().int().positive().max(365).default(60),
   /** Field holding the record's image URL. */
   imageFrom: FieldName.optional(),
+  /** Fields holding a URL: kept only when the document published it, and never the document's own page. */
+  linkFields: z.array(FieldName).max(20).optional(),
   /** The one automatic hop per record, for fields a listing page does not carry. */
   followLinks: z.object({
     enabled: z.boolean().default(false),

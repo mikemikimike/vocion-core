@@ -25,7 +25,7 @@
 import type { CandidateExtractorConfig } from './config';
 import type { ExtractedRecord } from './model';
 import type { PageLink } from '@/libs/sources/pageMetadata';
-import { normaliseForKey } from '@/libs/actions/objects-propose-candidate';
+import { normaliseForKey, pageKey } from '@/libs/actions/objects-propose-candidate';
 import { dayPlus } from '@/libs/time/zone';
 import { calendarDayOf } from './knownCards';
 
@@ -268,6 +268,7 @@ function documentUrls(
  * itself, for the same gate and for the fallback at the end of this file.
  * @param opts.baseUrl - The document's own address, so a URL the model hands
  * back as a path can be resolved before the gate compares it.
+ * @param opts.ownUrl - The document's own address; a link field equal to it is dropped.
  * @param opts.knownIds - Run ids the prompt actually carried.
  * @param opts.today - Today as a calendar day in the config's timezone.
  * @param opts.rules - The adopted rules the prompt carried, by `step#id`.
@@ -281,6 +282,7 @@ export function validateRecords(opts: {
   publishedUrls?: string[];
   ogImage?: string;
   baseUrl?: string;
+  ownUrl?: string;
   knownIds: Set<number>;
   today: string;
   rules?: Array<{ id: string; text: string }>;
@@ -467,6 +469,25 @@ export function validateRecords(opts: {
           record.fields[config.imageFrom] = declared;
         }
       }
+    }
+    for (const field of config.linkFields ?? []) {
+      const value = record.fields[field];
+      if (typeof value !== 'string' || value === '') {
+        continue;
+      }
+      const declared = published(value);
+      if (declared === undefined) {
+        delete record.fields[field];
+        record.issues.push(`${field}: dropped, the document did not publish that URL`);
+        continue;
+      }
+      const own = pageKey(declared);
+      if (own !== null && (own === pageKey(opts.ownUrl) || own === pageKey(record.sourceUrl))) {
+        delete record.fields[field];
+        record.issues.push(`${field}: dropped, it is the page itself`);
+        continue;
+      }
+      record.fields[field] = declared;
     }
 
     // The hallucination guard: an id the prompt never sent is not a fact about

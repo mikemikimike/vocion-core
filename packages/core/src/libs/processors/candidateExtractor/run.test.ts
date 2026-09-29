@@ -459,6 +459,25 @@ describe('candidate extractor, one document end to end', () => {
     expect(input.extractionNotes).toContain('the document published for itself');
   });
 
+  it('drops a link field that points at the page it was read from', async () => {
+    const linked = candidateExtractorConfigSchema.parse({ ...config, linkFields: ['ticketUrl'] });
+    const own = `${document.uri}#tickets`;
+    invoke.mockResolvedValue({
+      content: JSON.stringify({ records: [{ fields: { title: 'Open Mic Night', startDate: day(3), venueName: 'Bellwater Hall', ticketUrl: own }, confidence: 0.9, suggestedDecision: 'approve', suggestedDecisionReason: 'listed' }] }),
+      usage_metadata: { input_tokens: 900, output_tokens: 120 },
+    });
+
+    const result = await run(context({ config: linked, document: { ...document, metadata: { ...document.metadata, links: [...document.metadata.links, { url: own, text: 'Tickets' }] } } }));
+
+    expect(result.produced).toBe(1);
+
+    const rows = await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG));
+    const event = rows.find(row => (row.input as { objectType?: string }).objectType === 'event-candidate');
+
+    expect((event?.input as { fields?: Record<string, unknown> })?.fields?.ticketUrl).toBeUndefined();
+    expect(String((event?.input as { extractionNotes?: string })?.extractionNotes)).toContain('ticketUrl: dropped, it is the page itself');
+  });
+
   it('reports a skip instead of throwing when the model never answers', async () => {
     invoke.mockResolvedValue({ content: 'I could not read that page.' });
 

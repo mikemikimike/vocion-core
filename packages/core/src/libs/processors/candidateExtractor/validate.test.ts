@@ -526,3 +526,50 @@ describe('scores and cited rules', () => {
     expect(out.records[0]?.matchedRules).toBeUndefined();
   });
 });
+
+describe('link fields', () => {
+  const config = configWith({ linkFields: ['ticketUrl'] });
+
+  it('drops a link the document did not publish', () => {
+    const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: 'https://evil.example/buy' } })], config);
+
+    expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+    expect(out.records[0]?.issues.join(' ')).toContain('ticketUrl: dropped, the document did not publish that URL');
+  });
+
+  it('keeps a published link and stores a path resolved', () => {
+    const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: '/tickets/42' } })], config, {
+      publishedUrls: ['https://bellwaterhall.example/tickets/42'],
+      baseUrl: 'https://bellwaterhall.example/feed.json',
+    });
+
+    expect(out.records[0]?.fields.ticketUrl).toBe('https://bellwaterhall.example/tickets/42');
+  });
+
+  it('drops a link that is the document\'s own page, in any spelling', () => {
+    for (const same of ['https://bellwaterhall.example/events/open-mic', 'https://bellwaterhall.example/events/open-mic/', 'https://bellwaterhall.example/events/open-mic#tickets']) {
+      const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: same } })], config, {
+        links: [{ url: same, text: 'Tickets' }],
+        ownUrl: 'https://bellwaterhall.example/events/open-mic',
+      });
+
+      expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+      expect(out.records[0]?.issues.join(' ')).toContain('ticketUrl: dropped, it is the page itself');
+    }
+  });
+
+  it('drops a link that is the record\'s own page', () => {
+    const out = run([record({ sourceUrl: 'https://bellwaterhall.example/e/open-mic', fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: 'https://bellwaterhall.example/e/open-mic/' } })], config, {
+      links: [{ url: 'https://bellwaterhall.example/e/open-mic', text: 'Open Mic Night' }, { url: 'https://bellwaterhall.example/e/open-mic/', text: 'Tickets' }],
+    });
+
+    expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+    expect(out.records[0]?.issues.join(' ')).toContain('ticketUrl: dropped, it is the page itself');
+  });
+
+  it('leaves a field alone when the config names no link fields', () => {
+    const out = run([record({ fields: { title: 'Open Mic Night', venueName: 'Bellwater Hall', ticketUrl: 'https://evil.example/buy' } })]);
+
+    expect(out.records[0]?.fields.ticketUrl).toBe('https://evil.example/buy');
+  });
+});
