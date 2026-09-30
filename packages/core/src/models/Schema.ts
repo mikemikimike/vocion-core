@@ -2959,6 +2959,8 @@ export const knowledgeDocumentSchema = pgTable(
     processorAttempts: integer('processor_attempts').default(0).notNull(),
     /** Why the last try did not finish. */
     processorError: text('processor_error'),
+    /** When the last finished run said its output goes stale; once passed, the sync runs the processor again on unchanged content. */
+    processorRevisitAt: timestamp('processor_revisit_at', { mode: 'date' }),
     /** Last-modified hints from the upstream source (HTTP ETag / mtime). */
     etag: text('etag'),
     lastModifiedAt: timestamp('last_modified_at', { mode: 'date' }),

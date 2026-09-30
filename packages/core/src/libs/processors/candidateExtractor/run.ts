@@ -28,9 +28,9 @@ import type { DocumentProcessor, ProcessorResult } from '../types';
 import type { CandidateExtractorConfig } from './config';
 import type { PageLink } from '@/libs/sources/pageMetadata';
 import { pushScore } from '@/libs/Langfuse';
-import { icsOverriddenInstant, icsRecurrence } from '@/libs/sources/web';
-import { expandRecurrence } from '@/libs/time/recurrence';
-import { dayPlus, isoInZone, resolveTimeZone, startOfDay } from '@/libs/time/zone';
+import { icsOverriddenInstant, icsOwnValues, icsRecurrence } from '@/libs/sources/web';
+import { expandRecurrence, readRule, ruleEndedBefore } from '@/libs/time/recurrence';
+import { dayKey, dayPlus, isoInZone, resolveTimeZone, startOfDay } from '@/libs/time/zone';
 import { keepIdentity, loadDocumentCards } from './identity';
 import { loadKnownCards } from './knownCards';
 import { labelRecords } from './labels';
@@ -101,9 +101,22 @@ async function learningStepsFor(orgId: string, config: CandidateExtractorConfig)
   }
 }
 
+/** A split calendar component, as the prompt and the revisit time read it. */
+type CalendarEntry = {
+  lines: string[];
+  /** The zone the calendar declares, else the configured one. */
+  zone: string;
+  /** Its rule and anchor, when `icsRecurrence` reads them. */
+  rec?: NonNullable<ReturnType<typeof icsRecurrence>>;
+  /** The instances the feed writes as components of their own. */
+  replaced: Set<number>;
+  /** The horizon on the calendar's clock, from today's start to its last day's end. */
+  from: Date;
+  to: Date;
+};
+
 /**
- * The dates a repeating calendar entry falls on inside the horizon, for the
- * prompt, or undefined when the document is not one or its rule is not read.
+ * The document as a split calendar component, or undefined when it is not one.
  * @param content - the entry as the model reads it.
  * @param metadata - the entry's stored metadata.
  * @param metadata.feedUrl - the feed a split entry came from.
@@ -112,25 +125,81 @@ async function learningStepsFor(orgId: string, config: CandidateExtractorConfig)
  * @param config - the processor config.
  * @param today - the run's day.
  */
-function repeatingEntryDates(content: string, metadata: { feedUrl?: string; calendarZone?: string; overridden?: unknown }, config: CandidateExtractorConfig, today: string): string[] | undefined {
+function calendarEntry(content: string, metadata: { feedUrl?: string; calendarZone?: string; overridden?: unknown }, config: CandidateExtractorConfig, today: string): CalendarEntry | undefined {
   // A split calendar component, recognised by its text the way `splitFeed` in the web connector recognises the feed.
   if (typeof metadata.feedUrl !== 'string' || !/^BEGIN:VEVENT/i.test(content)) {
     return undefined;
   }
   const zone = resolveTimeZone(metadata.calendarZone, config.timezone);
-  const rec = icsRecurrence(content.split('\n'), zone);
-  if (!rec) {
+  const lines = content.split('\n');
+  const rec = icsRecurrence(lines, zone);
+  const stored = Array.isArray(metadata.overridden) ? metadata.overridden.filter((v): v is string => typeof v === 'string') : [];
+  const replaced = new Set(rec ? stored.map(v => icsOverriddenInstant(v, rec)?.getTime()).filter((t): t is number => t !== undefined) : []);
+  return { lines, zone, rec, replaced, from: startOfDay(today, zone), to: endOfDay(dayPlus(today, config.recurrenceHorizonDays), zone) };
+}
+
+/**
+ * The last instant of a day in a zone.
+ * @param day - `YYYY-MM-DD`.
+ * @param zone - the zone.
+ */
+function endOfDay(day: string, zone: string): Date {
+  return new Date(startOfDay(dayPlus(day, 1), zone).getTime() - 1);
+}
+
+/**
+ * The dates a repeating calendar entry falls on inside the horizon, for the
+ * prompt, or undefined when the document is not one or its rule is not read.
+ * @param entry - the document as a calendar entry.
+ */
+function repeatingEntryDates(entry: CalendarEntry | undefined): string[] | undefined {
+  if (!entry?.rec) {
     return undefined;
   }
-  const from = startOfDay(today, zone);
-  const to = new Date(startOfDay(dayPlus(today, config.recurrenceHorizonDays + 1), zone).getTime() - 1);
-  const stored = Array.isArray(metadata.overridden) ? metadata.overridden.filter((v): v is string => typeof v === 'string') : [];
-  const replaced = new Set(stored.map(v => icsOverriddenInstant(v, rec)?.getTime()).filter((t): t is number => t !== undefined));
+  const { rec, zone, replaced, from, to } = entry;
   const dates = expandRecurrence({ ...rec, from, to }).filter(d => !replaced.has(d.getTime()));
   if (dates.length === 0) {
     return undefined;
   }
   return dates.map(d => rec.allDay ? isoInZone(d, zone).slice(0, 10) : isoInZone(d, zone));
+}
+
+/** How far past the horizon a series' next date is looked for: ten years. */
+const LOOKAHEAD_DAYS = 3_653;
+
+/**
+ * When a repeating calendar entry's reading goes stale: the day its next date
+ * past the horizon comes inside it, but no sooner than half a horizon on. A
+ * rule the expander does not read is read again every half horizon until it
+ * has plainly ended. Undefined for a one-off entry, a series with nothing left
+ * past the horizon, and any other document.
+ * @param entry - the document as a calendar entry.
+ * @param config - the processor config.
+ * @param today - the run's day.
+ */
+function revisitTime(entry: CalendarEntry | undefined, config: CandidateExtractorConfig, today: string): Date | undefined {
+  if (!entry) {
+    return undefined;
+  }
+  const horizon = config.recurrenceHorizonDays;
+  const soonest = dayPlus(today, Math.max(1, Math.floor(horizon / 2)));
+  const revisitOn = (day: string) => startOfDay(day > soonest ? day : soonest, resolveTimeZone(config.timezone));
+  const rule = entry.rec && readRule(entry.rec.rule);
+  if (!entry.rec || !rule) {
+    const start = icsOwnValues(entry.lines, 'DTSTART')[0];
+    return icsOwnValues(entry.lines, 'RRULE').some(r => !ruleEndedBefore(r, today, start)) ? revisitOn(soonest) : undefined;
+  }
+  const searchEnd = dayPlus(today, horizon + LOOKAHEAD_DAYS);
+  const next = expandRecurrence({
+    ...entry.rec,
+    from: new Date(entry.to.getTime() + 1),
+    to: endOfDay(searchEnd, entry.zone),
+  }).find(d => !entry.replaced.has(d.getTime()));
+  if (next) {
+    return revisitOn(dayPlus(dayKey(next, entry.zone), -horizon));
+  }
+  // An interval too long to reach in the search has not ended; one with a COUNT or an UNTIL has.
+  return rule.count === undefined && rule.until === undefined ? revisitOn(dayPlus(searchEnd, -horizon)) : undefined;
 }
 
 export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResult> => {
@@ -157,12 +226,16 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     overridden?: unknown;
   };
 
+  const entry = calendarEntry(ctx.document.content, metadata, config, today);
+  const revisitAt = revisitTime(entry, config, today);
+  const stale = revisitAt ? { revisitAt } : {};
+
   // A one-off entry that ended two days ago or more can only yield past
   // records, which `dropIfPast` would drop after paying for them. One day of
   // margin covers a feed whose zone differs from the configured one.
   if (config.dropIfPast && typeof metadata.endsOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(metadata.endsOn) && metadata.endsOn < dayPlus(today, -1)) {
     counts['skipped.past_before_call'] = 1;
-    return { produced: 0, skipped: 1, notes: [`the entry ended on ${metadata.endsOn}, so it was not read`], counts };
+    return { produced: 0, skipped: 1, notes: [`the entry ended on ${metadata.endsOn}, so it was not read`], counts, ...stale };
   }
   const jsonLdBlocks = metadata.jsonLd ?? [];
 
@@ -178,7 +251,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     notes.push(`learning steps that could not be read: ${rules.failedSteps.join(', ')}`);
   }
 
-  const occurrences = repeatingEntryDates(ctx.document.content, metadata, config, today);
+  const occurrences = repeatingEntryDates(entry);
   const prompt = buildExtractionPrompt({
     config,
     rules: rules.text,
@@ -220,7 +293,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     notes.push(skipMessage);
     const outcome = SKIP_OUTCOME[extraction.reason];
     const retry = outcome === 'finished' ? undefined : { reason: skipMessage, countsAsTry: outcome === 'retry' };
-    return { produced: 0, skipped: 1, notes, counts, ...(retry ? { retry } : {}) };
+    return { produced: 0, skipped: 1, notes, counts, ...(retry ? { retry } : stale) };
   }
 
   counts.found = extraction.records.length;
@@ -293,5 +366,5 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
   pushScore({ traceId: extraction.traceId, name: 'extraction-ok', value: produced > 0 ? 1 : 0 });
 
   const retry = proposed.proposalCapHit ? { reason: PROPOSAL_CAP_HIT_NOTE, countsAsTry: true } : undefined;
-  return { produced, skipped: Math.max(0, skipped), notes, counts, ...(retry ? { retry } : {}) };
+  return { produced, skipped: Math.max(0, skipped), notes, counts, ...(retry ? { retry } : stale) };
 };
