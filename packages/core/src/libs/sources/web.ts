@@ -1637,6 +1637,8 @@ const ITEM_TITLE_FIELDS = ['name', 'title', 'summary'] as const;
  * reason this list resolves relative values: `fullUrl` is a path, `/events/x`,
  * and the gate it feeds compares exactly, so an unresolved path can never
  * match what a model read and would drop the link it exists to keep.
+ * `assetUrl` is the entry's file, an image unless its `contentType` says
+ * otherwise.
  *
  * `imageUrl` is here because it is the extractor's own field name: an entry
  * that publishes its poster under the very key the pipeline reads it back out
@@ -1776,7 +1778,11 @@ function declaredUrls(item: unknown, baseUrl: string): string[] {
   if (!fields) {
     return [];
   }
-  const out = ITEM_URL_FIELDS.map(field => declaredUrl(fields[field], baseUrl)).filter(url => url !== undefined);
+  const notImage = typeof fields.contentType === 'string' && !fields.contentType.toLowerCase().startsWith('image/');
+  const out = ITEM_URL_FIELDS
+    .filter(field => !(notImage && field === 'assetUrl'))
+    .map(field => declaredUrl(fields[field], baseUrl))
+    .filter(url => url !== undefined);
   // A CMS export routinely repeats one link under two keys, so the dedupe is
   // what keeps the stored row honest rather than a formality.
   return dedupe(out).slice(0, PUBLISHED_URL_CAP);
@@ -2103,7 +2109,8 @@ const JSON_LD_TRUNCATED = '[structured data truncated]';
  * properly instead, so we can drop the chrome and keep the facts.
  *
  * `structure` is the same walk's structured half, the parsed JSON-LD, the
- * og:image and every URL the page published, kept instead of thrown away.
+ * og:image, every URL the page published and every image its text shows,
+ * kept instead of thrown away.
  * It is optional on the return type because the callers write
  * `{ title: undefined, content: raw, structure: undefined }` for non-HTML
  * bodies.
@@ -2151,7 +2158,7 @@ export function extractFromHtml(html: string, baseUrl?: string, ignore: readonly
   // file as the hero image in the body.
   const renderedImages = new Set<string>(image ? [image] : []);
   const renderedLinks = new Set<string>();
-  renderImages($, baseUrl, renderedImages);
+  const shown = renderImages($, baseUrl, renderedImages);
   renderTimes($);
   renderLinks($, baseUrl, renderedLinks);
   markBreaks($);
@@ -2180,6 +2187,9 @@ export function extractFromHtml(html: string, baseUrl?: string, ignore: readonly
   }
   if (published.length) {
     structure.links = published;
+  }
+  if (shown.length) {
+    structure.images = shown;
   }
 
   return { title, content: parts.join('\n\n'), structure };
@@ -2348,12 +2358,14 @@ function removeBoilerplate($: CheerioAPI): void {
 }
 
 /**
- * Replace each image with `[image: alt](src)`.
+ * Replace each image with `[image: alt](src)`, and return the srcs printed, in
+ * document order.
  * @param $ - the parsed page
  * @param baseUrl - the page URL, when the caller knows it
  * @param rendered - srcs already spoken for, added to as we go
  */
-function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<string>): void {
+function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<string>): string[] {
+  const printed: string[] = [];
   $('img').each((_i, el) => {
     const $el = $(el);
     // A lazy-loading theme puts a placeholder in `src` and the real file in a
@@ -2371,9 +2383,11 @@ function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<
       return;
     }
     rendered.add(src);
+    printed.push(src);
     const alt = ($el.attr('alt') ?? '').replace(/\s+/g, ' ').trim();
     $el.replaceWith(textNode($, alt ? `[image: ${alt}](${src})` : `[image](${src})`));
   });
+  return printed;
 }
 
 /**

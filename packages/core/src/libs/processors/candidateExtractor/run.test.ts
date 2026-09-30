@@ -472,6 +472,29 @@ describe('candidate extractor, one document end to end', () => {
     expect(input.extractionNotes).toContain('the document published for itself');
   });
 
+  it('accepts an image the page\'s text shows, which is in no link list', async () => {
+    const poster = 'https://bellwaterhall.example/uploads/open-mic.jpg';
+    invoke.mockResolvedValue({
+      content: JSON.stringify({
+        records: [{
+          fields: { title: 'Open Mic Night', startDate: day(7), venueName: 'Bellwater Hall' },
+          imageUrl: poster,
+          confidence: 0.9,
+          suggestedDecision: 'approve',
+          suggestedDecisionReason: 'A public listing with its own date and venue.',
+        }],
+      }),
+      usage_metadata: { input_tokens: 700, output_tokens: 90 },
+    });
+
+    await run(context({ document: { ...document, metadata: { ...document.metadata, images: [poster] } } }));
+
+    const runs = await db.select().from(actionRunSchema).where(eq(actionRunSchema.orgId, ORG));
+    const card = runs.find(row => (row.input as { title?: string }).title === 'Open Mic Night');
+
+    expect((card?.input as { imageUrl?: string }).imageUrl).toBe(poster);
+  });
+
   it('drops a link field that points at the page it was read from', async () => {
     const linked = candidateExtractorConfigSchema.parse({ ...config, linkFields: ['ticketUrl'] });
     const own = `${document.uri}#tickets`;

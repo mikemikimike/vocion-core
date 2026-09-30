@@ -233,19 +233,6 @@ describe('candidate extractor validation', () => {
     expect(out.counts['skipped.bad_category']).toBe(1);
   });
 
-  it('drops a price whose digits the document never printed', () => {
-    const config = configWith({ mustAppearInDocument: ['price'] });
-
-    const out = run([
-      record({ fields: { price: '$12' } }),
-      record({ fields: { title: 'Late Show', price: '$45' } }),
-    ], config);
-
-    expect(out.records[0]?.fields.price).toBe('$12');
-    expect(out.records[1]?.fields.price).toBeUndefined();
-    expect(out.records[1]?.issues.join(' ')).toContain('digits');
-  });
-
   it('drops a URL the page never published, and keeps the record', () => {
     const out = run([record({ sourceUrl: 'https://evil.example/pwn', imageUrl: 'https://cdn.example/poster.jpg' })], configWith(), {
       links: [{ url: 'https://cdn.example/poster.jpg', text: 'poster' }],
@@ -463,6 +450,127 @@ describe('candidate extractor validation', () => {
 
     expect(calendarToday('America/New_York', at)).toBe('2026-11-10');
     expect(calendarToday(undefined, at)).toBe('2026-11-11');
+  });
+});
+
+describe('values the document has to print', () => {
+  const priced = configWith({ mustAppearInDocument: ['price'] });
+
+  it('drops a price whose digits the document never printed, naming it', () => {
+    const out = run([
+      record({ fields: { price: '$12' } }),
+      record({ fields: { title: 'Late Show', price: '$45' } }),
+    ], priced);
+
+    expect(out.records[0]?.fields.price).toBe('$12');
+    expect(out.records[1]?.fields.price).toBeUndefined();
+    expect(out.records[1]?.issues).toEqual(['price: dropped "$45", its digits do not appear anywhere in the document']);
+    expect(out.counts['dropped.not_in_document']).toBe(1);
+  });
+
+  it('drops a price in words the document never printed as a word, naming it', () => {
+    const out = run([record({ fields: { price: 'Free' } })], priced, {
+      pageText: 'Open Mic Night, 12 November. Poster art from freeform.',
+    });
+
+    expect(out.records[0]?.fields.price).toBeUndefined();
+    expect(out.records[0]?.issues).toEqual(['price: dropped "Free", its words do not appear anywhere in the document']);
+    expect(out.counts['dropped.not_in_document']).toBe(1);
+  });
+
+  it('reads a word the document printed with a plural "s" or "es", and no looser form', () => {
+    const out = run([
+      record({ fields: { price: 'Donation' } }),
+      record({ fields: { title: 'Late Show', price: 'Day pass' } }),
+      record({ fields: { title: 'Matinee', price: 'Donate' } }),
+    ], priced, { pageText: 'Suggested donations at the door. Day passes sold here.' });
+
+    expect(out.records.map(kept => kept.fields.price)).toEqual(['Donation', 'Day pass', undefined]);
+    expect(out.records[2]?.issues).toEqual(['price: dropped "Donate", its words do not appear anywhere in the document']);
+  });
+
+  it('matches an accent whether the document stored it composed or decomposed', () => {
+    const composed = 'Free for Caf\u00E9 members';
+    const decomposed = 'Free for Cafe\u0301 members';
+
+    const onDecomposed = run([record({ fields: { price: composed } })], priced, { pageText: decomposed });
+    const onComposed = run([record({ fields: { price: decomposed } })], priced, { pageText: composed });
+
+    expect(onDecomposed.records[0]?.fields.price).toBe(composed);
+    expect(onComposed.records[0]?.fields.price).toBe(decomposed);
+  });
+
+  it('keeps a price in words the document printed, however it joined or quoted them', () => {
+    const out = run([
+      record({ fields: { price: 'Pay-What-You-Can' } }),
+      record({ fields: { title: 'Late Show', price: 'Free with a Hub\u2019s card' } }),
+    ], priced, { pageText: 'Pay-What-You-Can at the door. Late Show: free with a Hub\u2019s card.' });
+
+    expect(out.records.map(kept => kept.fields.price)).toEqual(['Pay-What-You-Can', 'Free with a Hub\u2019s card']);
+    expect(out.counts['dropped.not_in_document']).toBeUndefined();
+  });
+
+  it('does not hold a value the operator supplied to the document', () => {
+    const out = run([record()], configWith({ mustAppearInDocument: ['price'], defaults: { price: 'Free' } }));
+
+    expect(out.records[0]?.fields.price).toBe('Free');
+    expect(out.records[0]?.issues).toEqual([]);
+  });
+
+  it('finds a price the page printed only in its structured data', () => {
+    const out = run([record({ fields: { price: '$31' } })], priced, {
+      jsonLd: [{ '@type': 'Event', 'offers': { price: '31.00' } }],
+    });
+
+    expect(out.records[0]?.fields.price).toBe('$31');
+  });
+
+  it('holds a list to its digits, as before', () => {
+    const out = run([
+      record({ fields: { price: ['Free', 'Members'] } }),
+      record({ fields: { title: 'Late Show', price: ['$12', '$45'] } }),
+    ], priced);
+
+    expect(out.records[0]?.fields.price).toEqual(['Free', 'Members']);
+    expect(out.records[1]?.fields.price).toBeUndefined();
+    expect(out.records[1]?.issues.join(' ')).toContain('its digits do not appear');
+  });
+});
+
+describe('images the page shows', () => {
+  const PAGE_IMAGE = 'https://bellwaterhall.example/uploads/open-mic.jpg';
+
+  it('accepts an image the page shows for the image fields, and for nothing else', () => {
+    const config = configWith({ imageFrom: 'poster', linkFields: ['ticketUrl'] });
+
+    const out = run([record({
+      imageUrl: PAGE_IMAGE,
+      sourceUrl: PAGE_IMAGE,
+      fields: { poster: PAGE_IMAGE, ticketUrl: PAGE_IMAGE },
+    })], config, { images: [PAGE_IMAGE] });
+
+    expect(out.records[0]?.imageUrl).toBe(PAGE_IMAGE);
+    expect(out.records[0]?.fields.poster).toBe(PAGE_IMAGE);
+    expect(out.records[0]?.sourceUrl).toBeUndefined();
+    expect(out.records[0]?.fields.ticketUrl).toBeUndefined();
+  });
+
+  it('ignores a list that is not a list of strings', () => {
+    for (const wrong of [PAGE_IMAGE, [42, null], { url: PAGE_IMAGE }]) {
+      const out = run([record({ imageUrl: PAGE_IMAGE })], configWith(), { images: wrong });
+
+      expect(out.records[0]?.imageUrl).toBeUndefined();
+    }
+  });
+
+  it('still fills a missing image from the document\'s own when the page shows others', () => {
+    const out = run([record()], configWith(), {
+      ogImage: 'https://bellwaterhall.example/og-card.png',
+      images: [PAGE_IMAGE],
+    });
+
+    expect(out.records[0]?.imageUrl).toBe('https://bellwaterhall.example/og-card.png');
+    expect(out.counts.image_from_document).toBe(1);
   });
 });
 

@@ -137,7 +137,7 @@ export const candidateExtractorConfigSchema = z.object({
   allowedValues: z.record(FieldName, z.array(z.string().min(1)).min(1)).optional(),
   /** What an out-of-enum value costs: the value, or the whole record. */
   onViolation: z.enum(['dropValue', 'dropRecord']).default('dropValue'),
-  /** Fields whose digits must occur in the document, or the field is dropped. */
+  /** Fields the document must corroborate, or the field is dropped: every digit run, and each word of a string that has none. */
   mustAppearInDocument: z.array(FieldName).max(20).optional(),
   /** Fields the document must print as written; a value it does not is kept, with a note for the reviewer. */
   quotedFields: z.array(FieldName).max(20).optional(),

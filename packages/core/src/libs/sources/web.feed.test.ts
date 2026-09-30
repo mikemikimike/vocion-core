@@ -923,6 +923,26 @@ describe('the JSON per-event split', () => {
     ]);
   });
 
+  it('skips a JSON entry\'s assetUrl when its contentType is not an image, unless another key declares it', async () => {
+    const items = [
+      { id: 'a1', title: 'Opening Night', contentType: 'text/html', assetUrl: 'https://cdn.venue.test/opening' },
+      { id: 'a2', title: 'Second Night', contentType: 'image/jpeg', assetUrl: 'https://cdn.venue.test/second.jpg' },
+      { id: 'a3', title: 'Third Night', assetUrl: 'https://cdn.venue.test/third.jpg' },
+      { id: 'a4', title: 'Fourth Night', contentType: 'text/html', assetUrl: 'https://cdn.venue.test/fourth.jpg', image: 'https://cdn.venue.test/fourth.jpg' },
+    ];
+    stubFetch(() => Response.json(items));
+
+    const { docs } = await run({ urls: ['https://venue.test/events.json'] });
+
+    expect(docs.map(d => d.metadata?.publishedUrls)).toEqual([
+      undefined,
+      ['https://cdn.venue.test/second.jpg'],
+      ['https://cdn.venue.test/third.jpg'],
+      ['https://cdn.venue.test/fourth.jpg'],
+    ]);
+    expect(docs[0]?.content).toContain('https://cdn.venue.test/opening');
+  });
+
   it('hashes the item when it publishes no key, and never uses its index', async () => {
     const items = [{ when: '2026-11-01' }, { when: '2026-11-08' }];
     stubFetch(() => Response.json(items));
