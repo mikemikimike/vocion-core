@@ -1,13 +1,19 @@
 import { setRequestLocale } from 'next-intl/server';
 import { notFound, redirect } from 'next/navigation';
-import { FeatureReportView, ReportContextLine } from '@/features/dashboard/factory/FeatureReportView';
+import { FeatureReportView, ReportContextLine, reportLiveRefresh } from '@/features/dashboard/factory/FeatureReportView';
 import { RecordChangeIntent } from '@/features/dashboard/objects/RecordChangeIntent';
 import { TitleBar } from '@/features/dashboard/TitleBar';
+import { VersionChip } from '@/features/dashboard/versions/VersionChip';
 import { VersionWatch } from '@/features/dashboard/versions/VersionWatch';
 import { WikiView } from '@/features/dashboard/wiki/WikiView';
 import { clerkAuth as auth } from '@/libs/Auth';
 import { Link } from '@/libs/I18nNavigation';
+import { featureStatusOf } from '@/services/factory/featureReport';
 import { loadFeatureReport } from '@/services/factory/featureReportData';
+import { withDuplicateFact } from '@/services/objects/duplicateCheck';
+import { recordVersionOf } from '@/services/objects/recordBody';
+import { recordHref } from '@/services/objects/recordHref';
+import { relatedOf, relatedWrites } from '@/services/objects/related';
 import { readPageForOrg } from '@/services/PluginService';
 
 /**
@@ -83,8 +89,10 @@ export default async function WorkspaceReportPage(props: {
     const { ProductOverviewView } = await import('@/features/dashboard/factory/ProductOverviewView');
     const now = new Date();
     const overview = await loadProductOverview(orgId, id, now);
+    const related = overview ? await relatedOf(orgId, Number(id)).catch(() => []) : [];
+    const writes = overview ? await relatedWrites(orgId, Number(id)).catch(() => []) : [];
     return overview
-      ? <ProductOverviewView overview={overview} page={{ slug: manifest.slug, title: manifest.title }} now={now.getTime()} />
+      ? <ProductOverviewView overview={overview} page={{ slug: manifest.slug, title: manifest.title }} now={now.getTime()} related={related} writes={writes} />
       : notFound();
   }
   // A release's own page (the Releases feed's row link): what changed for
@@ -105,9 +113,11 @@ export default async function WorkspaceReportPage(props: {
     const { workspaceTimeZone } = await import('@/libs/time/workspaceTimeZone');
     const { evidenceArtifactIdsOf } = await import('@/libs/workspace/criterionEvidence');
     const ids = evidenceArtifactIdsOf(row.meta);
-    const [linked, artifacts, timeZone] = await Promise.all([loadReleaseLinked(orgId, [row]), loadReleaseArtifacts(orgId, ids), workspaceTimeZone(orgId)]);
-    const report = assembleReleaseReport(row, { linked, artifacts, timeZone, now: new Date() });
-    return <ReleaseDetailView report={report} recordPage={manifest.recordPage} backHref={`/dashboard/p/${manifest.slug}`} />;
+    const { announceMode } = await import('@/services/factory/releaseAnnounce');
+    const [linked, artifacts, timeZone, mode] = await Promise.all([loadReleaseLinked(orgId, [row]), loadReleaseArtifacts(orgId, ids), workspaceTimeZone(orgId), announceMode(orgId)]);
+    const report = assembleReleaseReport(row, { linked, artifacts, timeZone, now: new Date(), announceMode: mode });
+    const related = await relatedOf(orgId, releaseId).catch(() => []);
+    return <ReleaseDetailView report={report} recordPage={manifest.recordPage} backHref={`/dashboard/p/${manifest.slug}`} related={related} />;
   }
   if (!manifest || manifest.archetype !== 'report' || !manifest.report) {
     return notFound();
@@ -118,7 +128,21 @@ export default async function WorkspaceReportPage(props: {
     return notFound();
   }
 
-  const report = await loadFeatureReport(orgId, recordId);
+  const now = new Date();
+  const report = await loadFeatureReport(orgId, recordId, now);
+  // The three lines, with the record's own page as their base — the same
+  // read the API, the pane and the chat draw (`services/objects/recordStatus.ts`).
+  const status = report
+    ? await withDuplicateFact(orgId, featureStatusOf(report, { objectType: manifest.report.subject, href: await recordHref(orgId, { objectType: manifest.report.subject, id: recordId }) }, now))
+    : undefined;
+  // The record's version closes the metadata line, and carries the page's
+  // re-read while anything runs (one chip, not a History row and a live row).
+  const version = report ? await recordVersionOf(orgId, report.requestId).catch(() => null) : null;
+  const chip = report
+    ? <VersionChip objectId={report.requestId} version={version?.version ?? null} updatedAt={version?.at ?? null} live={reportLiveRefresh(report)} />
+    : null;
+  // What it is connected to, in the one Related block (`relatedOf`).
+  const related = report ? await relatedOf(orgId, report.requestId).catch(() => []) : [];
 
   return (
     <>
@@ -139,17 +163,13 @@ export default async function WorkspaceReportPage(props: {
         title={report ? report.title : manifest.title}
         description={report
           ? (
-              (report.goal ?? null) === null && report.context.length === 0
-                ? undefined
-                : (
-                    // The subtitle reads at body size and normal contrast —
-                    // it is what the work is FOR; the context line under it
-                    // is metadata, smaller and muted (Chris, 2026-09-28).
-                    <>
-                      {report.goal && <span className="block text-[15px] leading-relaxed text-foreground">{report.goal}</span>}
-                      <ReportContextLine bits={report.context} />
-                    </>
-                  )
+              // The subtitle reads at body size and normal contrast — it is
+              // what the work is FOR; the context line under it is metadata,
+              // smaller and muted (Chris, 2026-09-28), closed by the version.
+              <>
+                {report.goal && <span className="block text-[15px] leading-relaxed text-foreground">{report.goal}</span>}
+                <ReportContextLine bits={report.context} end={chip} />
+              </>
             )
           : manifest.description}
       />
@@ -160,7 +180,7 @@ export default async function WorkspaceReportPage(props: {
       {report && <RecordChangeIntent objectId={report.requestId} title={report.title} selectionRoot={'[id^="report-"]'} />}
       {report && <VersionWatch refs={[{ type: 'object', id: String(report.requestId) }]} />}
       {report
-        ? <FeatureReportView report={report} />
+        ? <FeatureReportView report={report} status={status} related={related} />
         : (
             <p className="max-w-2xl text-sm text-muted-foreground">
               There is no

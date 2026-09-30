@@ -1,3 +1,5 @@
+import type { RelatedItem } from '@/libs/workspace/related';
+
 /**
  * A RUN READS LIKE A RUNNER PAGE (backlog 036; Chris, 2026-09-28: "for live
  * runs, I'd expect it to look like a GitHub runner or Vercel deployment
@@ -90,7 +92,35 @@ export type RunHeader = {
   recovery?: string | null;
   /** Where the run belongs: its feature, plan, attempt and acceptance (`RunContext`). */
   context?: RunContext | null;
+  /**
+   * The worker's own id for the task (`send-t275`): a machine handle, shown
+   * in the facts rows, never as the title (Chris, 2026-09-30, run #435).
+   */
+  taskId?: string | null;
+  /** The seat doing the work, as the status line names it ("Engineer"). */
+  seat?: string | null;
 };
+
+/**
+ * WHY THIS ATTEMPT, in one line under the header (Chris, 2026-09-30: the CI
+ * failure that sent run #435 back was buried in its objective paragraph).
+ * `ci` — CI failed on the last attempt's pull request; `review` — QA (or the
+ * person who merges) sent it back; `note` — what the person pressing Build
+ * asked of it; `recovery` — the factory's own reason for starting it again.
+ * Absent on a first attempt.
+ */
+export type RunWhy = {
+  kind: 'ci' | 'review' | 'note' | 'recovery';
+  /** The line: "CI failed on the pull request: test (unit)". */
+  line: string;
+  /** What failed, in the check's own words — its first line (the failing test and message). */
+  detail: string | null;
+  /** Where the evidence is: the last attempt's pull request. */
+  href: string | null;
+};
+
+/** One acceptance criterion and, when a verdict exists, whether it was proven. */
+export type RunCriterion = { text: string; state: 'proven' | 'open' | null };
 
 /**
  * WHERE A RUN BELONGS (Chris, 2026-09-29: "When I'm on the active run I
@@ -102,9 +132,67 @@ export type RunHeader = {
 export type RunContext = {
   feature: { id: number; title: string; href: string } | null;
   plan: { id: number; title: string; href: string } | null;
-  attempt: { n: number; of: number; others: Array<{ runId: number; status: string; href: string }> } | null;
-  acceptance: { count: number; href: string } | null;
+  /** The engineering task the run builds, the record behind the machine id. */
+  task?: { id: number; href: string } | null;
+  /**
+   * Which automatic attempt this is, from the SAME count the feature page
+   * reads (`request.metadata.recovery`, per stage, against its limit), so the
+   * run and its feature never show two counters. Null for a build a person
+   * started: it is not one of the automatic attempts.
+   */
+  attempt: { n: number; of: number } | null;
+  /** The feature's other engineering runs, oldest first. */
+  others?: Array<{ runId: number; status: string; href: string }>;
+  acceptance: { count: number; href: string; criteria?: RunCriterion[] } | null;
+  /** The branch the work is on, linked to its repository when the repository says where. */
+  branch?: { name: string; href: string | null } | null;
+  why?: RunWhy | null;
+  /** The chat the feature was requested in (`services/objects/related.recordOrigin`). */
+  origin?: { conversationId: number; title: string; href: string | null; by: string | null; at: string | null } | null;
 };
+
+/**
+ * WHAT A RUN IS CONNECTED TO, as the one Related block draws it
+ * (`components/patterns/Related`): the chat its feature started in, the
+ * feature, its plan, the other attempts, its branch and pull request. Read
+ * off the run's own context; the page and the pane both draw it.
+ * @param h - The run's header.
+ */
+export function runRelatedItems(h: RunHeader): RelatedItem[] {
+  const c = h.context;
+  if (!c) {
+    return h.prUrl ? [linkItem('pr', 'Pull request', h.prUrl, prName(h.prUrl))] : [];
+  }
+  const items: RelatedItem[] = [];
+  if (c.origin) {
+    items.push({ key: `origin:${c.origin.conversationId}`, relation: 'origin', label: 'Started in chat', title: c.origin.title, href: c.origin.href, external: false, preview: { type: 'conversation', id: String(c.origin.conversationId) }, kind: 'conversation', note: c.origin.by, at: c.origin.at });
+  }
+  if (c.feature) {
+    items.push({ key: `feature:${c.feature.id}`, relation: 'feature', label: 'Feature', title: `#${c.feature.id} ${c.feature.title}`, href: c.feature.href, external: false, preview: { type: 'object', id: String(c.feature.id) }, kind: 'record', note: null, at: null });
+  }
+  if (c.plan) {
+    items.push({ key: `plan:${c.plan.id}`, relation: 'plan', label: 'Plan', title: `#${c.plan.id} ${c.plan.title}`, href: c.plan.href, external: false, preview: { type: 'object', id: String(c.plan.id) }, kind: 'record', note: null, at: null });
+  }
+  for (const o of c.others ?? []) {
+    items.push({ key: `attempt:${o.runId}`, relation: 'attempts', label: 'Other attempts', title: `Run #${o.runId}`, href: o.href, external: false, preview: { type: 'worker_run', id: String(o.runId) }, kind: 'run', note: o.status, at: null });
+  }
+  if (c.branch) {
+    items.push(c.branch.href ? linkItem('branch', 'Branch', c.branch.href, c.branch.name) : { key: `branch:${c.branch.name}`, relation: 'branch', label: 'Branch', title: c.branch.name, href: null, external: false, preview: null, kind: 'link', note: null, at: null });
+  }
+  if (h.prUrl) {
+    items.push(linkItem('pr', 'Pull request', h.prUrl, prName(h.prUrl)));
+  }
+  return items;
+}
+
+function linkItem(relation: string, label: string, href: string, title: string): RelatedItem {
+  return { key: `${relation}:${href}`, relation, label, title, href, external: /^https?:\/\//.test(href), preview: null, kind: 'link', note: null, at: null };
+}
+
+function prName(url: string): string {
+  const n = /\/(?:pull|merge_requests)\/(\d+)/.exec(url)?.[1];
+  return n ? `PR #${n}` : url.split('/').filter(Boolean).at(-1) ?? url;
+}
 
 /** Everything the run page draws, and what a poll returns. */
 export type RunLogData = {
@@ -801,6 +889,55 @@ export function mergeRunLog(prev: RunLogData, next: RunLogData): RunLogData {
  */
 export function focusStep(steps: readonly RunStep[]): string | null {
   return (steps.find(s => s.status === 'running') ?? steps.find(s => s.status === 'failed'))?.key ?? null;
+}
+
+/** The Now line of a live run: the step it is on and the engineer's latest words. */
+export type RunNow = { step: string; say: string | null };
+
+/**
+ * WHAT IS HAPPENING NOW, in one line above the steps (Chris, 2026-09-30):
+ * the running step and the engineer's latest commentary line — the last line
+ * of its last `claude.text` event ("API side passes, 7 of 7. Now stamp-web:
+ * theme helpers…"). An older run with no lines says its progress note. Null
+ * once the run has stopped, or before it reports a step.
+ * @param data - The run as the page holds it.
+ * @param steps - Its steps (`deriveSteps`).
+ */
+export function runNow(data: Pick<RunLogData, 'header' | 'events'>, steps: readonly RunStep[]): RunNow | null {
+  if (!isLiveStatus(data.header.status)) {
+    return null;
+  }
+  const step = steps.find(s => s.status === 'running') ?? steps.at(-1);
+  if (!step) {
+    return null;
+  }
+  let say: string | null = null;
+  for (let i = data.events.length - 1; i >= 0 && say === null; i--) {
+    const e = data.events[i]!;
+    if (e.phase === 'claude.text' && typeof e.fields.text === 'string') {
+      say = stripAnsi(e.fields.text).split('\n').map(l => l.trim()).filter(Boolean).at(-1) ?? null;
+    }
+  }
+  if (say === null && data.events.length === 0) {
+    say = data.header.progress.note?.split('\n').map(l => l.trim()).filter(Boolean).at(-1) ?? null;
+  }
+  return { step: step.name.replace(/^Now: /, ''), say };
+}
+
+/**
+ * A run as the preview pane holds it (`services/runs/RunLogService.
+ * readRunGlance`): the header, the steps without their logs, and the Now
+ * line. Small, so the pane re-reads it whole while the run is live.
+ */
+export type RunGlance = { header: RunHeader; steps: RunStep[]; now: RunNow | null };
+
+/**
+ * The glance off a full read: every step kept, every log dropped.
+ * @param data - The run as `readRunLog` returned it.
+ */
+export function glanceOf(data: RunLogData): RunGlance {
+  const steps = deriveSteps(data);
+  return { header: data.header, steps: steps.map(s => ({ ...s, lines: [], links: [] })), now: runNow(data, steps) };
 }
 
 /**

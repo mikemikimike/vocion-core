@@ -36,6 +36,9 @@ import { z } from 'zod';
  */
 export const CANDIDATE_EXTRACTOR_DOCUMENT_TIMEOUT_MS = 270_000;
 
+/** The slug the registry holds this processor under, as a source manifest names it. */
+export const CANDIDATE_EXTRACTOR_SLUG = 'candidate-extractor';
+
 /**
  * A field name on the object type being extracted.
  *

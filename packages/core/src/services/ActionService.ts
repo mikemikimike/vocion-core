@@ -20,6 +20,7 @@ import type { Principal } from '@/services/authz';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import { decideExecution } from '@/libs/actions/autoAccept';
+import { decidedByMachine } from '@/libs/actions/decider';
 import { isManualAction } from '@/libs/actions/manual';
 import { isNeverAuto } from '@/libs/actions/neverAuto';
 import { policyKeyForRun } from '@/libs/actions/policyKey';
@@ -67,12 +68,14 @@ export type ActionRunResult = {
  * no consumer could tell a fresh card from a refresh, let alone from one a
  * moderator already threw out.
  */
-export type ProposeOutcome = 'created' | 'refreshed' | 'already_decided';
+export type ProposeOutcome = 'created' | 'refreshed' | 'already_decided' | 'already_underway';
 
 export type ProposeResult = ActionRunResult & {
   outcome: ProposeOutcome;
   /** When the earlier run was decided. Set on `already_decided` only. */
   decidedAt?: Date | null;
+  /** What is already happening, and where to follow it. Set on `already_underway` only. */
+  underway?: { line: string; href?: string | null };
 };
 
 const DAY_IN_MS = 86_400_000;
@@ -221,10 +224,11 @@ async function findDecidedRunForKey(
   const statuses = cardKey
     ? [...CARD_STATUSES_THAT_BLOCK]
     : config?.statuses ?? [...DECIDED_STATUSES_THAT_BLOCK];
-  const [row] = await db
+  const rows = await db
     .select({
       id: actionRunSchema.id,
       status: actionRunSchema.status,
+      decidedBy: actionRunSchema.decidedBy,
       decidedAt: actionRunSchema.decidedAt,
       executedAt: actionRunSchema.executedAt,
       createdAt: actionRunSchema.createdAt,
@@ -238,7 +242,15 @@ async function findDecidedRunForKey(
       inArray(actionRunSchema.status, [...statuses]),
     ))
     .orderBy(desc(actionRunSchema.id))
-    .limit(1);
+    .limit(20);
+  // A MACHINE'S REJECTION DOES NOT STAND. A seat withdrawing its own
+  // card, its budget retiring it, or a sweep expiring it says nothing about
+  // the record, yet it used to bar the record for good: request #130
+  // (2026-09-30) could never be planned again because the product manager had
+  // withdrawn an old plan card for it, and every replan was refused as "a
+  // person already decided this exact record". A machine-made `done` still
+  // counts; the record it produced exists (`decisionStillStands` answers for it).
+  const row = cardKey ? rows.at(0) : rows.find(r => r.status !== 'rejected' || !decidedByMachine(r.decidedBy));
   if (!row) {
     return undefined;
   }
@@ -421,6 +433,14 @@ export async function proposeAction(input: {
   // The action's own last word, before any row exists. Tenant state the input
   // schema cannot check lives here, and refusing costs the caller nothing but
   // a message it can act on.
+  // What was asked for is already happening: say so, start nothing, refuse nothing.
+  const underway = await action.underway?.(
+    { orgId: input.orgId, invokedBy: input.invokedBy ?? input.principal.id, ...(input.turn ? { turn: input.turn } : {}) },
+    parsed,
+  );
+  if (underway) {
+    return { runId: 0, status: 'done', outcome: 'already_underway', underway };
+  }
   const refusal = await action.precheck?.(
     { orgId: input.orgId, invokedBy: input.invokedBy ?? input.principal.id, ...(input.turn ? { turn: input.turn } : {}) },
     parsed,
@@ -439,7 +459,13 @@ export async function proposeAction(input: {
   // `dedupKey` over the API, so two actions can share one; matching on the
   // key alone would rewrite the other action's row with this input and run
   // this action's `onProposed` against a run it does not own.
-  if (dedupKey) {
+  // A key the action itself does not trust (a candidate missing one of its
+  // identity fields) is shared by every filing missing that same field, so it
+  // answers for no one record: it neither refreshes an open card nor stands
+  // behind a decided one. Refreshing on it rewrote whichever record the first
+  // such card had made (#124, 2026-09-30); such a filing is a new card.
+  const keyIdentifiesOneRecord = action.dedupAgainstDecided?.keyIsTrustworthy?.(parsed) ?? true;
+  if (dedupKey && keyIdentifiesOneRecord) {
     const refreshed = await db.transaction(async (tx) => {
       const lookup = tx
         .select({ id: actionRunSchema.id, input: actionRunSchema.input, proposal: actionRunSchema.proposal })
@@ -525,7 +551,6 @@ export async function proposeAction(input: {
     // can do instead.
     // A key the action itself does not trust — a candidate missing one of
     // its identity fields — must not answer for a record nobody has seen.
-    const keyIdentifiesOneRecord = action.dedupAgainstDecided?.keyIsTrustworthy?.(parsed) ?? true;
     const decided = keyIdentifiesOneRecord
       ? await findDecidedRunForKey(input.orgId, action.id, dedupKey, action.dedupAgainstDecided)
       : undefined;

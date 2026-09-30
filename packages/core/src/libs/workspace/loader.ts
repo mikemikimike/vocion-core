@@ -2,7 +2,7 @@ import type { ZodType } from 'zod';
 import type { ActivatedPack, ComposedEntry, FolderEntry, PackRaw, RawEntry } from './compose';
 import type { Origin } from './merge';
 import type { LoadedPlugin } from './plugins';
-import type { AgentManifest, AutomationManifest, EvalDatasetManifest, LearningStepManifest, MissionManifest, ObjectTypeManifest, OperatingIntentManifest, PackManifest, PlaybookManifest, SourceManifest, TeamManifest, TrustManifest, VoiceManifest, WorkflowManifest, WorkspaceManifest } from './schemas';
+import type { AgentManifest, AutomationManifest, EvalDatasetManifest, LearningStepManifest, MissionManifest, NotificationRuleManifest, ObjectTypeManifest, OperatingIntentManifest, PackManifest, PlaybookManifest, SourceManifest, TeamManifest, TrustManifest, VoiceManifest, WorkflowManifest, WorkspaceManifest } from './schemas';
 import type { LoadedWikiPage } from './wiki-pages';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -56,6 +56,37 @@ export type LoadedWorkflow = WorkflowManifest & { sourceFile: string };
 export type LoadedMission = MissionManifest & { sourceFile: string; origin: Origin };
 export type LoadedAutomation = AutomationManifest & { sourceFile: string };
 
+/**
+ * A declared notification kind, and the layer that declared it: `workspace`,
+ * or `plugin:<slug>` (backlog 048).
+ */
+export type LoadedNotification = NotificationRuleManifest & { source: string };
+
+/**
+ * The notification kinds a workspace has on: every enabled plugin's, in load
+ * order, then the workspace's own, a workspace entry replacing a plugin's of
+ * the same kind whole (the whole-file rule automations use). Two plugins
+ * declaring one kind is an error — a kind belongs to one plugin.
+ * @param plugins - The resolved plugins.
+ * @param manifest - The workspace manifest.
+ */
+export function composeNotifications(plugins: readonly LoadedPlugin[], manifest: Pick<WorkspaceManifest, 'notifications'>): LoadedNotification[] {
+  const byKind = new Map<string, LoadedNotification>();
+  for (const plugin of plugins) {
+    for (const rule of plugin.manifest.notifications ?? []) {
+      const prior = byKind.get(rule.kind);
+      if (prior) {
+        throw new Error(`notification kind "${rule.kind}" is declared by both ${prior.source} and plugin:${plugin.manifest.slug} — a kind belongs to one plugin`);
+      }
+      byKind.set(rule.kind, { ...rule, source: `plugin:${plugin.manifest.slug}` });
+    }
+  }
+  for (const rule of manifest.notifications ?? []) {
+    byKind.set(rule.kind, { ...rule, source: 'workspace' });
+  }
+  return [...byKind.values()];
+}
+
 export type LoadedLearningStep = LearningStepManifest & { sourceFile: string };
 export type LoadedEvalDataset = EvalDatasetManifest & { sourceFile: string };
 /**
@@ -93,6 +124,13 @@ export type LoadedPlaybook = PlaybookManifest & {
    * override: workspace copy whole-file-replacing an activated base twin.
    */
   origin: FolderOrigin;
+  /**
+   * On an override: the SHA-256 of the body it replaces — the base or
+   * plugin twin's SKILL.md as it stands at this load. The applier keeps the
+   * one in force when the override was last edited, so a later change to the
+   * twin reads as drift (`services/plugins/configureData.ts`).
+   */
+  baseSha?: string;
 };
 
 /**
@@ -131,6 +169,8 @@ export type LoadedWorkspace = {
   workflows: LoadedWorkflow[];
   missions: LoadedMission[];
   automations: LoadedAutomation[];
+  /** Declared notification kinds, plugins' and the workspace's (`composeNotifications`). */
+  notifications: LoadedNotification[];
   trust: TrustManifest | null;
   /** The workspace's voice rules from voice.yaml, or null when unauthored. */
   voice: VoiceManifest | null;
@@ -382,6 +422,7 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
     workflows,
     missions,
     automations,
+    notifications: composeNotifications(plugins, manifest),
     trust,
     voice,
     operatingIntent,
@@ -611,7 +652,7 @@ function composeFolders(
         .filter(f => basename(f) !== 'SKILL.md' && !basename(f).startsWith('.'))
         .map(f => relative(baseFolder, f));
       const merged = new Set([...loaded.sourceFiles, ...baseSiblings]);
-      out.push({ ...loaded, origin: 'override', sourceFiles: [...merged], resources: [...merged] });
+      out.push({ ...loaded, origin: 'override', sourceFiles: [...merged], resources: [...merged], baseSha: skillBodySha(join(baseFolder, 'SKILL.md')) ?? undefined });
     } else {
       if (packEntries?.has(loaded.slug) && !isOverride) {
         throw new Error(
@@ -976,6 +1017,25 @@ function assertNamedRefs(agents: LoadedAgent[], skills: LoadedPlaybook[], playbo
   }
   if (problems.length > 0) {
     throw new Error(`unresolved references:\n  - ${problems.join('\n  - ')}`);
+  }
+}
+
+/**
+ * The SHA-256 of a SKILL.md body — the same digest `contentSha` is — or null
+ * when the file is missing or has no frontmatter. What an override's twin is
+ * compared by: the body, never the frontmatter, so a reworded description is
+ * not drift.
+ * @param file - Absolute path of a SKILL.md.
+ */
+export function skillBodySha(file: string): string | null {
+  if (!existsSync(file)) {
+    return null;
+  }
+  try {
+    const fm = parseFrontmatter(readFileSync(file, 'utf8'), file);
+    return createHash('sha256').update(fm.body, 'utf8').digest('hex');
+  } catch {
+    return null;
   }
 }
 

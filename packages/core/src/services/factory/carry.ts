@@ -115,6 +115,18 @@ async function updateRecovery(orgId: string, requestId: number, change: (s: Reco
 }
 
 /**
+ * One line on a request's own account (its Activity), from a step outside
+ * this file — a red CI's routing (`ciFailed.ts`), the pipeline reconciler.
+ * @param orgId - Tenant.
+ * @param requestId - The request.
+ * @param line - What happened, in a sentence.
+ * @param runId - The run it was about, when there is one.
+ */
+export async function noteOnRequest(orgId: string, requestId: number, line: string, runId: number | null = null): Promise<void> {
+  await updateRecovery(orgId, requestId, s => logLine(s, line, new Date().toISOString(), runId));
+}
+
+/**
  * A BLOCKER WHOSE MOVE WAS MADE IS CLEARED (#130, 2026-09-29): "approve plan
  * 136" stayed on the request as Blocked after plan 136 was approved, because
  * nothing read the blocker back when the state it named moved. The records it
@@ -427,6 +439,24 @@ async function escalate(orgId: string, request: FactoryRecord, why: string, unbl
     await linkAskGroup(orgId, priorDecided.id, priorDecided.groupKey ?? `factory-recovery:${request.id}`);
   }
   await updateRecovery(orgId, request.id, s => logLine({ ...s, stage: 'stopped', line, askId: ask.id }, `Stopped after ${s.attempts.length} attempt${s.attempts.length === 1 ? '' : 's'}: ${line} Ask #${ask.id} is with a person.`, now.toISOString()));
+  // The typed moment a person is needed (backlog 048): what the plugin's
+  // "needs a person" notification is declared on. After the ask exists, so a
+  // notification never points at a question that is not there; deduped on
+  // the request and the ask, so a sweep refreshing this stop raises nothing.
+  const { emitEvent, FACTORY_STOPPED } = await import('@/services/EventService');
+  const payload: import('@/services/EventService').FactoryStoppedPayload = {
+    requestId: request.id,
+    title: request.title,
+    askId: ask.id,
+    why: why.replace(/[.\s]+$/, ''),
+    unblock,
+    line,
+    attempts: state.attempts.length,
+    failure: failure?.class ?? null,
+  };
+  await emitEvent({ orgId, type: FACTORY_STOPPED, payload, dedupeKey: `${FACTORY_STOPPED}:${request.id}:${ask.id}`, invokedBy: `factory:${PM}`, dispatchMode: 'auto' }).catch((err) => {
+    console.warn('[factory] could not raise factory.stopped', { requestId: request.id, error: (err as Error).message });
+  });
   return line;
 }
 
@@ -527,6 +557,17 @@ export async function intakeFiledRequest(orgId: string, payload: Partial<ObjectC
   if (!request || !isOpen(request)) {
     return skip(id, 'not an open request');
   }
+  // THE SAME ASK TWICE (#265/#268, 2026-09-30): before anything is built,
+  // a model reads whether this repeats a request already on file. Linked
+  // (done for you, Undo on the record), its work is the other one's and
+  // nothing starts; below the bar nothing is said and intake carries on.
+  const { checkNewRecordForDuplicate } = await import('@/services/objects/duplicateCheck');
+  const duplicate = await checkNewRecordForDuplicate(orgId, payload);
+  if (duplicate.linked && duplicate.line) {
+    const line = duplicate.line;
+    await updateRecovery(orgId, id, s => logLine(s, line, new Date().toISOString()));
+    return { requestId: id, did: `duplicate:${duplicate.did}`, line: duplicate.line };
+  }
   const work = await workFor(orgId, id);
   if (work.tasks.length > 0 || work.waiting) {
     return skip(id, 'work already exists for it');
@@ -540,8 +581,8 @@ export async function intakeFiledRequest(orgId: string, payload: Partial<ObjectC
   if (decision.do === 'start') {
     const out = await propose(orgId, DISPATCH, { requestId: id, ...(plan ? { planId: plan.id } : {}), trigger: 'request', reason: `Started on its own: ${decision.why}.` }, {
       confidence: 0.9,
-      rationale: `Filed from a person's turn in a conversation as a fix, with its acceptance written: ${decision.why}.`,
-      reason: 'A person asked for this fix; the build starts now and Undo cancels it until a worker claims it.',
+      rationale: `A fix with its acceptance written: ${decision.why}.`,
+      reason: 'The build starts now, and Undo cancels it until a worker claims it.',
     });
     const line = !out.ok
       ? `Filed; the build could not start: ${out.error}`
@@ -981,7 +1022,20 @@ export async function resumeAfterWorkerRebuild(orgId: string, now: Date = new Da
   const { and, desc, eq, gt, isNotNull, like } = await import('drizzle-orm');
   const { db } = await import('@/libs/DB');
   const { askSchema, workerRunSchema } = await import('@/models/Schema');
-  const stops = await db.select({ id: askSchema.id, sourceRef: askSchema.sourceRef, createdAt: askSchema.createdAt }).from(askSchema).where(and(eq(askSchema.orgId, orgId), eq(askSchema.status, 'open'), like(askSchema.sourceRef, 'factory-recovery:%')));
+  const stops: Array<{ id: number | null; sourceRef: string | null; createdAt: Date | null }> = await db.select({ id: askSchema.id, sourceRef: askSchema.sourceRef, createdAt: askSchema.createdAt }).from(askSchema).where(and(eq(askSchema.orgId, orgId), eq(askSchema.status, 'open'), like(askSchema.sourceRef, 'factory-recovery:%')));
+  // A STOP WHOSE ASK IS CLOSED IS STILL A STOP (2026-09-30, "Open alerts"
+  // #124: its ask #220 was decided on 09-28, the request stayed "Stopped",
+  // and nothing would ever look at it again). Such a request joins the stops,
+  // dated by its last recovery line.
+  const withOpenAsk = new Set(stops.map(st => Number(/^factory-recovery:(\d+):/.exec(String(st.sourceRef ?? ''))?.[1])));
+  const { listBusinessObjects: listRequests } = await import('@/services/BusinessObjectService');
+  for (const r of ((await listRequests(orgId, 'request').catch(() => [])) as Array<{ id: number; metadata: unknown }>)) {
+    const state = readRecovery((r.metadata ?? {}) as Meta);
+    if (state.stage === 'stopped' && !withOpenAsk.has(r.id)) {
+      const last = state.log.at(-1)?.at;
+      stops.push({ id: null, sourceRef: `factory-recovery:${r.id}:closed-ask`, createdAt: last ? new Date(last) : null });
+    }
+  }
   if (stops.length === 0) {
     return [];
   }
@@ -1048,8 +1102,10 @@ export async function resumeAfterWorkerRebuild(orgId: string, now: Date = new Da
       continue;
     }
     await writeMeta(orgId, requestId, { workerRebuildResumedFor: rebuilt.version });
-    await supersedeAsk(orgId, stop.id, line);
-    await updateRecovery(orgId, requestId, s => logLine({ ...s, stage: s.stage === 'stopped' ? null : s.stage, askId: s.askId === stop.id ? null : s.askId, line: s.stage === 'stopped' ? null : s.line }, `${line} Ask #${stop.id} resolved itself.${dispatched.res.status === 'pending' ? ` The build is on a card for a person (action #${dispatched.res.runId}).` : ''}`, at, failed?.id ?? null));
+    if (stop.id !== null) {
+      await supersedeAsk(orgId, stop.id, line);
+    }
+    await updateRecovery(orgId, requestId, s => logLine({ ...s, stage: s.stage === 'stopped' ? null : s.stage, askId: s.askId === stop.id ? null : s.askId, line: s.stage === 'stopped' ? null : s.line }, `${line}${stop.id !== null ? ` Ask #${stop.id} resolved itself.` : ''}${dispatched.res.status === 'pending' ? ` The build is on a card for a person (action #${dispatched.res.runId}).` : ''}`, at, failed?.id ?? null));
     if (failed) {
       await recordRunLine(orgId, failed.id, line);
     }
@@ -1079,6 +1135,8 @@ export async function sweepStuckRequests(orgId: string, now: Date = new Date(), 
     console.warn('factory sweep: the stale-plan check failed', { orgId, message: err.message });
     return [];
   });
+  // A task waiting on QA with no review behind it is watched every five
+  // minutes by the reconciler (`reconcile.ts`, backlog 049), not here.
   // A replaced attempt's pull request is closed, naming what replaced it, so
   // the open PRs are the work still live (services/factory/supersededPulls.ts).
   await import('./supersededPulls').then(m => m.closeSupersededPulls(orgId)).catch((err: Error) => {

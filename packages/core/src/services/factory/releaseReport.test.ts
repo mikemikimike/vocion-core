@@ -130,11 +130,29 @@ describe('the release page', () => {
 
     const heldDown = report({ ...RELEASE, meta: { ...RELEASE.meta, announcement: 'Uploads resume.', notesSource: 'human', healthAfter: 'down' } }).announcement;
 
+    // A check informs; the press stays (principle 13).
     expect(heldDown.blocked).toContain('down');
+    expect(heldDown.publish).toEqual({ mode: 'copy' });
 
     const published = report({ ...RELEASE, meta: { ...RELEASE.meta, announcement: 'Uploads resume.', announcedAt: '2026-09-28T10:00:00Z', announcedTo: { channels: ['changelog', 'status page'] } } }).announcement;
 
     expect(published).toMatchObject({ state: 'published', action: null, publishedLine: 'Published Mon, Sep 28, 2026, 10:00 AM UTC to changelog, status page' });
+    expect(published.publish).toBeNull();
+  });
+
+  it('publishes in one press where it can: Slack with a connection, else a copy; a failed post says why', () => {
+    const approved = { ...RELEASE, meta: { ...RELEASE.meta, announcement: 'Uploads resume.', notesSource: 'human' } };
+
+    expect(report().announcement.publish).toBeNull();
+    expect(assembleReleaseReport(approved, { linked: LINKED, now: NOW, timeZone: 'UTC', announceMode: 'slack' }).announcement.publish).toEqual({ mode: 'slack' });
+
+    const failed = assembleReleaseReport({ ...approved, meta: { ...approved.meta, announceFailure: { at: '2026-09-28T09:00:00Z', error: 'Slack refused the post: not_in_channel.' } } }, { linked: LINKED, now: NOW, timeZone: 'UTC' }).announcement;
+
+    expect(failed.failure).toBe('Not published (Mon, Sep 28, 2026, 9:00 AM UTC): Slack refused the post: not_in_channel.');
+
+    const posted = assembleReleaseReport({ ...approved, meta: { ...approved.meta, announcedAt: '2026-09-28T10:00:00Z', announcedTo: { channels: ['Slack'], post: { surface: 'slack', channelId: 'C0NW', ts: '1.2', fileIds: [], media: 'blocks', runId: 88 } } } }, { linked: LINKED, now: NOW, timeZone: 'UTC' }).announcement;
+
+    expect(posted).toMatchObject({ state: 'published', publish: null, post: { surface: 'slack', runId: 88 }, failure: null });
   });
 
   it('says why an internal release needs no announcement', () => {
@@ -317,5 +335,37 @@ describe('the release notes', () => {
       lines: ['Upload a large file on a phone, lose signal, and it picks up where it stopped.', 'Internal: the worker no longer reports a skipped test as passed.'],
     });
     expect(report({ ...RELEASE, meta: { ...RELEASE.meta, notes, notesSource: 'human' } }).notes.source).toBe('human');
+  });
+});
+
+describe('the live check after the deploy (2026-09-30)', () => {
+  const LIVE_ART = [
+    ...ARTIFACTS,
+    { id: 1301, title: 'Resume banner · desktop · live', kind: 'link', role: 'qa-screenshot', url: 'https://files.example/qa/relay/resume-live.png?sig=2', md: null },
+    { id: 1302, title: 'Offline notice · desktop · live', kind: 'link', role: 'qa-screenshot', url: 'https://files.example/qa/relay/offline-live.png?sig=3', md: null },
+  ];
+  const withLive = (extra: Record<string, unknown>): PageRow => ({ ...RELEASE, meta: { ...RELEASE.meta, ...extra } });
+
+  it('is absent until a live check ran', () => {
+    expect(report().verification.live).toBeNull();
+    expect(report().announcement.image).toBeNull();
+  });
+
+  it('shows each live state with its picture, and why one was not reached', () => {
+    const page = assembleReleaseReport(withLive({
+      liveCheckedAt: '2026-09-28T08:20:00Z',
+      liveSummary: '1 of 2 live states reached',
+      liveEvidence: [
+        { taskId: 52, flow: 'Resume banner', criterion: 'The upload resumes where it stopped.', artifactId: 1301, status: 'reached' },
+        { taskId: 52, flow: 'Offline notice', criterion: 'Losing signal shows a notice.', artifactId: 1302, status: 'not_reached', reason: 'Step 3 (offline) could not run on production.' },
+      ],
+      announcementImageArtifactId: 1301,
+    }), { linked: LINKED, artifacts: LIVE_ART, now: NOW, timeZone: 'UTC' });
+    const live = page.verification.live!;
+
+    expect(live).toMatchObject({ title: 'Live check', line: '1 of 2 live states reached', tone: 'warn', href: 'https://relay.example' });
+    expect(live.shots.map(s => [s.reached, s.imageUrl])).toEqual([[true, 'https://files.example/qa/relay/resume-live.png?sig=2'], [false, 'https://files.example/qa/relay/offline-live.png?sig=3']]);
+    expect(live.shots[1]!.reason).toBe('Step 3 (offline) could not run on production.');
+    expect(page.announcement.image?.url).toBe('https://files.example/qa/relay/resume-live.png?sig=2');
   });
 });

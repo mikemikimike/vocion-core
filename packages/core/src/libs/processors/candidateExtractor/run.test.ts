@@ -7,7 +7,7 @@
  * its place only where the capture itself is the thing under test.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { instantInZone, isoInZone } from '@/libs/time/zone';
+import { dayPlus, instantInZone, isoInZone, startOfDay } from '@/libs/time/zone';
 import { createSyncBudget } from '../budget';
 
 const invoke = vi.fn();
@@ -660,6 +660,135 @@ describe('candidate extractor, one document end to end', () => {
       await run(context({ document: entry(weeklyAt23, { calendarZone: 'Nowhere/Special' }) }));
 
       expect(block()).toContain(at23(0, 'America/New_York'));
+    });
+
+    describe('says when its reading goes stale', () => {
+      const NY = 'America/New_York';
+      const onDay = (offset: number) => dayPlus(calendarToday(config.timezone), offset);
+      const at19 = (offset: number) => `DTSTART;TZID=America/New_York:${compact(onDay(offset))}T190000`;
+      const dayStart = (offset: number) => startOfDay(onDay(offset), NY);
+
+      it('half a horizon on, for a weekly entry that keeps coming inside it', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const result = await run(context({ document: entry([at19(-7), 'RRULE:FREQ=WEEKLY']) }));
+
+        expect(result.revisitAt).toEqual(dayStart(30));
+      });
+
+      it('on the day its next date past the horizon comes inside it, when that is later', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const result = await run(context({ document: entry([at19(0), 'RRULE:FREQ=WEEKLY;INTERVAL=13']) }));
+
+        expect(result.revisitAt).toEqual(dayStart(91 - 60));
+      });
+
+      it('for a series whose first date is past the horizon', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const result = await run(context({ document: entry([at19(100), 'RRULE:FREQ=WEEKLY']) }));
+
+        expect(result.revisitAt).toEqual(dayStart(40));
+      });
+
+      it('skipping a date the feed writes as a component of its own', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const result = await run(context({ document: entry([at19(0), 'RRULE:FREQ=WEEKLY;INTERVAL=13'], { overridden: [`${compact(onDay(91))}T190000`] }) }));
+
+        expect(result.revisitAt).toEqual(dayStart(182 - 60));
+      });
+
+      it('never, for a series with nothing left past the horizon', async () => {
+        invoke.mockResolvedValue(answer());
+
+        for (const rule of [`RRULE:FREQ=WEEKLY;UNTIL=${compact(onDay(-1))}`, 'RRULE:FREQ=WEEKLY;COUNT=5', `RRULE:FREQ=WEEKLY;UNTIL=${compact(onDay(20))}`]) {
+          const result = await run(context({ document: entry([at19(-70), rule]) }));
+
+          expect(result).not.toHaveProperty('revisitAt');
+        }
+      });
+
+      it('never, for a one-off entry or a page that is not a calendar entry', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const oneOff = await run(context({ document: entry([at19(3)]) }));
+        const page = await run(context());
+
+        expect(oneOff).not.toHaveProperty('revisitAt');
+        expect(page).not.toHaveProperty('revisitAt');
+      });
+
+      it('on the calendar\'s day, from the start of the run\'s own day, when the calendar\'s zone is ahead', async () => {
+        invoke.mockResolvedValue(answer());
+        const inAuckland = [`DTSTART;TZID=Pacific/Auckland:${compact(onDay(0))}T090000`, 'RRULE:FREQ=WEEKLY;INTERVAL=13'];
+
+        const result = await run(context({ document: entry(inAuckland, { calendarZone: 'Pacific/Auckland' }) }));
+
+        expect(result.revisitAt).toEqual(dayStart(91 - 60));
+      });
+
+      it('ten years on, for an interval longer than the search that has no end', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const result = await run(context({ document: entry([at19(0), 'RRULE:FREQ=WEEKLY;INTERVAL=1000']) }));
+
+        expect(result.revisitAt).toEqual(dayStart(3653));
+      });
+
+      it('a day on at the soonest, when the horizon is a single day', async () => {
+        invoke.mockResolvedValue(answer());
+        const short = candidateExtractorConfigSchema.parse({ ...config, recurrenceHorizonDays: 1 });
+
+        const weekly = await run(context({ config: short, document: entry([at19(-7), 'RRULE:FREQ=WEEKLY']) }));
+        const monthly = await run(context({ config: short, document: entry([at19(-7), 'RRULE:FREQ=MONTHLY;BYMONTHDAY=15']) }));
+
+        expect(weekly.revisitAt).toEqual(dayStart(7 - 1));
+        expect(monthly.revisitAt).toEqual(dayStart(1));
+      });
+
+      it('half a horizon on, for a rule the expander does not read, until it has plainly ended', async () => {
+        invoke.mockResolvedValue(answer());
+        const revisitFor = async (lines: string[]) => (await run(context({ document: entry(lines) }))).revisitAt;
+
+        expect(await revisitFor([at19(-40), 'RRULE:FREQ=MONTHLY;BYMONTHDAY=15'])).toEqual(dayStart(30));
+        expect(await revisitFor([at19(-40), 'RRULE:FREQ=YEARLY'])).toEqual(dayStart(30));
+        expect(await revisitFor([at19(-40), `RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=${compact(onDay(20))}`])).toEqual(dayStart(30));
+        expect(await revisitFor([at19(-40), 'RRULE:FREQ=MONTHLY;BYMONTHDAY=15;COUNT=3'])).toEqual(dayStart(30));
+        expect(await revisitFor([at19(-40), `RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=${compact(onDay(-1))}`])).toBeUndefined();
+        expect(await revisitFor([at19(-400), 'RRULE:FREQ=MONTHLY;BYMONTHDAY=15;COUNT=3'])).toBeUndefined();
+      });
+
+      it('reads a floating UNTIL, which the expander refuses, by its day', async () => {
+        invoke.mockResolvedValue(answer());
+        const revisitFor = async (until: string) => (await run(context({ document: entry([at19(-40), `RRULE:FREQ=WEEKLY;UNTIL=${until}`]) }))).revisitAt;
+
+        expect(await revisitFor(`${compact(onDay(400))}T235959`)).toEqual(dayStart(30));
+        expect(await revisitFor(`${compact(onDay(-1))}T235959`)).toBeUndefined();
+      });
+
+      it('half a horizon on, for an entry with a rule of its own that the reader gives up on', async () => {
+        invoke.mockResolvedValue(answer());
+
+        const excluded = await run(context({ document: entry([at19(-7), 'RRULE:FREQ=WEEKLY', 'EXRULE:FREQ=WEEKLY;INTERVAL=2']) }));
+        const twice = await run(context({ document: entry([at19(-7), 'RRULE:FREQ=WEEKLY;BYDAY=MO', 'RRULE:FREQ=WEEKLY;BYDAY=TH']) }));
+        const ended = await run(context({ document: entry([at19(-70), `RRULE:FREQ=WEEKLY;UNTIL=${compact(onDay(-2))}`, 'EXRULE:FREQ=WEEKLY;INTERVAL=2']) }));
+
+        expect(excluded.revisitAt).toEqual(dayStart(30));
+        expect(twice.revisitAt).toEqual(dayStart(30));
+        expect(ended).not.toHaveProperty('revisitAt');
+      });
+
+      it('even when the model answer is unusable, which still counts as finished', async () => {
+        invoke.mockResolvedValue({ content: 'I could not read that page.' });
+
+        const result = await run(context({ document: entry([at19(-7), 'RRULE:FREQ=WEEKLY']) }));
+
+        expect(result.counts).toMatchObject({ model_invalid: 1 });
+        expect(result.retry).toBeUndefined();
+        expect(result.revisitAt).toEqual(dayStart(30));
+      });
     });
 
     it('gets no block unless it is a split calendar component', async () => {

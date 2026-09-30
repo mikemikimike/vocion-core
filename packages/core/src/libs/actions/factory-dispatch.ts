@@ -353,8 +353,9 @@ export function higherRisk(a: string, b: string | null): string {
  * @param input.previous
  * @param input.resume - The attempt this one continues from ({@link pickResumeBase}): its branch is the base, its verdict the brief.
  * @param input.note - What the person pressing Build (or the factory's recovery) asks of this attempt.
+ * @param input.reported - What the person sent in the chat the request was filed from (`reported.reportedLinks`).
  */
-export function deriveContract(input: { given: Meta; request: Meta & { title?: string } | null; plan: Meta | null; repo: Meta | null; previous?: { id: number; meta: Meta } | null; resume?: { id: number; meta: Meta } | null; note?: string }): Meta {
+export function deriveContract(input: { given: Meta; request: Meta & { title?: string } | null; plan: Meta | null; repo: Meta | null; previous?: { id: number; meta: Meta } | null; resume?: { id: number; meta: Meta } | null; note?: string; reported?: ReadonlyArray<{ title: string; url: string; file: string | null }> }): Meta {
   const g = input.given;
   const r = input.request ?? {};
   const p = input.plan ?? {};
@@ -465,11 +466,16 @@ export function deriveContract(input: { given: Meta; request: Meta & { title?: s
     ? `\n\nThe last attempt (task #${prev.id}${str(prev.meta, 'prUrl') ? `, ${str(prev.meta, 'prUrl')}` : ''}) was sent back by ${(prevVerdict as { heldBy?: string }).heldBy === 'person' ? 'the person who merges' : 'QA'}: ${String(prevVerdict.note ?? 'changes asked').replace(/^A person held the merge: /, '')}${owed.length > 0 ? `\nProve each of these with evidence a reviewer can open (a named test, a screenshot of that exact state):\n${owed.map(c => `- ${c.criterion}${c.evidence ? ` (QA: ${c.evidence})` : ''}`).join('\n')}` : ''}`
     : '';
   const asked = input.note ? `\n\nFor this attempt: ${input.note}` : '';
+  // WHAT THE PERSON SAW (Chris, 2026-09-30, #268): what they sent in the chat
+  // it was filed from, as links the engineer opens before changing anything.
+  const reported = (input.reported ?? []).length > 0
+    ? `\n\nWhat the person reported (open each to see what they saw):\n${input.reported!.map(r => `- ${r.title}: ${r.file ?? r.url}${r.file ? ` (${r.url})` : ''}`).join('\n')}`
+    : '';
   const resumeProven = resume ? (resume.meta.verdict as { proven?: number; total?: number } | undefined) : undefined;
   const continued = resume
     ? `\n\nThis attempt continues branch ${String(resume.meta.branch)} (task #${resume.id}, ${resumeProven?.proven ?? 0} of ${resumeProven?.total ?? '?'} criteria proven). Keep what is proven; change only what the open criteria need.`
     : '';
-  const objective = (str(g, 'objective') ?? [str(r, 'outcome'), str(p, 'approach')].filter(Boolean).join(' ')) + carried + continued + asked;
+  const objective = (str(g, 'objective') ?? [str(r, 'outcome'), str(p, 'approach')].filter(Boolean).join(' ')) + reported + carried + continued + asked;
   // A ui change is refused without a QA flow (the worker screenshots it
   // before and after). The request says where it lives; that page is the flow.
   const visuals = (r.visuals ?? {}) as Meta;
@@ -494,6 +500,10 @@ export function deriveContract(input: { given: Meta; request: Meta & { title?: s
     title: str(g, 'title') ?? (typeof r.title === 'string' ? r.title : null),
     objective: objective || null,
     ...(input.previous ? { previousTaskId: input.previous.id } : prev ? { previousTaskId: prev.id } : {}),
+    // What was asked of THIS attempt, kept apart from the objective it rides
+    // in, so the run page says it in one line (`RunWhy`). Task metadata only:
+    // `contractFromTask` names the worker's fields and never sends it.
+    ...(input.note ? { attemptNote: input.note.slice(0, 1000) } : {}),
     ...(resume ? { baseSha: String(resume.meta.branch), attempt: (Number(resume.meta.attempt) || 1) + 1, resumedFrom: resume.id } : {}),
     acceptanceContract: acceptance,
     allowedPaths: paths,
@@ -601,7 +611,9 @@ async function loadAll(ctx: ActionContext, input: z.infer<typeof dispatchInput>)
     : null;
   if (!stored && request) {
     const { latest: previous, resume } = await sentBackTask(ctx.orgId, request.id, plan ? plan.id : null, plan ? str(plan.meta, 'approvedAt') : null);
-    const meta = deriveContract({ given: (input.contract ?? {}) as Meta, request: { ...request.meta, title: request.title }, plan: plan?.meta ?? null, repo, previous, resume, note: input.note });
+    const { reportedLinks } = await import('@/services/objects/reported');
+    const reported = await reportedLinks(ctx.orgId, request.id).catch(() => []);
+    const meta = deriveContract({ given: (input.contract ?? {}) as Meta, request: { ...request.meta, title: request.title }, plan: plan?.meta ?? null, repo, previous, resume, note: input.note, reported });
     task = { id: 0, title: String(meta.title ?? request.title), typeId: 0, typeSlug: 'engineering_task', meta: { ...meta, requestId: request.id } };
   }
   return { task, plan, request, repo };
@@ -722,6 +734,20 @@ export type EarlierStart = { id: number; status: string; executedAt: Date | null
  * @param opts.now - The clock.
  */
 export function underwayRefusal(earlier: readonly EarlierStart[], opts: { trigger?: string | null; now?: Date } = {}): string | null {
+  const u = underwayNow(earlier, opts);
+  return u ? `already building: ${u.line}. Nothing new was started — follow that run.` : null;
+}
+
+/**
+ * What is already happening for this request, as a line a person reads and
+ * the worker run to follow, or null (the positive half of the guard: a start
+ * of something already running is answered, not refused).
+ * @param earlier - The request's earlier starts, newest first.
+ * @param opts - What is asking.
+ * @param opts.trigger - The new start's trigger.
+ * @param opts.now - The clock.
+ */
+export function underwayNow(earlier: readonly EarlierStart[], opts: { trigger?: string | null; now?: Date } = {}): { line: string; workerRunId: number | null } | null {
   const now = (opts.now ?? new Date()).getTime();
   for (const run of earlier) {
     // A plan's own build continues the start that asked for the plan, even
@@ -729,19 +755,19 @@ export function underwayRefusal(earlier: readonly EarlierStart[], opts: { trigge
     // planning, the plan was approved two minutes later, and its build was
     // refused as "already building: run #5335 is starting it").
     if (IN_FLIGHT_RUN_STATUSES.includes(run.status) && opts.trigger !== 'plan') {
-      return `already building: run #${run.id} is starting it now. Nothing new was started — follow that run.`;
+      return { line: `run #${run.id} is starting it now`, workerRunId: null };
     }
     if (run.status !== 'done' || !run.result) {
       continue;
     }
     const workerRunId = Number(run.result.workerRunId);
     if (Number.isInteger(workerRunId) && workerRunId > 0 && run.workerStatus && BUILDING_WORKER_STATUSES.includes(run.workerStatus)) {
-      return `already building: run #${workerRunId} (started by action #${run.id}) is ${run.workerStatus}. Nothing new was started — follow that run, or stop it before starting another.`;
+      return { line: `run #${workerRunId} (started by action #${run.id}) is ${run.workerStatus}`, workerRunId };
     }
     if (run.result.planning === true && opts.trigger !== 'plan' && run.executedAt && now - run.executedAt.getTime() < PLANNING_HOLD_MS) {
       const minutes = Math.max(0, Math.round((now - run.executedAt.getTime()) / 60_000));
       const why = typeof run.result.why === 'string' ? ` (${run.result.why})` : '';
-      return `already building: run #${run.id} started it ${minutes === 0 ? 'under a minute' : `${minutes} min`} ago and it is planning first${why}. Nothing new was started — the plan's approval starts the build.`;
+      return { line: `run #${run.id} started it ${minutes === 0 ? 'under a minute' : `${minutes} min`} ago and it is planning first${why}; the plan's approval starts the build`, workerRunId: null };
     }
   }
   return null;
@@ -859,6 +885,14 @@ export const factoryDispatchAction: Action<typeof dispatchInput> = {
   ownsDedupKey: true,
   internalInput: ['trigger', 'recoveryOfRun', 'recoveryClass', 'autoRetryOf', 'planFirst', 'replan'],
   policyKeyFor: input => (input.autoRetryOf ? `${DISPATCH_ACTION_ID}.retry` : input.trigger ? `${DISPATCH_ACTION_ID}.${TRIGGER_KEY[input.trigger]}` : DISPATCH_ACTION_ID),
+  // Already building, planning or starting: answered with the run, never refused.
+  async underway(ctx, input) {
+    if (!input.requestId) {
+      return null;
+    }
+    const u = underwayNow(await earlierStarts(ctx.orgId, input.requestId), { trigger: input.trigger });
+    return u ? { line: u.line, href: u.workerRunId ? `/dashboard/p/runs/${u.workerRunId}` : null } : null;
+  },
   async precheck(ctx, input) {
     const { externalWorkersEnabled } = await import('@/services/WorkerRunService');
     if (!externalWorkersEnabled()) {

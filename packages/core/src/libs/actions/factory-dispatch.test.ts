@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { contractFromTask, contractGaps, deriveContract, factoryDispatchAction, fitName, higherRisk, pathsFromComponents, pickResumeBase, riskFromPaths, underwayRefusal } from './factory-dispatch';
+import { contractFromTask, contractGaps, deriveContract, factoryDispatchAction, fitName, higherRisk, pathsFromComponents, pickResumeBase, riskFromPaths, underwayNow, underwayRefusal } from './factory-dispatch';
 
 // The engineering_task record as the worker's contract (snake_case), and what
 // stops a task from being started. Every name and path below is invented.
@@ -79,6 +79,18 @@ describe('a contract from the records alone', () => {
       'Prove each of these with evidence a reviewer can open (a named test, a screenshot of that exact state):',
       '- The dialog names the file types. (QA: no screenshot of the open dialog)',
       '- Closing a request stops uploads.',
+    ]);
+  });
+
+  it('lists what the person reported in chat, so the engineer opens what they saw (Chris, 2026-09-30, #268)', () => {
+    const reported = [{ title: 'header-overflow.png', url: 'https://app.northwind.example/dashboard/artifacts/88', file: 'https://app.northwind.example/api/artifacts/o-88/header-overflow.png' }];
+    const c = deriveContract({ given: {}, request, plan, repo, reported });
+
+    expect(String(c.objective).split('\n')).toEqual([
+      'Send a link to upload a file to you. Surface what exists.',
+      '',
+      'What the person reported (open each to see what they saw):',
+      '- header-overflow.png: https://app.northwind.example/api/artifacts/o-88/header-overflow.png (https://app.northwind.example/dashboard/artifacts/88)',
     ]);
   });
 
@@ -373,5 +385,15 @@ describe('a plan\'s own build is never refused as a second start (#201, 2026-09-
 
     expect(underwayRefusal(executing, { trigger: 'plan' })).toBeNull();
     expect(underwayRefusal(executing, { trigger: 'recovery' })).toMatch(/^already building: run #5335/);
+  });
+});
+
+describe('a start of something already running is answered, not refused (conversation 394, 2026-09-30)', () => {
+  it('names the worker run to follow', () => {
+    const building = [{ id: 5381, status: 'done', executedAt: new Date(), result: { workerRunId: 432 }, workerStatus: 'queued' }];
+
+    expect(underwayNow(building)).toEqual({ line: 'run #432 (started by action #5381) is queued', workerRunId: 432 });
+    expect(underwayRefusal(building)).toBe('already building: run #432 (started by action #5381) is queued. Nothing new was started — follow that run.');
+    expect(underwayNow([])).toBeNull();
   });
 });

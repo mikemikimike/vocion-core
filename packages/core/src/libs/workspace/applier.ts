@@ -1,11 +1,11 @@
-import type { LoadedAgent, LoadedAutomation, LoadedEvalDataset, LoadedLearningStep, LoadedMission, LoadedObjectType, LoadedPlaybook, LoadedSource, LoadedTeam, LoadedWorkflow, LoadedWorkspace } from './loader';
+import type { LoadedAgent, LoadedAutomation, LoadedEvalDataset, LoadedLearningStep, LoadedMission, LoadedNotification, LoadedObjectType, LoadedPlaybook, LoadedSource, LoadedTeam, LoadedWorkflow, LoadedWorkspace } from './loader';
 import type { KnownProcessorNames, SourceUpsertSpec } from '@/libs/sources/upsert';
 import { readFileSync } from 'node:fs';
 import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { addressOnDomain, defaultMailboxAddress, mailDomain } from '@/libs/mail/mailbox';
 import { canonical, reconcileSourceSchedules, storedProcessorNames, upsertSourceRow, validateSourceSpec } from '@/libs/sources/upsert';
-import { agentSchema, automationSchema, businessObjectTypeSchema, evalDatasetSchema, evalEvaluatorSchema, memoryNamespaceSchema, missionSchema, playbookSchema, projectSchema, teamSchema, trustRuleSchema, userSchema, workflowSchema, workspaceVersionSchema } from '@/models/Schema';
+import { agentSchema, automationSchema, businessObjectTypeSchema, evalDatasetSchema, evalEvaluatorSchema, memoryNamespaceSchema, missionSchema, notificationRuleSchema, playbookSchema, projectSchema, teamSchema, trustRuleSchema, userSchema, workflowSchema, workspaceVersionSchema } from '@/models/Schema';
 import { AGENT_DEFAULT_SCOPE_SLUG, setCentsLimits } from '@/services/BudgetService';
 import { deriveRole } from './hierarchy';
 import { effectiveTeamSlug } from './teams';
@@ -48,6 +48,8 @@ export type ApplyResult = {
     workflows: ResourceCounts;
     missions: ResourceCounts;
     automations: ResourceCounts;
+    /** Declared notification kinds (`notifications:` in plugin.yaml / workspace.yaml). */
+    notifications: ResourceCounts;
     playbooks: ResourceCounts;
     learningSteps: ResourceCounts;
     evalDatasets: ResourceCounts;
@@ -154,6 +156,7 @@ export async function applyWorkspace(loaded: LoadedWorkspace, opts: ApplyOptions
     workflows: blank(),
     missions: blank(),
     automations: blank(),
+    notifications: blank(),
     playbooks: blank(),
     learningSteps: blank(),
     evalDatasets: blank(),
@@ -257,6 +260,17 @@ export async function applyWorkspace(loaded: LoadedWorkspace, opts: ApplyOptions
     }
   }
 
+  // Notification kinds: few, declared, stored as the rows the event bus
+  // matches (backlog 048). A kind the workspace stopped declaring is
+  // disabled below with the other retired rows, never left notifying.
+  for (const rule of loaded.notifications ?? []) {
+    try {
+      bump(counts.notifications, await upsertNotificationRule(orgId, rule, mode));
+    } catch (err) {
+      errors.push({ resource: 'notification', slug: rule.kind, message: (err as Error).message });
+    }
+  }
+
   // WHAT THE WORKSPACE NO LONGER SHIPS IS RETIRED, NOT LEFT RUNNING.
   //
   // Until 2026-09-24 the applier only ever added and updated: an agent, a
@@ -322,6 +336,23 @@ export async function applyWorkspace(loaded: LoadedWorkspace, opts: ApplyOptions
       }
     } catch (err) {
       errors.push({ resource: 'automation', slug: '(retire sweep)', message: (err as Error).message });
+    }
+    try {
+      const declared = (loaded.notifications ?? []).map(n => n.kind);
+      const retired = await db
+        .update(notificationRuleSchema)
+        .set({ status: 'disabled', updatedAt: new Date() })
+        .where(and(
+          eq(notificationRuleSchema.orgId, orgId),
+          ne(notificationRuleSchema.status, 'disabled'),
+          declared.length > 0 ? notInArray(notificationRuleSchema.kind, declared) : undefined,
+        ))
+        .returning({ kind: notificationRuleSchema.kind });
+      for (const row of retired) {
+        warnings.push({ resource: 'notification', slug: row.kind, message: 'no longer declared — this kind notifies nobody now' });
+      }
+    } catch (err) {
+      errors.push({ resource: 'notification', slug: '(retire sweep)', message: (err as Error).message });
     }
   }
   if (!mode.offline) {
@@ -1354,6 +1385,55 @@ async function upsertAutomation(orgId: string, automation: LoadedAutomation, mod
 }
 
 /**
+ * Store one declared notification kind. The whole manifest entry is the
+ * `config` the event bus matches on; `label`, `event`, `status` and `source`
+ * are lifted out for the settings page and the lookup index.
+ * @param orgId - Tenant.
+ * @param rule - The declared kind and the layer it came from.
+ * @param mode - Dry run / offline.
+ */
+async function upsertNotificationRule(orgId: string, rule: LoadedNotification, mode: ApplyMode): Promise<UpsertOutcome> {
+  const { source, status, ...config } = rule;
+  const payload = {
+    orgId,
+    kind: rule.kind,
+    label: rule.label,
+    description: rule.description ?? null,
+    event: rule.event,
+    status,
+    source,
+    config,
+  };
+  if (mode.offline) {
+    return 'unknown';
+  }
+  const [existing] = await db
+    .select()
+    .from(notificationRuleSchema)
+    .where(and(eq(notificationRuleSchema.orgId, orgId), eq(notificationRuleSchema.kind, rule.kind)));
+  if (!existing) {
+    if (!mode.dryRun) {
+      await db.insert(notificationRuleSchema).values(payload);
+    }
+    return 'created';
+  }
+  if (
+    existing.label === payload.label
+    && (existing.description ?? null) === payload.description
+    && existing.event === payload.event
+    && existing.status === payload.status
+    && existing.source === payload.source
+    && canonical(existing.config) === canonical(payload.config)
+  ) {
+    return 'unchanged';
+  }
+  if (!mode.dryRun) {
+    await db.update(notificationRuleSchema).set({ ...payload, updatedAt: new Date() }).where(eq(notificationRuleSchema.id, existing.id));
+  }
+  return 'updated';
+}
+
+/**
  * Say which automations in this workspace are under a person's pause.
  *
  * `upsertAutomation` never writes the pause columns, so the pause survives
@@ -1397,6 +1477,32 @@ async function reportPausedAutomations(orgId: string, loaded: LoadedWorkspace, w
   }
 }
 
+/**
+ * The base an override is measured against. A new override, or one whose own
+ * body changed, takes its twin's body as it stands now — whoever edited it
+ * last saw that version. An unchanged override keeps the base already on its
+ * row, so a later change to the plugin's copy shows up as drift. Anything
+ * that is not an override has no base.
+ * @param existing - The stored row, when there is one.
+ * @param existing.origin
+ * @param existing.contentSha
+ * @param existing.frontmatter
+ * @param next - What this apply loaded.
+ */
+export function overrideBaseSha(
+  existing: { origin: string; contentSha: string; frontmatter: unknown } | null,
+  next: Pick<LoadedPlaybook, 'origin' | 'contentSha' | 'baseSha'>,
+): string | undefined {
+  if (next.origin !== 'override') {
+    return undefined;
+  }
+  const kept = (existing?.frontmatter as { baseSha?: unknown } | null)?.baseSha;
+  if (existing && existing.origin === 'override' && existing.contentSha === next.contentSha && typeof kept === 'string') {
+    return kept;
+  }
+  return next.baseSha;
+}
+
 async function upsertPlaybook(orgId: string, pb: LoadedPlaybook, mode: ApplyMode): Promise<UpsertOutcome> {
   const payload = {
     orgId,
@@ -1429,6 +1535,14 @@ async function upsertPlaybook(orgId: string, pb: LoadedPlaybook, mode: ApplyMode
     .from(playbookSchema)
     .where(and(eq(playbookSchema.orgId, orgId), eq(playbookSchema.slug, pb.slug)));
 
+  // What an override was written against: kept from the row while the
+  // override itself is unchanged, so the plugin moving underneath it reads
+  // as drift rather than being quietly re-baselined on the next apply.
+  const baseSha = overrideBaseSha(existing ?? null, pb);
+  if (baseSha) {
+    payload.frontmatter.baseSha = baseSha;
+  }
+
   if (!existing) {
     if (!mode.dryRun) {
       await db.insert(playbookSchema).values(payload);
@@ -1437,7 +1551,8 @@ async function upsertPlaybook(orgId: string, pb: LoadedPlaybook, mode: ApplyMode
   }
 
   if (
-    existing.contentSha === payload.contentSha
+    (existing.frontmatter as { baseSha?: unknown } | null)?.baseSha === payload.frontmatter.baseSha
+    && existing.contentSha === payload.contentSha
     && existing.name === payload.name
     && existing.description === payload.description
     && existing.version === payload.version

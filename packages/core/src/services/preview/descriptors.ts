@@ -8,7 +8,7 @@ import { db } from '@/libs/DB';
 import { inspectDocument } from '@/libs/documents/sheets';
 import { parseSourcesRefId, sourcesMarkdown } from '@/libs/preview/sourcesRef';
 import { canOpenArtifact } from '@/libs/share/audience';
-import { artifactSchema, briefingSchema, conversationMessageSchema, conversationSchema, leadBriefSchema, missionRunSchema, toolCallSchema, workerRunSchema } from '@/models/Schema';
+import { agentSchema, artifactSchema, briefingSchema, conversationMessageSchema, conversationSchema, leadBriefSchema, missionRunSchema, toolCallSchema, workerRunSchema } from '@/models/Schema';
 import { findDocumentForCitation } from './documentRef';
 import { registerPreview } from './registry';
 
@@ -215,8 +215,14 @@ async function resolveObject(ref: RecordRef, ctx: { orgId: string; userId: strin
       const { recordBody } = await import('@/services/objects/recordBody');
       const bodyRow = await recordBody(ctx.orgId, obj.id).catch(() => null);
       const historyLink = bodyRow ? `[History — v${bodyRow.currentVersion}](?preview=${encodeURIComponent(`record_history:${obj.id}`)})` : '';
+      // WHERE IT IS, at the top — the same three lines its page draws, for
+      // a record whose type has a report page. A status that cannot be read
+      // leaves the preview as it was rather than failing it.
+      const { loadRecordStatus } = await import('@/services/objects/recordStatus');
+      const status = await loadRecordStatus(ctx.orgId, obj.id).catch(() => null);
       return {
         ref,
+        ...(status?.ok ? { status: status.status } : {}),
         title: obj.title,
         sourceLabel: obj.type?.label ?? 'Record',
         facts: facts(...parts.facts, obj.status && { label: 'Status', value: obj.status }, bodyRow && { label: 'Version', value: `v${bodyRow.currentVersion}` }),
@@ -474,8 +480,12 @@ registerPreview('worker_run', {
     const stoppedAt = typeof progress.phase === 'string' ? progress.phase : null;
     const failed = ['failed', 'lost', 'cancelled'].includes(run.status);
     // The Claude Code block a stopped run carries — the same one its run page prints.
-    const { workerRunAttach } = await import('@/services/runs/RunLogService');
+    const { readRunGlance, workerRunAttach } = await import('@/services/runs/RunLogService');
     const attach = await workerRunAttach(run);
+    // What the pane draws: the run page's own header, why-line, Now line and
+    // steps without their logs (`RunGlanceView`). The text below stays for a
+    // surface that reads a preview as text.
+    const glance = await readRunGlance(ctx.orgId, String(run.id)).catch(() => null);
     const text = [
       failed ? `**Stopped${stoppedAt ? ` at ${stoppedAt}` : ''}** — ${run.error ? run.error.split('\n')[0]!.slice(0, 300) : 'the run ended without saying why'}` : null,
       input.task?.objective ? `**Objective** — ${input.task.objective}` : null,
@@ -489,11 +499,14 @@ registerPreview('worker_run', {
     ].filter(Boolean).join('\n\n');
     return {
       ref,
-      title: input.task?.task_id ?? `Engineering run ${run.id}`,
+      // The feature's name, as the run page's title — never the worker's task id.
+      title: glance?.header.title ?? input.task?.task_id ?? `Engineering run ${run.id}`,
       sourceLabel: 'Run',
       href: `/dashboard/p/runs/${run.id}`,
+      ...(glance ? { run: glance } : {}),
       facts: facts(
         { label: 'Run', value: `#${run.id}` },
+        input.task?.task_id && { label: 'Task', value: input.task.task_id },
         { label: 'Status', value: run.status },
         stoppedAt && { label: failed ? 'Stopped at' : 'Stage', value: stoppedAt },
         { label: 'Agent', value: run.agentSlug },
@@ -671,6 +684,56 @@ registerPreview('record_history', {
         { label: 'Versions', value: String(history.versions.length) },
       ),
       ...body(lines.join('\n')),
+    };
+  },
+});
+
+/**
+ * An agent — `agent:<slug>`. What a seat on a Configure page, a roster or an
+ * org chart points at: who it is, where it sits, what it runs on and what it
+ * mounts, with its own page one click away. A peek, so it carries no prompt
+ * and no controls: the agent's page is where it is changed.
+ */
+registerPreview('agent', {
+  sourceLabel: 'Agent',
+  href: ref => `/dashboard/agents/${encodeURIComponent(ref.id)}`,
+  resolve: async (ref, ctx) => {
+    const [agent] = await db
+      .select({
+        slug: agentSchema.slug,
+        name: agentSchema.name,
+        description: agentSchema.description,
+        eyebrow: agentSchema.eyebrow,
+        role: agentSchema.role,
+        team: agentSchema.team,
+        model: agentSchema.model,
+        harnessConfig: agentSchema.harnessConfig,
+        skillSlugs: agentSchema.skillSlugs,
+        playbookSlugs: agentSchema.playbookSlugs,
+        active: agentSchema.active,
+      })
+      .from(agentSchema)
+      .where(and(eq(agentSchema.orgId, ctx.orgId), eq(agentSchema.slug, ref.id)))
+      .limit(1);
+    if (!agent) {
+      return null;
+    }
+    const skills = agent.skillSlugs ?? [];
+    const playbooks = agent.playbookSlugs ?? [];
+    return {
+      ref,
+      title: agent.name,
+      sourceLabel: 'Agent',
+      ...(agent.eyebrow ? { subtitle: agent.eyebrow } : {}),
+      facts: facts(
+        { label: 'Role', value: agent.role === 'lead' ? 'Lead' : 'Specialist' },
+        agent.team ? { label: 'Team', value: agent.team } : null,
+        { label: 'Model', value: agent.harnessConfig?.model ?? agent.model ?? '' },
+        skills.length > 0 ? { label: 'Skills', value: skills.join(', ') } : null,
+        playbooks.length > 0 ? { label: 'Playbooks', value: playbooks.join(', ') } : null,
+        String(agent.active) !== 'true' ? { label: 'State', value: 'Inactive' } : null,
+      ),
+      ...body(agent.description),
     };
   },
 });

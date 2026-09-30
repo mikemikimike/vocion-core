@@ -3,7 +3,7 @@ import type { AddDocumentLinkInput, CreateBusinessObjectInput, CreateObjectTypeI
 import { and, eq } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { businessObjectSchema, businessObjectTypeSchema, objectDocumentLinkSchema } from '@/models/Schema';
-import { announceObjectCreated } from '@/services/objects/objectCreated';
+import { announceObjectCreated, originMeta } from '@/services/objects/objectCreated';
 import { recomputeRollupsForObject } from '@/services/objects/rollups';
 
 /* ------------------------------------------------------------------ */
@@ -100,7 +100,8 @@ export const createBusinessObject = async (
       typeId: objType.id,
       title: input.title,
       status: input.status ?? 'active',
-      metadata: input.metadata ?? {},
+      // A record asked for in a conversation says so, in the same write.
+      metadata: withOrigin(input.metadata ?? {}, originMeta(origin ? { conversationId: origin.conversationId, userId: origin.actor ?? userId } : null)),
       createdBy: userId,
     })
     .returning();
@@ -120,6 +121,12 @@ export const createBusinessObject = async (
   }
 
   if (obj) {
+    // What the person sent in that conversation is the record's evidence (`reported.ts`).
+    const asked = originMeta(origin ? { conversationId: origin.conversationId } : null);
+    if (asked) {
+      const { linkReportedAttachments } = await import('@/services/objects/reported');
+      await linkReportedAttachments(orgId, obj.id, asked.conversationId).catch(() => undefined);
+    }
     await announceObjectCreated(orgId, obj, input.typeSlug, origin ?? { source: 'service', actor: userId });
   }
   return obj;
@@ -457,3 +464,12 @@ export const linkExternalRecord = async (
 
   return updated ?? null;
 };
+
+/**
+ * A record's metadata with where it came from, unless it already says.
+ * @param meta - The metadata as given.
+ * @param origin - Where it came from (`originMeta`), or null.
+ */
+function withOrigin(meta: Record<string, unknown>, origin: ReturnType<typeof originMeta>): Record<string, unknown> {
+  return origin && !(meta.origin && typeof meta.origin === 'object') ? { ...meta, origin } : meta;
+}

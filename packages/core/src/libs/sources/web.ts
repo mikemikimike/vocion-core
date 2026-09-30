@@ -1096,11 +1096,11 @@ function icsEndsOn(block: string[], zone?: string): string | undefined {
  * @param fallbackZone - the zone an all-day or floating start runs in.
  */
 export function icsRecurrence(lines: string[], fallbackZone = 'UTC'): { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; allDay: boolean } | undefined {
-  const rules = icsProperties(lines, 'RRULE').filter(p => p.own);
-  if (rules.length !== 1 || icsProperties(lines, 'EXRULE').some(p => p.own)) {
+  const rules = icsOwnValues(lines, 'RRULE');
+  if (rules.length !== 1 || icsOwnValues(lines, 'EXRULE').length > 0) {
     return undefined;
   }
-  const rule = rules[0]!.value;
+  const rule = rules[0]!;
   const unfolded = unfoldIcs(lines);
   const startLine = unfolded.find(line => /^DTSTART[;:]/i.test(line));
   const read = startLine ? icsInstants(startLine, fallbackZone) : undefined;
@@ -1240,6 +1240,16 @@ function icsProperties(lines: string[], name: string): IcsProperty[] {
     out.push({ value: value.trim(), own: open.length === 1, guessed });
   }
   return out;
+}
+
+/**
+ * Every value of one property the component carries itself, never a nested
+ * alarm's.
+ * @param lines - the component's lines, as written or as the model reads them.
+ * @param name - the property name, uppercase.
+ */
+export function icsOwnValues(lines: string[], name: string): string[] {
+  return icsProperties(lines, name).filter(p => p.own).map(p => p.value);
 }
 
 /**

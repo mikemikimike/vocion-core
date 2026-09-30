@@ -1,11 +1,15 @@
+import type { ReactNode } from 'react';
 import type { DotTone } from '@/components/patterns';
+import type { RecordStatus } from '@/libs/factory/liveStatus';
+import type { RelatedItem } from '@/libs/workspace/related';
 import type { FeatureReport, LiveBuild, ReportAction, ReportAttempt, ReportEvidence, ReportNotice, ReportStatus, Tone } from '@/services/factory/featureReport';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Section, StatusDot } from '@/components/patterns';
+import { Related, Section, StatusDot } from '@/components/patterns';
 import { buttonVariants } from '@/components/ui/buttonVariants';
-import { LiveRefresh } from '@/features/dashboard/LiveRefresh';
 import { PreviewPanel } from '@/features/preview/PreviewPanel';
+import { liveTopic } from '@/libs/live/topics';
+import { featureStatusOf } from '@/services/factory/featureReport';
 import { FeatureActivity } from './FeatureActivity';
 import { FeatureBuild, FeatureHeadline } from './FeatureBuild';
 import { FeatureDismiss } from './FeatureDismiss';
@@ -13,6 +17,7 @@ import { FeatureDrawerLink } from './FeatureDrawerLink';
 import { LocalDate } from './LocalDate';
 import { MediaCarousel } from './MediaCarousel';
 import { RunRow } from './RunRow';
+import { WorkStatus } from './WorkStatus';
 
 /**
  * The feature page, drawn for the person who owns the outcome (Chris,
@@ -44,6 +49,7 @@ const DOT_TONE: Record<Tone, DotTone> = { ok: 'pass', warn: 'amber', bad: 'fail'
 /** What this evidence is FOR, in the reader's words rather than the field's. */
 const ROLE_WORD: Record<string, string> = {
   'proposed': 'Proposed',
+  'reported': 'Reported',
   'shipped': 'After',
   'qa-screenshot': 'Screenshot',
   'qa-video': 'Video',
@@ -164,9 +170,10 @@ function WatchTheBuild({ live }: { live: LiveBuild }) {
  * report column once clipped it to two grey specks (2026-09-23).
  * @param props - The context bits.
  * @param props.bits - Short facts, in reading order.
+ * @param props.end - What closes the line: the record's version chip.
  */
-export function ReportContextLine({ bits }: { bits: readonly string[] }) {
-  if (bits.length === 0) {
+export function ReportContextLine({ bits, end }: { bits: readonly string[]; end?: ReactNode }) {
+  if (bits.length === 0 && !end) {
     return null;
   }
   return (
@@ -177,8 +184,30 @@ export function ReportContextLine({ bits }: { bits: readonly string[] }) {
           {bit}
         </span>
       ))}
+      {end && (
+        <span className="flex items-center gap-2">
+          {bits.length > 0 && <span aria-hidden className="text-border">·</span>}
+          {end}
+        </span>
+      )}
     </p>
   );
+}
+
+/**
+ * How the feature page re-reads itself, or null when there is nothing to
+ * follow and nothing running: when anything the page is made of changes —
+ * its tasks, their runs, its cards, asks and evidence — pushed on the live
+ * stream, so the Now line and the stage move without a reload or a poll. The
+ * record itself is followed by the route's VersionWatch. While the stream is
+ * down it polls every 5s, only while something runs. The version chip
+ * carries it (`versions/VersionChip`).
+ * @param report - The report.
+ */
+export function reportLiveRefresh(report: Pick<FeatureReport, 'live' | 'timeline' | 'follow' | 'requestId'>): { everyMs: number; follow: string[]; poll: boolean } | null {
+  const moving = report.live !== null || report.timeline.some(e => e.live);
+  const followed = (report.follow ?? []).filter(t => t !== liveTopic.record(report.requestId));
+  return followed.length > 0 || moving ? { everyMs: 5000, follow: followed, poll: moving } : null;
 }
 
 /**
@@ -229,41 +258,44 @@ function ActionButton({ action, report, primary, children }: { action: ReportAct
 }
 
 /**
- * WHERE IT IS, AND THE ONE MOVE. One or two sentences — what is known, and
- * what is not established — and one action that follows the state.
+ * WHERE IT IS: the stage, then You, Now, Next (Chris, 2026-09-30: "so I
+ * understand when I'm waiting. What's next. What's running."). The same
+ * three lines the chat, the preview pane and the Work row draw
+ * (`WorkStatus`). The stage keeps its one sentence while nothing runs — what
+ * is known and what is not; while something runs, the Now line says it, and
+ * opens the run. The move sits on the You line when it is a person's; any
+ * other move follows the lines.
  * @param props
  * @param props.report - The report.
+ * @param props.status - The three lines, as the page's route read them.
  */
-function StatusBlock({ report }: { report: FeatureReport }) {
+function StatusBlock({ report, status }: { report: FeatureReport; status: RecordStatus }) {
   const s: ReportStatus = report.status;
   const secondary = s.secondary === null
     ? null
     : s.secondary.kind === 'dismiss'
       ? <FeatureDismiss requestId={report.requestId} />
       : <ActionButton action={s.secondary} report={report} primary={false} />;
+  // The move that IS the running run ("Watch the plan being written") is
+  // the Now line already; drawn twice it would be two ways to one place.
+  const moveIsLive = s.action?.kind === 'link' && report.live !== null && s.action.href === report.live.runHref;
+  const actions = s.action && !moveIsLive
+    ? s.action.kind === 'build'
+      ? <ActionButton action={s.action} report={report} primary>{secondary}</ActionButton>
+      : (
+          <>
+            <ActionButton action={s.action} report={report} primary />
+            {secondary}
+          </>
+        )
+    : null;
+  const yours = report.state.needsYou && actions !== null;
   return (
     <section id="report-state" data-testid="report-status" aria-label="Current state" className="space-y-3">
-      {/* THE CURRENT STATE, said once, and the run carrying it as a row
-          that opens it (Chris, 2026-09-29: "is that 'current state'?"). */}
       <div className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">Current state</div>
-      <FeatureHeadline requestId={report.requestId} tone={DOT_TONE[s.tone]} headline={s.headline} sentence={s.sentence} />
-      {s.activeRun && (
-        <div className="-mx-2 max-w-prose" data-testid="report-active-run">
-          <RunRow attempt={s.activeRun.attempt} of={s.activeRun.of} testId="report-active-run-row" />
-        </div>
-      )}
-      {s.action && (
-        <div className="flex flex-wrap items-center gap-2">
-          {s.action.kind === 'build'
-            ? <ActionButton action={s.action} report={report} primary>{secondary}</ActionButton>
-            : (
-                <>
-                  <ActionButton action={s.action} report={report} primary />
-                  {secondary}
-                </>
-              )}
-        </div>
-      )}
+      <FeatureHeadline requestId={report.requestId} tone={DOT_TONE[s.tone]} headline={s.headline} sentence={report.live ? '' : s.sentence} />
+      <WorkStatus status={status} hideStage youAction={yours ? <span className="flex flex-wrap items-center gap-2">{actions}</span> : undefined} className="max-w-prose" />
+      {!yours && actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       {report.notices.length > 0 && <Notices notices={report.notices} requestId={report.requestId} />}
     </section>
   );
@@ -563,7 +595,14 @@ function StickyAction({ report }: { report: FeatureReport }) {
   );
 }
 
-export function FeatureReportView({ report }: { report: FeatureReport }) {
+/**
+ * @param props
+ * @param props.report - The assembled report.
+ * @param props.status - Its three lines as the route read them (the record's own page href). Absent, read off the report here.
+ * @param props.related
+ */
+export function FeatureReportView({ report, status, related = [] }: { report: FeatureReport; status?: RecordStatus; related?: readonly RelatedItem[] }) {
+  const lines = status ?? featureStatusOf(report, { objectType: '', href: '' }, new Date());
   const visuals = report.sections.find(x => x.key === 'visuals');
   const today = report.sections.find(x => x.key === 'today');
   // THE BEST REAL PICTURE LEADS: what shipped, then the product today, then a
@@ -581,7 +620,9 @@ export function FeatureReportView({ report }: { report: FeatureReport }) {
     <div className="max-w-4xl space-y-8 overflow-x-hidden">
       {/* One pane for every drawer on this page, and for every peek. */}
       <PreviewPanel />
-      {report.timeline.some(e => e.live) && <LiveRefresh everyMs={5000} />}
+      {/* The re-read — pushed on the live stream for what the page is made
+          of, polled every 5s while it is down and something runs — rides the
+          version chip in the title's metadata line (`reportLiveRefresh`). */}
 
       {/* 1 + 2. THE INTRODUCTION, THEN WHERE IT IS. The title, subtitle and
           context line are the route's title bar; the story is a short plain
@@ -602,7 +643,7 @@ export function FeatureReportView({ report }: { report: FeatureReport }) {
             )}
           </div>
         )}
-        <StatusBlock report={report} />
+        <StatusBlock report={report} status={lines} />
       </div>
 
       {/* 3. WHAT IT LOOKS LIKE — the gallery, as it was. */}
@@ -610,6 +651,15 @@ export function FeatureReportView({ report }: { report: FeatureReport }) {
 
       {/* 4. CONNECTED WORK — compact; the whole list opens in the pane. */}
       {(report.activity?.length ?? 0) > 0 && <FeatureActivity items={report.activity!} requestId={report.requestId} />}
+
+      {/* RELATED — what it is connected to: the chat that started it, its
+          plan, tasks, runs, pull requests and releases (`relatedOf`). */}
+      {related.length > 0 && (
+        <section id="report-related" aria-labelledby="report-related-heading" data-testid="feature-related">
+          <h2 id="report-related-heading" className="text-xs font-medium tracking-wide text-muted-foreground uppercase">Related</h2>
+          <Related items={related} className="mt-1" />
+        </section>
+      )}
 
       {/* 5–9. Each stage in a few lines, the full record one tap away. */}
       <div>

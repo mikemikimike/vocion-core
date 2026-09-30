@@ -3,12 +3,14 @@
 import type { DashboardLinkKind } from './links';
 import type { AgentRun, ChatMessage, ConversationAutonomy, IndexedDocument } from './types';
 import type { FollowExclude, TurnToolStep } from '@/libs/chat/turnFollowups';
+import type { TurnRecord } from '@/libs/factory/liveStatus';
 import { AlertCircle, ArrowUpRight, Bot, ClipboardCheck, FileText, FolderOpen, Gauge, Inbox, LayoutDashboard, MessageSquare, Newspaper, Rocket, Target, Users } from 'lucide-react';
 import { memo, useMemo, useState } from 'react';
 import Markdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ConfidenceIndicator } from '@/components/ui/confidence-indicator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { RecordMicrocard } from '@/features/dashboard/factory/WorkStatus';
 import { openPreview } from '@/features/preview/previewState';
 import { normalizeAnswerHtml, stripCardNotes } from '@/libs/chat/answerText';
 import { splitScratch } from '@/libs/chat/scratch';
@@ -96,7 +98,33 @@ export type AgentMessageProps = {
   conversationId?: number | null;
   /** The page's own record: never a follow chip (it refreshes itself). */
   pageRecord?: FollowExclude | null;
+  /** The newest turn in the thread — the only one that carries record microcards. */
+  latest?: boolean;
+  /** The records the thread is about (`useThreadRecords`), drawn under the newest turn beside what it did itself. */
+  threadRecords?: TurnRecord[];
 };
+
+/** How many microcards the newest turn carries at most. */
+const MICROCARDS_SHOWN = 3;
+
+/**
+ * The newest turn's microcards: what it filed or changed itself, then what
+ * the thread is about — one per record, less the page's own record, at most
+ * {@link MICROCARDS_SHOWN}.
+ * @param own - The turn's `turn_records`.
+ * @param thread - The thread's records.
+ * @param pageRecord - The page's own record, which shows itself.
+ */
+export function microcardsOf(own: readonly TurnRecord[], thread: readonly TurnRecord[], pageRecord?: FollowExclude | null): TurnRecord[] {
+  const out: TurnRecord[] = [];
+  for (const r of [...own, ...thread]) {
+    const onPage = pageRecord?.type === 'object' && pageRecord.id === String(r.id);
+    if (!onPage && !out.some(o => o.id === r.id)) {
+      out.push(r);
+    }
+  }
+  return out.slice(0, MICROCARDS_SHOWN);
+}
 
 function formatTime(ts: number | undefined): string {
   if (!ts) {
@@ -177,16 +205,22 @@ function turnEndingMarker(status: ChatMessage['status']): string | null {
   return null;
 }
 
-export const AgentMessage = memo(({ message, timestamp, agentName, onShowSources, onCitationClick, streaming = false, activity, onFeedback, via, viaReason, onOpenArtifact, conversationId, pageRecord }: AgentMessageProps) => {
+export const AgentMessage = memo(({ message, timestamp, agentName, onShowSources, onCitationClick, streaming = false, activity, onFeedback, via, viaReason, onOpenArtifact, conversationId, pageRecord, latest = false, threadRecords }: AgentMessageProps) => {
   const elapsed = useElapsed(streaming);
   const runs: AgentRun[] = message.runs
     ?? (message.content ? [{ type: 'text', text: message.content }] : []);
   const sourceCount = message.documents?.length ?? message.citationCount ?? 0;
-  // What the turn set moving, less the page's own record and the artifacts
-  // the row already shows.
+  // THE MICROCARDS: one line per record the turn filed or changed, on the
+  // newest turn only, less the page's own record (it shows itself). Each
+  // replaces that record's plain follow chip — one shape per record.
+  // The turn's own records come first (they carry what a change wrote), then
+  // the thread's — one per record, at most three.
+  const microcards = useMemo(() => (latest && !streaming ? microcardsOf(message.records ?? [], threadRecords ?? [], pageRecord) : []), [latest, streaming, message.records, threadRecords, pageRecord]);
+  // What the turn set moving, less the page's own record, the artifacts the
+  // row already shows and the records a microcard already draws.
   const follow = useMemo(() => turnFollowups(message.runs as TurnToolStep[] | undefined, {
-    exclude: [...(pageRecord ? [pageRecord] : []), ...(message.artifacts ?? []).map(a => ({ type: 'artifact', id: String(a.id) }))],
-  }), [message.runs, message.artifacts, pageRecord]);
+    exclude: [...(pageRecord ? [pageRecord] : []), ...(message.artifacts ?? []).map(a => ({ type: 'artifact', id: String(a.id) })), ...microcards.map(r => ({ type: 'object', id: String(r.id) }))],
+  }), [message.runs, message.artifacts, pageRecord, microcards]);
   // A failure is a failure whether it arrived as a legacy run or as a typed
   // trace node — #368 persists the latter, and the badge has to find both.
   // A step a later step of the same kind recovered from is not a failure of
@@ -479,6 +513,11 @@ export const AgentMessage = memo(({ message, timestamp, agentName, onShowSources
               artifacts, then each run, record or ask its steps started,
               followed live (Chris, 2026-09-29). Not while it streams: a
               chip for a step still running would be a claim. */}
+          {microcards.length > 0 && (
+            <div className="-mx-2 mt-3 space-y-0.5" data-testid="turn-record-microcards">
+              {microcards.map(r => <RecordMicrocard key={r.id} record={r} />)}
+            </div>
+          )}
           {((message.artifacts?.length ?? 0) > 0 || (!streaming && follow.length > 0)) && (
             <ArtifactChips artifacts={message.artifacts ?? []} follow={streaming ? [] : follow} onOpen={onOpenArtifact} />
           )}

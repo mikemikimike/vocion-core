@@ -1079,6 +1079,34 @@
       "when": 1790800560986,
       "tag": "0153_rest_many_credentials",
       "breakpoints": true
+    },
+    {
+      "idx": 154,
+      "version": "7",
+      "when": 1790744948477,
+      "tag": "0154_app_login_many_credentials",
+      "breakpoints": true
+    },
+    {
+      "idx": 155,
+      "version": "7",
+      "when": 1790900000000,
+      "tag": "0155_live_notice",
+      "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1790900060000,
+      "tag": "0156_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1790900120000,
+      "tag": "0157_processor_revisit_at",
+      "breakpoints": true
     }
   ]
 }

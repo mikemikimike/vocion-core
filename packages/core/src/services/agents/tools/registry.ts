@@ -45,6 +45,7 @@ import { findScreenshotsTool } from './findScreenshots';
 import { freshenSourceTool } from './freshenSource';
 import { generateImageTool } from './generateImage';
 import { getBrandTool } from './getBrand';
+import { githubCheckLogsTools } from './githubCheckLogs';
 import { gmailTools } from './gmailThread';
 import { requestHumanReviewTool } from './hitl';
 import { hubspotCatalogTools } from './hubspotCatalog';
@@ -67,6 +68,7 @@ import { updateMissionNotesTool } from './missionNotes';
 import { pageContextTool } from './pageContext';
 import { personalizationTools } from './personalization';
 import { posthogCountTools } from './posthogCounts';
+import { productAccessTools } from './productAccess';
 import { proposeActionTool } from './proposeAction';
 import { readObjectTools } from './readObject';
 import { recommendActionTool } from './recommendAction';
@@ -181,6 +183,12 @@ function baseDomainTools(ctx: RuntimeContext): StructuredToolInterface[] {
     // Granted-only: QA's verdict on a pull request, bound to its head, and the
     // merge card on approve — one call, so the review cannot end unrecorded.
     ...recordVerdictTools(ctx),
+    // Granted-only: a product's production URLs and QA sign-in (never the
+    // password, which only the worker reads, over the API).
+    ...productAccessTools(ctx),
+    // Granted-only: what CI said on a pull request or an Actions run — failing
+    // checks, annotations, the failing step's log tail (backlog 049).
+    ...githubCheckLogsTools(ctx),
     listLearningStepsTool(ctx),
     getLearningsTool(ctx),
     checkLearningDedupTool(ctx),

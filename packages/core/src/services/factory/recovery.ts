@@ -544,6 +544,16 @@ export function intakeDecision(input: { meta: Record<string, unknown>; origin: {
   const kind = str(m.kind)?.toLowerCase() ?? null;
   const severity = str(m.severity)?.toLowerCase() ?? null;
   const fix = kind === 'bug' || kind === 'incident' || severity === 'p1';
+  // A RED DEFAULT BRANCH IS FIXED WITHOUT A CARD (backlog 049). The factory
+  // filed it on GitHub's own evidence (`ciFailed.ts`), listing the pull
+  // requests it blocks; every one of them waits on it, so a tap in front of
+  // the build only lengthens the wait. The build still goes through QA and the
+  // merge's own trust rule, and Undo cancels it until a worker claims it.
+  const pipelineFix = m.pipelineFix && typeof m.pipelineFix === 'object' && !Array.isArray(m.pipelineFix) ? m.pipelineFix as Record<string, unknown> : null;
+  if (fix && pipelineFix && str(pipelineFix.repo)) {
+    const blocks = Array.isArray(pipelineFix.blocks) ? pipelineFix.blocks.length : 0;
+    return { do: 'start', why: `${str(pipelineFix.branch) ?? 'the default branch'} of ${str(pipelineFix.repo)} is red, and ${blocks} pull request${blocks === 1 ? ' waits' : 's wait'} on it` };
+  }
   if (fix && input.origin.conversationId && input.origin.byPerson) {
     const what = [kind, severity?.toUpperCase()].filter(Boolean).join(', ');
     return { do: 'start', why: `a person asked for this fix in conversation #${input.origin.conversationId} (${what}, ${acceptance.length} acceptance criteri${acceptance.length === 1 ? 'on' : 'a'})` };
@@ -806,4 +816,23 @@ export function replanBrief(failure: Failure): string {
  */
 export function attemptsOf(state: Pick<RecoveryState, 'attempts'>, kind: RecoveryEntry['kind']): number {
   return state.attempts.filter(a => a.kind === kind).length;
+}
+
+/**
+ * Which automatic attempt one run was, counted the way the feature page
+ * counts (`recoveryStage`: this stage's attempts against its limit), so a run
+ * page and its feature never read two counters — #435 read "Attempt 2 of 2"
+ * (every run of the feature) while its feature read "Recovering (attempt 2 of
+ * 3)" (2026-09-30). Null for a run the recovery did not send: a build a
+ * person started is where the count begins, not one of its attempts.
+ * @param state - The request's recovery state (`readRecovery`).
+ * @param runId - The run.
+ */
+export function attemptOfRun(state: Pick<RecoveryState, 'attempts' | 'limit'>, runId: number): { n: number; of: number } | null {
+  const entry = state.attempts.find(a => a.runId === runId);
+  if (!entry) {
+    return null;
+  }
+  const upTo = state.attempts.slice(0, state.attempts.indexOf(entry) + 1);
+  return { n: attemptsOf({ attempts: upTo }, entry.kind), of: state.limit };
 }

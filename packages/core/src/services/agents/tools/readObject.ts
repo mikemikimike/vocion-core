@@ -21,10 +21,13 @@
 
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RuntimeContext } from '../types';
+import type { WorkFacts } from '@/libs/factory/workFacts';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
+import { nowLine } from '@/libs/factory/liveStatus';
 import { getBusinessObject } from '@/services/BusinessObjectService';
 import { readRecovery } from '@/services/factory/recovery';
+import { loadRecordStatus } from '@/services/objects/recordStatus';
 
 /**
  * THE RECORD'S HISTORY, COUNTED, AT THE TOP.
@@ -67,6 +70,54 @@ export function recoverySummary(meta: Record<string, unknown>): Record<string, u
   };
 }
 
+/**
+ * The delivery facts as an agent reads them: each on its own typed field, with
+ * the line it reads as (`libs/factory/workFacts.ts`, backlog 044). A finished
+ * run is not a merge, a merge is not a release, and "not reported" is not a
+ * pass — each field says only what its record says.
+ * @param f - The report's facts.
+ */
+function factsForAgent(f: WorkFacts): Record<string, unknown> {
+  return {
+    request: { id: f.request.id, stage: f.request.stage, recordState: f.request.recordState, line: f.request.line },
+    attempt: f.taskId === null ? null : { taskId: f.taskId },
+    verdict: { value: f.verdict.value, proven: f.verdict.proven, total: f.verdict.total, line: f.verdict.line },
+    pullRequest: { url: f.pullRequest.url, merge: f.pullRequest.merge, line: f.pullRequest.line },
+    ci: { state: f.ci.state, failedChecks: f.ci.failedChecks, line: f.ci.line },
+    mergeRule: { runsItself: f.mergeRule.runsItself, riskClass: f.mergeRule.riskClass, line: f.mergeRule.line },
+    shipped: f.shipped,
+    next: f.next,
+  };
+}
+
+/**
+ * The record's three-line status for an agent: the stage, whether it needs a
+ * person, what is running (as a line and as the run), and what is next — and
+ * the delivery facts under it.
+ * @param orgId - Tenant.
+ * @param id - The record.
+ */
+export async function liveStatusOf(orgId: string, id: number): Promise<Record<string, unknown> | null> {
+  try {
+    const read = await loadRecordStatus(orgId, id);
+    if (!read.ok) {
+      return null;
+    }
+    const s = read.status;
+    return {
+      stage: s.stage.label,
+      you: s.you.line,
+      ...(s.you.why ? { why: s.you.why } : {}),
+      now: nowLine(s.live, new Date(s.readAt)),
+      ...(s.live ? { run: { label: s.live.runLabel, href: s.live.runHref, since: s.live.startedAt } } : {}),
+      next: s.next,
+      ...(s.facts ? { facts: factsForAgent(s.facts) } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function readObjectTool(ctx: RuntimeContext) {
   const readable = ctx.objectTypeSlugs;
   return tool(
@@ -89,12 +140,24 @@ export function readObjectTool(ctx: RuntimeContext) {
       // comes counted, up front (`recoverySummary`).
       const meta = (row.metadata ?? {}) as Record<string, unknown>;
       const summary = recoverySummary(meta);
+      // WHERE IT IS NOW, the same read its page draws (parity rule): for a
+      // record whose type has a report page, You / Now / Next. A status that
+      // cannot be read is left off rather than failing the read.
+      const live = await liveStatusOf(ctx.orgId, row.id);
+      // A field the type derives from other records (`x-derived`) reads as
+      // those records say, the same value its page shows; a stored value
+      // that disagrees comes back as drift, never in its place.
+      const { derivedFieldsOf } = await import('@/services/objects/related');
+      const derived = await derivedFieldsOf(ctx.orgId, row.id).catch(() => ({ values: {}, drift: {} }));
       return JSON.stringify({
         id: row.id,
         title: row.title,
         status: row.status,
+        ...(live ? { liveStatus: live } : {}),
         ...(summary ? { recoverySummary: summary } : {}),
         ...meta,
+        ...derived.values,
+        ...(Object.keys(derived.drift).length > 0 ? { derivedDrift: derived.drift } : {}),
       });
     },
     {

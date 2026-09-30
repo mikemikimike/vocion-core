@@ -21,6 +21,13 @@ schema:
   # When a question about a request stops being a question (backlog 039): a
   # Review item asking about one closes itself once the request ends here.
   x-settled: {field: state, in: [shipped, answered, out_of_scope, deferred]}
+  # THE SAME ASK TWICE (core: services/objects/duplicateCheck.ts, backlog 044).
+  # #268 was filed from chat a minute after #265 asked for the same thing and
+  # got its own Build card. Now, when a request is filed, a model reads the
+  # product's open requests (and ones closed in the last two weeks) and, sure
+  # at the bar, links it with `duplicateOf`, done for you with Undo; the
+  # intake starts nothing for it. Below the bar nothing is written or said.
+  x-duplicate-check: {field: duplicateOf, within: [product], compare: [outcome, story, body], bar: 0.8, settledDays: 14}
   # WHO ANSWERS ON ITS PAGE (core: services/agents/router.ts pageOwnerDecision).
   # A chat opened on a request's page is the product manager's, whatever the
   # message's keywords score, unless the person names another agent
@@ -38,6 +45,16 @@ schema:
     dedupOn: [product, title]
     fields: [product, kind, outcome, story, body, acceptance, mainRisk, visuals, whyNote, gapCheck, why, severity, sizeClass, surface, askedBy, evidence, icp, source, theme, tags, expectedResult, howWeCheck]
     omit: [acceptance.met, acceptance.evidenceUrl, acceptance.checkedAt, visuals.beforeArtifactIds, visuals.mockupArtifactIds, visuals.afterArtifactIds, visuals.drawnArtifactId]
+  # RELATED (core: libs/workspace/related.ts): what a request is connected
+  # to, read from what the records already say. The chat that started it
+  # (first) and its artifacts are core's own; these are the factory's.
+  x-related:
+    - {key: product, label: Product, from: links, field: product, type: product, match: slug}
+    - {key: plans, label: Plan, from: backlinks, type: architecture_plan, field: requestId}
+    - {key: tasks, label: Engineering tasks, from: backlinks, type: engineering_task, field: requestId}
+    - {key: runs, label: Engineering runs, from: runs, of: tasks}
+    - {key: pulls, label: Pull requests, from: url, field: prUrl, of: tasks}
+    - {key: releases, label: Releases, from: backlinks, type: release, field: requestIds}
   properties:
     kind:
       x-display: {label: Kind, format: badge, group: Triage, tones: {bug: bad, incident: bad, gap: warn, idea: info, question: muted}}
@@ -178,7 +195,7 @@ schema:
         beforeArtifactIds: {type: array, items: {type: integer}, description: 'The screen as it is today — the real screenshot a mockup is drawn on. Written by draw_mockup, never by hand. (On a record from before mockupArtifactIds existed it holds the mockups, and is read that way.)'}
         mockupArtifactIds: {type: array, items: {type: integer}, description: 'What we propose to build: the same real screen with only the change drawn in, one image per state worth seeing (at rest, hover, confirmation). Written by draw_mockup — which also writes beforeArtifactIds — never by hand, so a decision is made against the real app rather than an invented one (request #224, 2026-09-29). A flow diagram for a flow change goes here too.'}
         afterArtifactIds: {type: array, items: {type: integer}, description: 'What shipped, captured from the running product. GIF and video later; a still is enough to close.'}
-        surfaceUrl: {type: string, description: 'Where on the live product this can be seen — and, once it has shipped, where the after-shot was captured. One link, because they are the same place, and a shot nobody can check against the real thing is decoration.'}
+        surfaceUrl: {type: string, description: 'The path on the live product where this can be seen (e.g. /account). The host comes from the product''s production environment, never from here: a full URL whose host is not one of the product''s environments is read as its path on the product.'}
         noVisualReason: {type: string, description: 'Why this user-facing change carries no visual. Recorded rather than assumed, so the gap is a decision somebody made and not an omission nobody noticed.'}
         drawnArtifactId: {type: integer, description: 'The picture the PLATFORM drew from the record (services/factory/proposalVisual.ts) — a diagram of the shape of the change, kept current on every write. It is what a card shows when nobody has filed a real mockup, and it never satisfies the mockup gate: a drawing derived from the record is not evidence of a proposed experience, so `no mock` stays on the row until Design files one or `noVisualReason` says why not (review, 2026-09-24).'}
     acceptance:

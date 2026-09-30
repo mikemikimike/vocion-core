@@ -236,7 +236,7 @@ describe('the action follows the state', () => {
     await expect.element(page.getByTestId('feature-dismiss')).toBeInTheDocument();
   });
 
-  it('never draws Build over a live run: the current state names the run as a row that opens it (Chris, 2026-09-29)', async () => {
+  it('never draws Build over a live run: the Now line names the run and opens it (Chris, 2026-09-29/30)', async () => {
     await page.viewport(1440, 900);
     await draw(proposal({
       tasks: [{ id: 77, title: 'Room PDF export', status: 'running', createdAt: T('2026-09-03T09:00:00Z'), meta: { requestId: 41 } }],
@@ -247,12 +247,18 @@ describe('the action follows the state', () => {
     // The row is the move: no second "View progress" button beside it.
     expect(document.querySelector('[data-testid="report-primary-action"]')).toBeNull();
 
-    const row = page.getByTestId('report-active-run-row');
+    // The Now line says what runs, its step, and opens the run (2026-09-30).
+    const now = page.getByTestId('work-status-now');
 
-    await expect.element(row).toHaveTextContent('Running');
-    await expect.element(row).toHaveTextContent('Run #503');
-    await expect.element(row).toHaveTextContent('attempt 1 of 1');
-    expect(row.element().getAttribute('data-preview-key')).toBe('worker_run:503');
+    await expect.element(now).toHaveTextContent('Engineer building');
+    await expect.element(now).toHaveTextContent('Running the checks');
+    await expect.element(page.getByTestId('work-status-you')).toHaveTextContent('Nothing needs you');
+    await expect.element(page.getByTestId('work-status-next')).toHaveTextContent('QA checks it');
+
+    const run = page.getByTestId('work-status-run');
+
+    await expect.element(run).toHaveTextContent('Run #503');
+    expect(run.element().getAttribute('data-preview-key')).toBe('worker_run:503');
     await expect.element(page.getByTestId('report-status')).toHaveTextContent('Current state');
     // The Implementation lists the live run as a row too.
     expect(document.querySelector('[data-testid="report-runs"] [data-run-row="503"][data-live="true"]')).not.toBeNull();
@@ -281,7 +287,7 @@ describe('the action follows the state', () => {
 
     await page.getByTestId('feature-build').click();
 
-    await expect.element(page.getByTestId('report-headline')).toHaveTextContent('Building');
+    await expect.element(page.getByTestId('report-headline')).toHaveTextContent('Waiting for a worker');
     await expect.element(page.getByTestId('report-status-sentence')).toHaveTextContent('Queued for the engineer just now.');
 
     await page.getByRole('button', { name: 'Undo' }).click();
@@ -387,8 +393,71 @@ describe('the pieces that carried over', () => {
     expect(srcs.indexOf(png(92))).toBeLessThan(srcs.indexOf(png(93)));
   });
 
+  it('shows what the person reported in chat as the screen before, not "Preview pending" (Chris, 2026-09-30, #268)', async () => {
+    await page.viewport(1440, 900);
+    const shot = '/api/artifacts/o-88/header-overflow.png';
+    await draw(fixture({
+      request: { id: 41, title: 'Fix header width overflow on mobile', status: 'new', createdAt: T('2026-09-30T08:05:00Z'), meta: { surface: 'ui', state: 'in_scope', product: 'northwind-portal' } },
+      tasks: [],
+      workerRuns: [],
+      artifacts: [
+        { id: 88, kind: 'file', title: 'header-overflow.png', recordType: 'object', recordId: '41', recordRole: 'reported', spec: { contentType: 'image/png' }, url: shot, createdAt: T('2026-09-30T08:00:00Z') },
+      ],
+    }));
+
+    expect(document.querySelector('[data-testid="report-preview-pending"]')).toBeNull();
+
+    const slide = document.querySelector('[data-testid="report-slide"]');
+
+    expect(slide?.querySelector('img')?.getAttribute('src')).toBe(shot);
+
+    const said = document.querySelector('[data-testid="report-carousel"]')?.textContent ?? '';
+
+    expect(said).toContain('Reported');
+    expect(said).toContain('Screenshot from chat');
+    expect(said).toContain('header-overflow.png');
+  });
+
   it('says a missing plan in plain words', () => {
     expect(plainWarning('The plan rule required a plan for this work and none is on the record. 1 worker run ran anyway.')).toBe('This feature was built without the required plan.');
     expect(plainWarning('Two releases claim this request. The second has no commit.')).toBe('Two releases claim this request.');
+  });
+});
+
+describe('where it started and what it is connected to (Chris, 2026-09-30, #269)', () => {
+  it('leads its Activity with the chat it was requested in, and draws Related with that chat first', async () => {
+    await page.viewport(1440, 900);
+    const report = {
+      ...fixture(),
+      activity: [
+        { kind: 'conversation' as const, id: 812, title: 'Requested in chat by Dana Okafor', at: T('2026-09-01T09:00:00Z'), status: null, detail: 'Board pack as a PDF', origin: true },
+        { kind: 'worker_run' as const, id: 435, title: 'Room PDF export', at: T('2026-09-03T10:00:00Z'), status: 'running', detail: null },
+      ],
+    };
+    await render(
+      <div className="px-6 py-4">
+        <FeatureReportView
+          report={report}
+          related={[
+            { key: 'o', relation: 'origin', label: 'Started in chat', title: 'Board pack as a PDF', href: '/dashboard/chat?c=812', external: false, preview: { type: 'conversation', id: '812' }, kind: 'conversation', note: 'Dana Okafor', at: null },
+            { key: 'p', relation: 'plans', label: 'Plan', title: '#52 Render the room to PDF', href: '/dashboard/objects/52', external: false, preview: { type: 'object', id: '52' }, kind: 'record', note: null, at: null },
+          ]}
+        />
+      </div>,
+    );
+
+    await expect.element(page.getByTestId('feature-activity')).toHaveTextContent(/^Activity/);
+
+    const first = document.querySelector('[data-testid="activity-row"]');
+
+    expect(first?.getAttribute('data-origin')).toBe('true');
+    expect(first?.textContent).toContain('Requested in chat by Dana Okafor · Board pack as a PDF');
+
+    const labels = [...document.querySelectorAll('[data-testid="feature-related"] dt')].map(d => d.textContent);
+
+    expect(labels).toEqual(['Started in chat', 'Plan']);
+    await expect.element(page.getByRole('link', { name: 'Board pack as a PDF' })).toHaveAttribute('href', '/dashboard/chat?c=812');
+
+    closePreview();
   });
 });

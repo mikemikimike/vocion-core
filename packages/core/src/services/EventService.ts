@@ -176,6 +176,35 @@ export const PLAN_APPROVED = 'plan.approved';
  */
 export const FACTORY_PLAN_REQUESTED = 'factory.plan_requested';
 
+/**
+ * The factory stopped on a request and put ONE question in front of a person
+ * — the moment the feature page's You line reads "Needs you" (`carry.ts`
+ * `escalate`: `recovery.stage` becomes `stopped` with its ask). Raised once
+ * per stop, after the ask exists, deduped on the request and the ask, so the
+ * sweep re-filing the same stop raises nothing twice. The software-factory
+ * plugin declares its "needs a person" notification on it.
+ */
+export const FACTORY_STOPPED = 'factory.stopped';
+
+/** Payload of `factory.stopped`. Scalars, which `when.filter` compares with `===`. */
+export type FactoryStoppedPayload = {
+  requestId: number;
+  /** The request's title, as the feature page names it. */
+  title: string;
+  /** The ask that is with a person. */
+  askId: number;
+  /** What stopped it, one sentence. */
+  why: string;
+  /** What would unblock it, one clause. */
+  unblock: string;
+  /** Both, as the request's Activity line reads. */
+  line: string;
+  /** Automatic attempts since a person last acted. */
+  attempts: number;
+  /** The failure class, when a run's failure stopped it; null otherwise. */
+  failure: string | null;
+};
+
 /** Payload of `artifact.saved`. Scalars only — `when.filter` compares with `===`. */
 export type ArtifactSavedPayload = {
   artifactId: number;
@@ -261,6 +290,14 @@ export type ReleaseLinkedPayload = {
   /** The requests it closes and the tasks it shipped. Not filterable; read them off the payload. */
   requestIds: number[];
   taskIds: number[];
+  /**
+   * The shipped features by name, as a notification or a line can say them:
+   * `Light theme toggle`, `Light theme toggle and Dark mode`, `Light theme
+   * toggle and 2 more`. Null when no feature was linked.
+   */
+  headline: string | null;
+  /** `is live` for one feature, `are live` for several — so a sentence agrees with `headline`. */
+  liveVerb: 'is live' | 'are live';
 };
 
 export const LEAD_REPLIED = 'lead.replied';
@@ -647,8 +684,24 @@ export async function emitEvent(input: EmitEventInput): Promise<EmitEventResult>
         });
         triggered.push({ slug: `automation:${a.slug}`, runId: res.runId });
       }
-    } catch {
-      // Same tolerance as workflows above - one bad automation never drops the event.
+    } catch (err) {
+      // One bad automation never drops the event, and never vanishes either
+      // (2026-09-30, PR #140: the automation meant to send a red CI back to
+      // the engineer matched, threw before its run row existed, and the
+      // event's `triggered` list was empty with no trace of why; the task
+      // then sat "awaiting review" for seven hours). The failure is a run row
+      // with its error, where the fire would have been, and a log line.
+      const message = (err as Error)?.message ?? String(err);
+      console.warn('[events] an automation matched and could not start', { orgId: input.orgId, slug: a.slug, event: input.type, message });
+      const skipId = await recordSkippedFire(input.orgId, a.slug, {
+        event: input.type,
+        payload,
+        result: { kind: 'skipped', reason: 'fire_failed', detail: `matched ${input.type} and could not start: ${message}`.slice(0, 500), event: input.type, causedBy },
+        error: message,
+      }).catch(() => null);
+      if (skipId !== null) {
+        skipped.push({ slug: a.slug, automationRunId: skipId, reason: 'fire_failed' });
+      }
     }
   }
 
@@ -656,6 +709,15 @@ export async function emitEvent(input: EmitEventInput): Promise<EmitEventResult>
     .insert(eventLogSchema)
     .values({ orgId: input.orgId, type: input.type, payload, dedupeKey: input.dedupeKey ?? null, triggered, invokedBy: input.invokedBy ?? null, causedBy })
     .returning({ id: eventLogSchema.id });
+
+  // NOTIFICATIONS (backlog 048): a kind a plugin or the workspace declared
+  // for this event tells the people it names. Only declared kinds notify —
+  // an event no rule names reaches nobody. Raised past a workspace pause on
+  // purpose: a pause refuses work, and a person hearing that something
+  // stopped or shipped is not work. `notifyFromEvent` never throws; a failure
+  // is written on the rule and logged, never taken out on the event.
+  const { notifyFromEvent } = await import('@/services/notifications/rules');
+  await notifyFromEvent({ orgId: input.orgId, type: input.type, payload, eventId: row!.id, dedupeKey: input.dedupeKey ?? null });
 
   return { eventId: row!.id, deduped: false, triggered, skipped };
 }

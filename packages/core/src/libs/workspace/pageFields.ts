@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseTopic } from '@/libs/live/topics';
 
 /**
  * Workspace pages, the part that runs anywhere — the page manifest schema,
@@ -65,9 +66,12 @@ const FieldSchema = z.object({
    * `{phase, note}` object as "phase · note" (any other object as its
    * primitive entries), so coarse progress reads as a sentence, not JSON.
    * `duration` reads an integer number of seconds as "18m 25s", because a
-   * run's length is the thing being compared and `1105` is not.
+   * run's length is the thing being compared and `1105` is not. `live`
+   * reads a `{line, live}` object — what is running for the row right now
+   * (`libs/factory/liveStatus.ts`) — as that line behind a status dot that
+   * breathes while something runs.
    */
-  format: z.enum(['text', 'badge', 'score', 'date', 'mono', 'image', 'icon', 'money', 'link', 'relative', 'progress', 'steps', 'duration', 'compare', 'workload']).default('text'),
+  format: z.enum(['text', 'badge', 'score', 'date', 'mono', 'image', 'icon', 'money', 'link', 'relative', 'progress', 'steps', 'duration', 'compare', 'workload', 'live']).default('text'),
   /**
    * For `format: compare`, the figure ours is read against and who it
    * belongs to. Our price beside the incumbent's is one fact, not four
@@ -255,16 +259,29 @@ const FieldSchema = z.object({
 });
 
 /**
- * A page that stays current while someone is looking at it. The rendered
- * page re-reads its rows and stats every `every` seconds while the tab is
- * visible, and says so ("live · 12s ago"). Bounded: under 5s a page would
- * hammer the database for no reading a person could follow; over 120s it
- * is not live, it is a page you reload. One request per interval per open
- * tab is the whole cost.
+ * A page that stays current while someone is looking at it, and says so
+ * ("live · 12s ago").
+ *
+ * `follow` names what the page is made of on the workspace live stream
+ * (backlog 050): `list:<type>` for records of a type, and the feeds `runs`,
+ * `cards`, `asks`, `events`. The page re-reads the moment one of them
+ * changes, wherever it was written, and makes no polling request while the
+ * stream is up. `every` is the interval it re-reads on otherwise — alone, it
+ * is the whole mechanism; beside `follow`, it is the fallback while the
+ * stream is down (15s when omitted). Bounded: under 5s a page would hammer
+ * the database for no reading a person could follow; over 120s it is not
+ * live, it is a page you reload.
  */
 const LiveSchema = z.object({
-  every: z.number().int().min(5).max(120),
-});
+  every: z.number().int().min(5).max(120).optional(),
+  follow: z.array(z.string().refine((t) => {
+    const topic = parseTopic(t);
+    return topic !== null && (topic.kind === 'list' || topic.kind === 'feed');
+  }, { message: 'follow takes list:<type> or a feed — runs, cards, asks, events' })).min(1).max(20).optional(),
+}).refine(l => l.every !== undefined || l.follow !== undefined, { message: 'live needs every (seconds between re-reads), follow (what the page is made of), or both' });
+
+/** How often a followed page re-reads while the live stream is down, when it names no interval. */
+export const LIVE_FALLBACK_EVERY_S = 15;
 
 /**
  * `since` keeps the rows whose date field is on or after the start of a
@@ -538,6 +555,44 @@ const ReportSchema = z.object({
   subject: z.enum(['request']),
 });
 
+/**
+ * What the `configure` archetype's tabs can hold — one relation of the page's
+ * plugin each: its agents as seats, its skills and playbooks, its
+ * automations, its trust rules, what it learned from use, and its team's
+ * measures. A closed set because each is a read core owns; a plugin chooses
+ * which it shows and in what order, never what they mean.
+ */
+export const CONFIGURE_TAB_KINDS = ['seats', 'skills', 'automations', 'trust', 'learned', 'measures'] as const;
+export type ConfigureTabKind = typeof CONFIGURE_TAB_KINDS[number];
+
+/**
+ * The `configure` archetype's sidebar blocks: how it is doing (the measures,
+ * each with its direction), what needs attention (links only, absent when
+ * nothing does) and what changed recently.
+ */
+export const CONFIGURE_ASIDE_KINDS = ['health', 'attention', 'changes'] as const;
+export type ConfigureAsideKind = typeof CONFIGURE_ASIDE_KINDS[number];
+
+/**
+ * The `configure` archetype — what drives a plugin, on one page: a main
+ * block of tabs, each a hairline list with its count, and a sidebar that
+ * stacks under the tabs on a phone. Declared by the plugin's page, drawn by
+ * core's generic blocks (`features/dashboard/configure`), so a second
+ * plugin's Configure page is this descriptor and nothing else.
+ */
+export const ConfigureBlocksSchema = z.object({
+  tabs: z.array(z.object({
+    kind: z.enum(CONFIGURE_TAB_KINDS),
+    /** The tab's name, when the plugin's word for it differs ("Seats" → "Agents"). */
+    label: z.string().min(1).max(40).optional(),
+  })).min(1).default(CONFIGURE_TAB_KINDS.map(kind => ({ kind }))),
+  aside: z.array(z.object({
+    kind: z.enum(CONFIGURE_ASIDE_KINDS),
+    label: z.string().min(1).max(40).optional(),
+  })).default(CONFIGURE_ASIDE_KINDS.map(kind => ({ kind }))),
+});
+export type ConfigureBlocks = z.infer<typeof ConfigureBlocksSchema>;
+
 export const PageManifestSchema = z.object({
   slug: SlugSchema,
   title: z.string(),
@@ -568,7 +623,7 @@ export const PageManifestSchema = z.object({
    * redirects to `href`. It exists so a plugin can seat a core surface (the
    * team report) beside its own pages without duplicating it.
    */
-  archetype: z.enum(['list', 'queue', 'markdown', 'link', 'report', 'wiki']),
+  archetype: z.enum(['list', 'queue', 'markdown', 'link', 'report', 'wiki', 'configure']),
   /**
    * Whether this page carries its plugin's "How <plugin> is doing" panel.
    * On by default; a plugin with many pages keeps it on one of them (the
@@ -577,6 +632,10 @@ export const PageManifestSchema = z.object({
   pluginPanel: z.boolean().default(true),
   /** Required by `link`: the route the row opens. */
   href: z.string().min(1).optional(),
+
+  // ---- configure config ----
+  /** The `configure` archetype's tabs and sidebar — see {@link ConfigureBlocksSchema}. Omitted, every block in its default order. */
+  configure: ConfigureBlocksSchema.optional(),
 
   // ---- report config ----
   /** Required by `report` — see {@link ReportSchema}. */
@@ -801,6 +860,7 @@ export const PageManifestSchema = z.object({
   widgets: z.array(WidgetSchema).default([]),
 })
   .refine(m => m.archetype !== 'link' || m.href !== undefined, { message: 'a link page needs href — the route it opens', path: ['href'] })
+  .refine(m => m.configure === undefined || m.archetype === 'configure', { message: 'configure declares the blocks of a configure page', path: ['configure'] })
   .refine(m => m.archetype !== 'report' || m.report !== undefined, { message: 'a report page needs report.subject — the record whose story it tells', path: ['report'] })
   // A wiki is a folder of markdown pages read as pages: the source names the folder, nothing else is declared.
   .refine(m => m.archetype !== 'wiki' || (m.source !== undefined && m.source.kind === 'artifacts' && typeof m.source.folder === 'string'), { message: 'a wiki page needs source: {kind: artifacts, folder: <name>} — the folder its pages live in', path: ['source'] })

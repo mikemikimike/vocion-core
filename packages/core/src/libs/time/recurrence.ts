@@ -40,6 +40,56 @@ function until(value: string, anchorZone: string): Date | undefined {
   return Number.isNaN(at.getTime()) ? undefined : at;
 }
 
+/** A rule `expandRecurrence` reads, as it reads it. */
+type ReadRule = { freq: 'DAILY' | 'WEEKLY'; interval: number; count?: number; until?: string; byDay: string[]; wkst: number };
+
+/**
+ * A rule in the subset this file expands, or undefined for any other.
+ * @param rule - the `RRULE` value.
+ */
+export function readRule(rule: string): ReadRule | undefined {
+  const r = parts(rule);
+  const freq = r.get('FREQ');
+  if ((freq !== 'DAILY' && freq !== 'WEEKLY') || [...r.keys()].some(k => !READ_PARTS.has(k)) || ['INTERVAL', 'COUNT'].some(k => r.has(k) && !/^\d+$/.test(r.get(k)!))) {
+    return undefined;
+  }
+  const interval = Number(r.get('INTERVAL') ?? '1');
+  const count = r.has('COUNT') ? Number(r.get('COUNT')) : undefined;
+  const byDay = (r.get('BYDAY') ?? '').split(',').filter(Boolean);
+  const known = WEEKDAYS as readonly string[];
+  // Whether an UNTIL reads does not depend on the zone, so UTC stands in for the anchor's.
+  if (interval < 1 || interval > SAFETY_CAP || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !until(r.get('UNTIL')!, 'UTC')) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d)) || !known.includes(r.get('WKST') ?? 'MO')) {
+    return undefined;
+  }
+  return { freq, interval, count, until: r.get('UNTIL'), byDay, wkst: known.indexOf(r.get('WKST') ?? 'MO') };
+}
+
+/**
+ * Whether a rule, read loosely, names nothing on or after a day: an `UNTIL` by
+ * its first eight digits, or a `COUNT` run out at its longest, 31 days a
+ * period (a year for YEARLY) from the start. For a rule `expandRecurrence`
+ * does not read, so anything it cannot tell reads as still running.
+ * @param rule - the `RRULE` value.
+ * @param day - `YYYY-MM-DD`.
+ * @param start - the `DTSTART` value as written, read by its first eight digits too.
+ */
+export function ruleEndedBefore(rule: string, day: string, start = ''): boolean {
+  const r = parts(rule);
+  const eightDigits = (value: string) => /^(\d{4})(\d{2})(\d{2})/.exec(value)?.slice(1).join('-');
+  const end = eightDigits(r.get('UNTIL') ?? '');
+  if (end) {
+    return end < day;
+  }
+  const from = eightDigits(start);
+  const count = Number(r.get('COUNT'));
+  const interval = Number(r.get('INTERVAL') ?? '1');
+  if (!from || !(count > 0) || !(interval > 0)) {
+    return false;
+  }
+  const span = count * interval * (r.get('FREQ') === 'YEARLY' ? 366 : 31);
+  return Date.parse(`${from}T00:00:00Z`) + span * DAY_MS < Date.parse(`${day}T00:00:00Z`);
+}
+
 /**
  * The instants a repeating entry falls on inside a window.
  * @param input - the rule and its anchor.
@@ -52,20 +102,16 @@ function until(value: string, anchorZone: string): Date | undefined {
  * @param input.to - the window end, inclusive.
  */
 export function expandRecurrence(input: { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; from: Date; to: Date }): Date[] {
-  const r = parts(input.rule);
-  const freq = r.get('FREQ');
-  if ((freq !== 'DAILY' && freq !== 'WEEKLY') || [...r.keys()].some(k => !READ_PARTS.has(k)) || ['INTERVAL', 'COUNT'].some(k => r.has(k) && !/^\d+$/.test(r.get(k)!))) {
+  const read = readRule(input.rule);
+  if (!read) {
     return [];
   }
-  const interval = Number(r.get('INTERVAL') ?? '1');
-  const count = r.has('COUNT') ? Number(r.get('COUNT')) : undefined;
-  const end = r.has('UNTIL') ? until(r.get('UNTIL')!, input.anchorZone) : undefined;
-  const byDay = (r.get('BYDAY') ?? '').split(',').filter(Boolean);
+  const { freq, interval, count, byDay, wkst } = read;
+  const end = read.until === undefined ? undefined : until(read.until, input.anchorZone);
+  if (read.until !== undefined && !end) {
+    return [];
+  }
   const known = WEEKDAYS as readonly string[];
-  if (interval < 1 || interval > SAFETY_CAP || (count !== undefined && !(count > 0 && count <= SAFETY_CAP)) || (r.has('UNTIL') && !end) || (freq === 'DAILY' && byDay.length > 0) || byDay.some(d => !known.includes(d)) || !known.includes(r.get('WKST') ?? 'MO')) {
-    return [];
-  }
-  const wkst = known.indexOf(r.get('WKST') ?? 'MO');
   const local = isoInZone(input.start, input.anchorZone);
   const startDay = local.slice(0, 10);
   const clock = local.slice(11, 19);

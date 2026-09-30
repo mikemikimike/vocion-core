@@ -41,6 +41,10 @@
       "description": "Endpoints under /api/v1/chat-bindings."
     },
     {
+      "name": "conversations",
+      "description": "Endpoints under /api/v1/conversations."
+    },
+    {
       "name": "evals",
       "description": "Endpoints under /api/v1/evals."
     },
@@ -61,12 +65,20 @@
       "description": "Endpoints under /api/v1/learnings."
     },
     {
+      "name": "live",
+      "description": "Endpoints under /api/v1/live."
+    },
+    {
       "name": "mission-runs",
       "description": "Endpoints under /api/v1/mission-runs."
     },
     {
       "name": "missions",
       "description": "Endpoints under /api/v1/missions."
+    },
+    {
+      "name": "notifications",
+      "description": "Endpoints under /api/v1/notifications."
     },
     {
       "name": "objects",
@@ -79,6 +91,14 @@
     {
       "name": "personalization",
       "description": "Endpoints under /api/v1/personalization."
+    },
+    {
+      "name": "products",
+      "description": "Endpoints under /api/v1/products."
+    },
+    {
+      "name": "push",
+      "description": "Endpoints under /api/v1/push."
     },
     {
       "name": "reviews",
@@ -1764,6 +1784,74 @@
         ]
       }
     },
+    "/api/v1/conversations/{id}/records": {
+      "get": {
+        "operationId": "get_conversations_id_records",
+        "summary": "The records this conversation is about, newest first, at most three: every record its own actions filed, then those its latest turn read or wrote by id.",
+        "tags": [
+          "conversations"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such record in this organization. Codes: `NOT_FOUND`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "The records this conversation is about, newest first, at most three: every\nrecord its own actions filed, then those its latest turn read or wrote by\nid. Each carries its page and whether it has a live status to read\n(`GET /api/v1/objects/:id/status`). The chat draws one microcard per\nrecord under the latest turn, and it survives a reload because it is read\nfrom the records, not from the turn's events.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The id from the URL.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
     "/api/v1/evals/{slug}/model-upgrade-test": {
       "post": {
         "operationId": "post_evals_slug_model_upgrade_test",
@@ -3176,6 +3264,102 @@
         ]
       }
     },
+    "/api/v1/live": {
+      "get": {
+        "operationId": "get_live",
+        "summary": "The workspace live stream (backlog 050): Server-Sent Events carrying a small change notice — `{id, topics, ref, kind, at}` — whenever something the caller foll…",
+        "tags": [
+          "live"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success. The body is `text/event-stream`, not JSON.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error. Codes: `UNAVAILABLE`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "The workspace live stream (backlog 050): Server-Sent Events carrying a\nsmall change notice — `{id, topics, ref, kind, at}` — whenever something\nthe caller follows changes, wherever it was written (this app, another\ncontainer, the worker). A notice never carries the change itself: re-read\nthe thing through its own read (`/objects/:id/status`, a card's status, an\nartifact), so shape and permission live in one place.\n\nTopics: `record:<id>`, `list:<type slug>`, `card:<id>`, `run:<id>`,\n`mission:<id>`, `ask:<id>`, `artifact:<id>`, `notification:<userId>`, and\nthe workspace feeds `cards`, `runs`, `asks`, `events`\n(`libs/live/topics.ts`). Each one is checked: a thing outside this\nworkspace, an artifact shared only with someone else, or another\nperson's notifications is refused and named in the first event.\n\nEvents: `ready` first (`{topics, refused, transport}`), then one `notice`\nper change with its ring id as the SSE id, a `reset` when the stream could\nnot replay what a reconnecting client missed (re-read everything shown),\nand a comment every 15s. A reconnect resumes from `Last-Event-ID`; a first\nconnection may pass `since` so changes made while the page loaded arrive.\nAuth: a signed-in session or a tenant API token (`Bearer vcn_live_…`).\n\nQuery parameters:\n- `topics` — comma-separated topics to follow (at most 400).\n- `after` — resume after this notice id, when the `Last-Event-ID` header cannot be sent.\n- `since` — epoch milliseconds; replay what changed since then (a first connection, up to two minutes back).",
+        "parameters": [
+          {
+            "name": "topics",
+            "in": "query",
+            "required": false,
+            "description": "comma-separated topics to follow (at most 400).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "resume after this notice id, when the `Last-Event-ID` header cannot be sent.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "epoch milliseconds; replay what changed since then (a first connection, up to two minutes back).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/v1/mission-runs": {
       "get": {
         "operationId": "get_mission_runs",
@@ -3489,6 +3673,331 @@
             }
           }
         ]
+      }
+    },
+    "/api/v1/notifications": {
+      "get": {
+        "operationId": "get_notifications",
+        "summary": "Your notifications in this workspace, newest first — what the bell and the notifications page read.",
+        "tags": [
+          "notifications"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Your notifications in this workspace, newest first — what the bell and the\nnotifications page read. Each carries its kind (and the kind's label), the\ntitle and body, the link it opens, the record it is about, whether it is\nread, and every channel's delivery state (`sent`, `pending` with the retry\nreason, `failed` with why, `skipped` with why). `unread` is the unread\ntotal; `nextBefore` pages further back.\nAuth: dashboard session, or a tenant token (its minter's notifications).\n\nQuery parameters:\n- `unread` — `1` for unread only.\n- `limit` — page size, 1–100 (default 30).\n- `before` — only notifications older than this id (from `nextBefore`).",
+        "parameters": [
+          {
+            "name": "unread",
+            "in": "query",
+            "required": false,
+            "description": "`1` for unread only.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "page size, 1–100 (default 30).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "only notifications older than this id (from `nextBefore`).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/v1/notifications/preferences": {
+      "get": {
+        "operationId": "get_notifications_preferences",
+        "summary": "Your notification settings in this workspace: per kind, per channel on/off (a channel a kind does not name takes its default), quiet hours, and where Slack not…",
+        "tags": [
+          "notifications"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Your notification settings in this workspace: per kind, per channel on/off\n(a channel a kind does not name takes its default), quiet hours, and where\nSlack notifications go (`dm` or the workspace's `channel`). With them: the\nkinds this workspace declares (label, the event, which plugin declared it,\nwhen it last fired and whom it reached) and each channel's default and\nwhether this server can send it at all.\nAuth: dashboard session, or a tenant token (its minter's settings)."
+      },
+      "put": {
+        "operationId": "put_notifications_preferences",
+        "summary": "Change your settings; only what you send moves.",
+        "tags": [
+          "notifications"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Change your settings; only what you send moves. `channels` is\n`{ <kind>: { <channel>: true | false } }` over `in_app`, `ios`, `web`,\n`email`, `slack` (in-app is always on). `quietHours` is\n`{ start: \"22:00\", end: \"07:00\", timeZone: \"America/Los_Angeles\" }`, or\nnull for none: push, email and Slack inside them wait for the end.\n`slackTarget` is `dm` or `channel`.\nAuth: dashboard session, or a tenant token (its minter's settings).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "A JSON object. This endpoint reads its fields dynamically, so they are described in the prose above.",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notifications/read": {
+      "post": {
+        "operationId": "post_notifications_read",
+        "summary": "Mark notifications read — the ones named, or every unread one with `all: true`.",
+        "tags": [
+          "notifications"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Mark notifications read — the ones named, or every unread one with\n`all: true`. Answers how many changed; a notification already read, or\nnot yours, is not counted.\nAuth: dashboard session, or a tenant token (its minter's notifications).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "The fields this endpoint reads.",
+                "properties": {
+                  "all": {
+                    "description": "Read by this endpoint; see the description for what it must contain."
+                  },
+                  "ids": {
+                    "description": "Read by this endpoint; see the description for what it must contain."
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notifications/unread-count": {
+      "get": {
+        "operationId": "get_notifications_unread_count",
+        "summary": "How many of your notifications in this workspace are unread — the bell's badge.",
+        "tags": [
+          "notifications"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "How many of your notifications in this workspace are unread — the bell's\nbadge. Cheap enough to poll.\nAuth: dashboard session, or a tenant token (its minter's count)."
       }
     },
     "/api/v1/objects": {
@@ -3857,6 +4366,130 @@
         ]
       }
     },
+    "/api/v1/objects/{id}/announce": {
+      "get": {
+        "operationId": "get_objects_id_announce",
+        "summary": "A release's announcement as it would be published: the words, the live screenshot it leads with (`image.url`, null when the release has none) and where publish…",
+        "tags": [
+          "objects"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such record in this organization. Codes: `NOT_FOUND`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "A release's announcement as it would be published: the words, the live\nscreenshot it leads with (`image.url`, null when the release has none) and\nwhere publishing sends it (`mode`: `slack` when the workspace has a Slack\nconnection, else `copy`).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The id from the URL.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      },
+      "post": {
+        "operationId": "post_objects_id_announce",
+        "summary": "Publish a release's announcement, with its picture, to the workspace's Slack channel — `release.announce`, proposed as the caller.",
+        "tags": [
+          "objects"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Publish a release's announcement, with its picture, to the workspace's\nSlack channel — `release.announce`, proposed as the caller. A person's own\npress runs at once (their action, with Undo on the run); a token's rides\nthe trust ladder and may come back `pending`. The words and the picture\nare read off the release, never from the request. A failed post is\nwritten on the release and returned as `error`.\n\nReturns `{ runId, status, line, error }`.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The id from the URL.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
     "/api/v1/objects/{id}/external-ref": {
       "post": {
         "operationId": "post_objects_id_external_ref",
@@ -4094,6 +4727,74 @@
           }
         },
         "description": "What the vision engine knew and what people have taught it since, for one\ninspection: the adopted learnings in the org (the rules the prompt carries),\nwhich of them were applied on the last check, and the learning candidates\nraised from this record or about its kit (pending / approved / rejected).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The id from the URL.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/api/v1/objects/{id}/status": {
+      "get": {
+        "operationId": "get_objects_id_status",
+        "summary": "Where one record is, in three lines: whether it needs you (and the one move), what is running for it right now (the run, its page, since when), and what happen…",
+        "tags": [
+          "objects"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such record in this organization. Codes: `NOT_FOUND`, `NO_REPORT_PAGE`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Where one record is, in three lines: whether it needs you (and the one\nmove), what is running for it right now (the run, its page, since when),\nand what happens next. For any record whose type has a report page in this\nworkspace; the same read the record's page, the preview pane and the chat\ndraw (`libs/factory/liveStatus.ts`). `live` is null when nothing is\nrunning, so a poller stops then.",
         "parameters": [
           {
             "name": "id",
@@ -4450,6 +5151,387 @@
           }
         },
         "description": "TEMPORARY — phase 2 deletes this file.\n\nDELETE /api/v1/personalization/queue — clear the personalization queue for\nthe caller's org. It exists only because `lead_brief_org_contact_idx` makes\na re-fire a no-op, so the flow cannot be tested twice without a way to\nempty the queue.\n\nThree gates, all of them structural: the route is absent unless\n`VOCION_ALLOW_QUEUE_RESET` is set, the caller must be an org admin, and the\ndelete is scoped to the session's org. It touches `lead_brief` only, so the\nHubSpot mirror survives and a re-test needs no re-sync."
+      }
+    },
+    "/api/v1/products/{slug}/access": {
+      "get": {
+        "operationId": "get_products_slug_access",
+        "summary": "a product's production environments and QA sign-in.",
+        "tags": [
+          "products"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "a product's production environments and\nQA sign-in. `?reveal=1` includes the password, for the worker signing in to\ncapture live evidence; it needs the `reveal_app_login` capability (or `*`).\n`?stage=` reads another stage.\n\n**Requires the `reveal_app_login` capability.** A token without it is refused with 403, and so is a member whose role does not carry it.",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "description": "The slug from the URL.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "required": false,
+            "description": "Read from the query string. This one has no description in the handler yet.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "reveal",
+            "in": "query",
+            "required": false,
+            "description": "Read from the query string. This one has no description in the handler yet.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-required-capability": [
+          "reveal_app_login"
+        ]
+      }
+    },
+    "/api/v1/push/config": {
+      "get": {
+        "operationId": "get_push_config",
+        "summary": "What a device needs to subscribe: the VAPID public key a browser's Push API subscription is made with (`webPushPublicKey`, null when this server has no Chrome…",
+        "tags": [
+          "push"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "What a device needs to subscribe: the VAPID public key a browser's Push API\nsubscription is made with (`webPushPublicKey`, null when this server has\nno Chrome notifications), and whether iPhone push is configured.\nAuth: dashboard session or tenant token."
+      }
+    },
+    "/api/v1/push/devices": {
+      "get": {
+        "operationId": "get_push_devices",
+        "summary": "The devices you asked to be notified on — browsers subscribed from the bell and iPhones whose app registered — newest first, with the last error a device repor…",
+        "tags": [
+          "push"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "The devices you asked to be notified on — browsers subscribed from the bell\nand iPhones whose app registered — newest first, with the last error a\ndevice reported.\nAuth: dashboard session, or a tenant token (its minter's devices)."
+      },
+      "post": {
+        "operationId": "post_push_devices",
+        "summary": "Register a device for push.",
+        "tags": [
+          "push"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Register a device for push. The iOS app sends `platform: ios`, the APNs\ndevice token as hex, its `bundleId` and `environment` (`production` for\nTestFlight and the App Store, `sandbox` for a build run from Xcode). A\nbrowser sends `platform: web` with its PushSubscription's `endpoint` and\n`keys` (`p256dh`, `auth`). `label` names the device in settings. The same\ntoken again refreshes it (and moves it to you). 201 with the device.\nAuth: dashboard session (the app signs in with it), or a tenant token.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "A JSON object. This endpoint reads its fields dynamically, so they are described in the prose above.",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_push_devices",
+        "summary": "Stop notifying this browser: removes your web subscription by its endpoint (the browser knows its endpoint, not the row id).",
+        "tags": [
+          "push"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Stop notifying this browser: removes your web subscription by its\nendpoint (the browser knows its endpoint, not the row id). A device by id\nis `DELETE /api/v1/push/devices/:id`.\nAuth: dashboard session, or a tenant token (its minter's devices).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "The fields this endpoint reads.",
+                "properties": {
+                  "endpoint": {
+                    "description": "Read by this endpoint; see the description for what it must contain."
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/push/devices/{id}": {
+      "delete": {
+        "operationId": "delete_push_devices_id",
+        "summary": "Remove one of your devices; it gets no more push.",
+        "tags": [
+          "push"
+        ],
+        "security": [
+          {
+            "bearerToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request was malformed or failed validation. Codes: `VALIDATION_FAILED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer token or session was missing or invalid. Codes: `UNAUTHORIZED`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is authenticated but not allowed to do this. Codes: `FORBIDDEN`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such record in this organization. Codes: `NOT_FOUND`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Remove one of your devices; it gets no more push. Another person's device\nis a 404.\nAuth: dashboard session, or a tenant token (its minter's devices).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The id from the URL.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
       }
     },
     "/api/v1/reviews": {

@@ -21,14 +21,19 @@
  */
 
 import type { FeatureReport, ReportActionRun, ReportActivity, ReportArtifact, ReportAsk, ReportObject, ReportWorkerRun } from './featureReport';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import type { RecordOrigin } from '@/services/objects/related';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import { db } from '@/libs/DB';
 import { actionRunSchema, askSchema, conversationSchema, missionRunSchema, toolCallSchema, userSchema, workerRunSchema } from '@/models/Schema';
 import { listArtifactsByIds, listArtifactsForRecords } from '@/services/ArtifactService';
 import { failedFireLines } from '@/services/automations/failedFires';
 import { getBusinessObject, listBusinessObjects } from '@/services/BusinessObjectService';
 import { recordLinkerForOrg } from '@/services/objects/recordHref';
+import { recordOrigin } from '@/services/objects/related';
+import { REPORTED_ROLE, reportedAttachments } from '@/services/objects/reported';
 import { assembleFeatureReport } from './featureReport';
+import { loadLiveMissionRuns, taskOfRun, toolCallNamedId } from './liveStatusData';
+import { loadPullSignals, mergeRiskClassOf, mergeRunsItself } from './pullSignals';
 
 type ObjectRow = { id: number; title: string; status: string | null; createdAt: Date | null; metadata: unknown; type?: { slug: string } | null };
 
@@ -64,13 +69,8 @@ function idOf(source: Record<string, unknown> | null | undefined, key: string): 
  * @param taskIds - The task ids.
  */
 function runIsForTask(input: Record<string, unknown>, taskIds: Set<number>): boolean {
-  const rec = input.record;
-  if (!rec || typeof rec !== 'object') {
-    return false;
-  }
-  const { type, id } = rec as Record<string, unknown>;
-  const n = typeof id === 'number' ? id : Number(id);
-  return type === 'engineering_task' && Number.isInteger(n) && taskIds.has(n);
+  const n = taskOfRun(input);
+  return n !== null && taskIds.has(n);
 }
 
 /**
@@ -238,7 +238,14 @@ export async function loadFeatureReport(orgId: string, requestId: number, now: D
     listArtifactsForRecords({ orgId, recordType: 'object', recordIds }),
     pictureIds.size === 0 ? Promise.resolve([]) : listArtifactsByIds({ orgId, ids: [...pictureIds] }),
   ]);
-  const artifactRows = [...onRecords, ...byId.filter(b => !onRecords.some(r => r.id === b.id))];
+  // The chat it was requested in, read once: its Activity leads with it, and
+  // a request filed before its uploads were linked finds them there (`reported.ts`).
+  const origin = await recordOrigin(orgId, { id: request.id, meta: (row.metadata ?? {}) as Record<string, unknown>, reviewActionRunId: row.reviewActionRunId }).catch(() => null);
+  const reportedRows = onRecords.some(a => a.recordRole === REPORTED_ROLE && a.recordId === String(request.id))
+    ? []
+    : (await reportedAttachments(orgId, { id: request.id, createdAt: row.createdAt, conversationId: origin?.conversationId ?? null }).catch(() => []))
+        .map(a => ({ ...a, recordType: 'object', recordId: String(request.id), recordRole: REPORTED_ROLE }));
+  const artifactRows = [...onRecords, ...byId.filter(b => !onRecords.some(r => r.id === b.id)), ...reportedRows.filter(r => !onRecords.some(o => o.id === r.id))];
   const artifacts: ReportArtifact[] = artifactRows.map(a => ({
     id: a.id,
     kind: a.kind,
@@ -267,8 +274,38 @@ export async function loadFeatureReport(orgId: string, requestId: number, now: D
     }
   }
 
-  const report = assembleFeatureReport({ request, tasks, plans, workerRuns, asks, actionRuns, releases, artifacts, now, people, link: await recordLinkerForOrg(orgId) });
-  return { ...report, activity: await loadActivity(orgId, requestId, taskIds, workerRuns) };
+  // THE RUNS WORKING ON IT NOW — the planning run its fire started for it, a
+  // reviewer's run over its change (`liveStatusData.loadLiveMissionRuns`).
+  // WHAT GITHUB AND THE TRUST RULE SAY (backlog 044): merged, closed and CI
+  // for every pull request the attempts carry, and whether the current
+  // attempt's merge runs itself — so the report never says merged, green or
+  // "waiting on a person" on a guess.
+  const pullUrls = [
+    ...tasks.map(t => (typeof t.meta.prUrl === 'string' ? t.meta.prUrl : null)),
+    ...workerRuns.map(r => (typeof r.result?.pr_url === 'string' ? r.result.pr_url : null)),
+  ];
+  const current = [...tasks].sort((a, b) => b.id - a.id)[0] ?? null;
+  const product = typeof request.meta.product === 'string' ? request.meta.product : null;
+  const [live, activity, link, pulls, mergeRule, liveBases] = await Promise.all([
+    loadLiveMissionRuns(orgId, [{ recordId: requestId, childIds: [...taskIds] }], now),
+    loadActivity(orgId, requestId, taskIds, workerRuns, origin),
+    recordLinkerForOrg(orgId),
+    loadPullSignals(orgId, pullUrls).catch(() => undefined),
+    current
+      ? mergeRiskClassOf(orgId, current.meta).then(async riskClass => ({ riskClass, runsItself: await mergeRunsItself(orgId, riskClass) })).catch(() => undefined)
+      : Promise.resolve(undefined),
+    // Where the product runs (its production environments), so a live link
+    // never carries a host an agent guessed (`libs/factory/liveUrl.ts`). The
+    // surfaces a person opens come first; an API or a worker is never one.
+    product
+      ? import('./productAccess').then(m => m.productAccess(orgId, product)).then(a => [...a.environments]
+          .filter(e => e.url && !['api', 'worker'].includes(String(e.surface ?? '')))
+          .sort((x, y) => (x.login ? 0 : 1) - (y.login ? 0 : 1))
+          .map(e => e.url as string)).catch(() => [])
+      : Promise.resolve([] as string[]),
+  ]);
+  const report = assembleFeatureReport({ request, tasks, plans, workerRuns, asks, actionRuns, releases, artifacts, now, people, link, missionRuns: live.get(requestId) ?? [], pulls, mergeRule, liveBases });
+  return { ...report, activity };
 }
 
 /**
@@ -280,15 +317,16 @@ export async function loadFeatureReport(orgId: string, requestId: number, now: D
  * @param requestId - The request.
  * @param taskIds - Its tasks.
  * @param workerRuns - Its tasks' worker runs.
+ * @param origin - The conversation it was requested in, when it was (`recordOrigin`).
  */
-async function loadActivity(orgId: string, requestId: number, taskIds: Set<number>, workerRuns: ReportWorkerRun[]): Promise<ReportActivity[]> {
+async function loadActivity(orgId: string, requestId: number, taskIds: Set<number>, workerRuns: ReportWorkerRun[], origin: RecordOrigin | null = null): Promise<ReportActivity[]> {
   const ids = [String(requestId), ...[...taskIds].map(String)];
   const calls = await db
     .select({ conversationId: toolCallSchema.conversationId, missionRunId: toolCallSchema.missionRunId, tool: toolCallSchema.tool, at: toolCallSchema.createdAt })
     .from(toolCallSchema)
     .where(and(
       eq(toolCallSchema.orgId, orgId),
-      inArray(sql<string>`coalesce(${toolCallSchema.input}->>'id', ${toolCallSchema.input}->>'object_id', ${toolCallSchema.input}#>>'{action_input,objectId}', ${toolCallSchema.input}#>>'{input,id}')`, ids),
+      inArray(toolCallNamedId, ids),
     ))
     .orderBy(desc(toolCallSchema.createdAt))
     .limit(400);
@@ -333,5 +371,20 @@ async function loadActivity(orgId: string, requestId: number, taskIds: Set<numbe
   for (const w of workerRuns) {
     out.push({ kind: 'worker_run', id: w.id, title: w.summary?.split('\n')[0]?.slice(0, 90) || `Engineering run ${w.id}`, at: w.completedAt ?? w.claimedAt ?? w.createdAt, status: w.status, detail: [w.model, w.cents !== null ? `$${(w.cents / 100).toFixed(2)}` : null].filter(Boolean).join(' · ') || null });
   }
-  return out.sort((a, b) => b.at.getTime() - a.at.getTime());
+  const sorted = out.sort((a, b) => b.at.getTime() - a.at.getTime());
+  if (!origin) {
+    return sorted;
+  }
+  // WHERE IT STARTED, first (Chris, 2026-09-30, #269): the conversation it
+  // was requested in, from the record's own origin, whatever else it did.
+  const asked: ReportActivity = {
+    kind: 'conversation',
+    id: origin.conversationId,
+    title: `Requested in chat${origin.by ? ` by ${origin.by}` : ''}`,
+    at: origin.at ? new Date(origin.at) : sorted.find(a => a.kind === 'conversation' && a.id === origin.conversationId)?.at ?? new Date(0),
+    status: null,
+    detail: origin.title,
+    origin: true,
+  };
+  return [asked, ...sorted.filter(a => !(a.kind === 'conversation' && a.id === origin.conversationId))];
 }

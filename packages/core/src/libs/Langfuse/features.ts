@@ -25,6 +25,8 @@ export const FEATURES = {
   FEEDBACK_CLASSIFY: 'feedback.classify',
   /** Haiku-based duplicate check between a proposed rule and existing ones. */
   FEEDBACK_DEDUPE: 'feedback.dedupe',
+  /** Whether a record just filed repeats one on file (`services/objects/duplicateCheck.ts`). */
+  RECORD_DUPLICATE: 'record.duplicate',
   /** Emergent chip synthesis — mission × skills × tracker state → chips. */
   CHIP_SYNTHESIS: 'chat.chip-synthesis',
   /**
@@ -34,6 +36,8 @@ export const FEATURES = {
   CHAT_CARDS: 'chat.cards',
   /** A thread's name, written by the classifier model after its first reply. */
   CHAT_TITLE: 'chat.title',
+  /** Which agent answers a conversation's first turn, read by the classifier (`services/agents/routeRead.ts`). */
+  CHAT_ROUTE: 'chat.route',
   /** OAuth token-refresh round-trips for Source plugins. */
   SOURCE_OAUTH: 'source.oauth',
   /** Native pgvector + Postgres FTS hybrid retrieval. */
@@ -56,6 +60,8 @@ export const FEATURES = {
   TOOL_IMAGE: 'tool.image',
   /** The `draw_mockup` survey — a vision read of the real screen a mockup is drawn on. */
   TOOL_MOCKUP: 'tool.mockup',
+  /** `ci.diagnose` — why a factory pull request's CI is red, read by the classifier (backlog 049). */
+  CI_DIAGNOSE: 'factory.ci_diagnose',
 } as const;
 
 export type FeatureName = (typeof FEATURES)[keyof typeof FEATURES];
