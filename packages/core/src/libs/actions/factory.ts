@@ -18,6 +18,7 @@
 import type { Action } from './types';
 import { z } from 'zod';
 import { manualAction } from './manual';
+import { MERGE_ACTION_ID } from './mergeAction';
 
 /**
  * A merge is not one decision. The class names what the diff touches, and
@@ -38,7 +39,7 @@ export const gitPushBranchAction = manualAction({
 });
 
 const gitMergeHandoff = manualAction({
-  id: 'git.merge',
+  id: MERGE_ACTION_ID,
   name: 'Merge a branch',
   description: 'Merge a reviewed pull request into the mainline (squash), only onto the commit QA judged and only with its checks green. Carries a riskClass (docs, deps, marketing, ui, logic, auth, billing, schema, infra, promise) — the trust rule and the ledger key on git.merge.<riskClass>, so each class earns on its own. Undo opens the revert pull request.',
   system: 'Git',
