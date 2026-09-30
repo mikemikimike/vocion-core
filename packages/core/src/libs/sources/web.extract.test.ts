@@ -16,7 +16,7 @@
  * test can prove nested values survive the round trip.
  */
 import { describe, expect, it } from 'vitest';
-import { JSON_LD_BLOCK_CAP, LINK_CAP, LINK_TEXT_CAP, pageMetadata } from './pageMetadata';
+import { IMAGE_CAP, JSON_LD_BLOCK_CAP, LINK_CAP, LINK_TEXT_CAP, pageMetadata } from './pageMetadata';
 import { extractFromHtml } from './web';
 
 const JSON_LD_HEADING = 'Structured data (JSON-LD):';
@@ -508,6 +508,27 @@ describe('extractFromHtml, the structure it returns', () => {
     expect(structure?.links?.find(link => link.url.endsWith('/tickets/702172'))?.text).toBe('Buy now');
   });
 
+  it('returns the images the text shows, and not the og:image, a header logo, a placeholder or a pixel', () => {
+    const { content, structure } = extractFromHtml(DETAIL_HTML.replace('<nav', '<img src="/logo.png" alt="Bellwater Hall"><nav'), DETAIL_URL);
+
+    expect(structure?.images).toEqual([
+      'https://images.tickethub.example/moonrise.jpg',
+      'https://bellwaterhall.example/wp-content/uploads/moonrise-hero.jpg',
+    ]);
+    expect(content).toContain('(https://images.tickethub.example/moonrise.jpg)');
+    expect(content).toContain('(https://bellwaterhall.example/wp-content/uploads/moonrise-hero.jpg)');
+    expect(content).not.toContain('logo.png');
+  });
+
+  it('declares the images it prints, and prints them as it always did', () => {
+    const html = SMALL_HTML.replace('</main>', '<p><img src="/p.jpg" alt="Poster"><img src="/i.jpg"></p></main>');
+
+    const { content, structure } = extractFromHtml(html, SMALL_URL);
+
+    expect(content).toBe(SMALL_CONTENT.replace('\n\n', '\n\n[image: Poster](https://ex.test/p.jpg)\n\n'));
+    expect(structure?.images).toEqual(['https://ex.test/p.jpg']);
+  });
+
   it('leaves out the fields the page has nothing for', () => {
     const { structure } = extractFromHtml('<html><body><p>Just words.</p></body></html>');
 
@@ -556,6 +577,15 @@ describe('pageMetadata, the blob that reaches the document row', () => {
 
     expect(meta.jsonLd).toHaveLength(JSON_LD_BLOCK_CAP);
     expect(meta.truncated).toBe(true);
+  });
+
+  it('caps the image list and says it truncated', () => {
+    const images = Array.from({ length: IMAGE_CAP + 1 }, (_v, i) => `https://ex.test/${i}.jpg`);
+    const meta = pageMetadata({ images });
+
+    expect(meta.images).toHaveLength(IMAGE_CAP);
+    expect(meta.truncated).toBe(true);
+    expect(pageMetadata({ images: [] })).toEqual({});
   });
 
   it('caps the link list and slices link text', () => {

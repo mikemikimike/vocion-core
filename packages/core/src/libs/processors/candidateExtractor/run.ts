@@ -150,6 +150,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     links?: PageLink[];
     publishedUrls?: string[];
     ogImage?: string;
+    images?: string[];
     feedUrl?: string;
     entryUrl?: unknown;
     endsOn?: string;
@@ -243,6 +244,7 @@ export const run: DocumentProcessor['run'] = async (ctx): Promise<ProcessorResul
     // the connector keeps it out of `content`: that text is hashed to decide
     // the document changed, and a dated image URL would change it daily.
     ogImage: metadata.ogImage,
+    images: metadata.images,
     knownIds: known.ids,
     today,
     rules: rules.rules,

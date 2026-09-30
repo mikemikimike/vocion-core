@@ -153,6 +153,33 @@ function digitRuns(value: unknown): string[] {
 }
 
 /**
+ * The words of a value with no digits, squashed the way the document is, so
+ * "Hub’s" is one word and not two.
+ * @param value - The field value.
+ */
+function valueWords(value: string): string[] {
+  return squash(unescaped(value)).match(/[\p{L}\p{M}]+/gu) ?? [];
+}
+
+/**
+ * Whether a word occurs in a text as a whole word, with no letter either side.
+ * @param text - The squashed document.
+ * @param word - One word of a value, letters only.
+ */
+function hasWord(text: string, word: string): boolean {
+  return new RegExp(`(?<![\\p{L}\\p{M}])${word}(?![\\p{L}\\p{M}])`, 'u').test(text);
+}
+
+/**
+ * The images an HTML page's text shows, in the form the gate compares, guarded
+ * for the reason `documentUrls` guards the declared list.
+ * @param images - `metadata.images`.
+ */
+function shownImages(images: unknown): Set<string> {
+  return new Set((Array.isArray(images) ? images : []).filter((url): url is string => typeof url === 'string').map(squashUrl));
+}
+
+/**
  * Whether a value reads as filled in.
  * @param value - The field value.
  */
@@ -266,6 +293,7 @@ function documentUrls(
  * declared for itself, for the same gate.
  * @param opts.ogImage - `metadata.ogImage`, the image the document stated for
  * itself, for the same gate and for the fallback at the end of this file.
+ * @param opts.images - `metadata.images`, the images the page's text shows, for the image fields only.
  * @param opts.baseUrl - The document's own address, so a URL the model hands
  * back as a path can be resolved before the gate compares it.
  * @param opts.ownUrl - The document's own URI, as stored; a link field that resolves to it is dropped.
@@ -282,6 +310,7 @@ export function validateRecords(opts: {
   jsonLd?: unknown[];
   publishedUrls?: string[];
   ogImage?: string;
+  images?: string[];
   baseUrl?: string;
   ownUrl?: string;
   entryUrl?: string;
@@ -325,6 +354,21 @@ export function validateRecords(opts: {
       return resolved;
     }
     return urls.blob !== '' && urls.blob.includes(url) ? url : undefined;
+  };
+  // A page's own images publish an image and nothing else, so they answer the
+  // image fields here and never reach `published`.
+  const images = shownImages(opts.images);
+  const publishedImage = (url: string | undefined): string | undefined => {
+    const declared = published(url);
+    if (declared !== undefined || !url) {
+      return declared;
+    }
+    const squashed = squashUrl(url);
+    if (images.has(squashed)) {
+      return squashed;
+    }
+    const resolved = resolvedAgainst(squashed, baseUrl);
+    return resolved && images.has(resolved) ? resolved : undefined;
   };
 
   const kept: ValidatedRecord[] = [];
@@ -419,16 +463,26 @@ export function validateRecords(opts: {
     }
 
     // "Never guess a price" as a check rather than a request: every digit run
-    // in the value has to occur in the document.
+    // in the value has to occur in the document, and a value with none has to
+    // show each of its words there.
     for (const field of config.mustAppearInDocument ?? []) {
       const value = record.fields[field];
-      if (isBlank(value)) {
+      if (isBlank(value) || defaulted.has(field)) {
         continue;
       }
+      quotedHaystack ??= squash(unescaped(pageBlob()));
+      const haystack = quotedHaystack;
       const runs = digitRuns(value);
-      if (runs.length > 0 && !runs.every(run => opts.pageText.includes(run))) {
+      let missing: string | undefined;
+      if (runs.length > 0 || typeof value !== 'string') {
+        missing = runs.every(run => haystack.includes(run)) ? undefined : 'digits';
+      } else if (!valueWords(value).every(word => hasWord(haystack, word))) {
+        missing = 'words';
+      }
+      if (missing) {
         delete record.fields[field];
-        record.issues.push(`${field}: dropped, its digits do not appear anywhere in the document`);
+        record.issues.push(`${field}: dropped, its ${missing} do not appear anywhere in the document`);
+        bump('dropped.not_in_document');
       }
     }
 
@@ -454,7 +508,7 @@ export function validateRecords(opts: {
       }
     }
     if (record.imageUrl) {
-      const declared = published(record.imageUrl);
+      const declared = publishedImage(record.imageUrl);
       if (declared === undefined) {
         record.issues.push('the image URL was not published by the document, so it was dropped');
         delete record.imageUrl;
@@ -465,7 +519,7 @@ export function validateRecords(opts: {
     if (config.imageFrom) {
       const fromField = record.fields[config.imageFrom];
       if (typeof fromField === 'string' && fromField !== '') {
-        const declared = published(fromField);
+        const declared = publishedImage(fromField);
         if (declared === undefined) {
           delete record.fields[config.imageFrom];
           record.issues.push(`${config.imageFrom}: dropped, the document did not publish that URL`);
@@ -604,14 +658,14 @@ export function validateRecords(opts: {
   // the card; an `imageFrom` field is part of the record's data, and writing a
   // fact about the document into it would be the inventing the prompt forbids.
   //
-  // It goes THROUGH `published`, the same gate every model-returned URL
+  // It goes THROUGH `publishedImage`, the same gate every model-returned image
   // passes, rather than around it. The gate knows this value only because
   // `documentUrls` was told about it, so the fallback cannot outlive the
   // declaration that justifies it: take the og:image back out of the gate and
   // this fills nothing, rather than quietly writing past it.
   const only = records.length === 1 ? records[0] : undefined;
   if (ogImage && only && !only.imageUrl) {
-    const declared = published(ogImage);
+    const declared = publishedImage(ogImage);
     if (declared !== undefined) {
       only.imageUrl = declared;
       // Said on the card, because a reviewer reading a picture of the wrong
