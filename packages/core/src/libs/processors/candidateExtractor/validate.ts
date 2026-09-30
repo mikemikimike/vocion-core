@@ -153,26 +153,25 @@ function digitRuns(value: unknown): string[] {
 }
 
 /**
- * The words of a value with no digits, squashed the way the document is, so
- * "Hub’s" is one word and not two.
- * @param value - The field value.
+ * The runs of letters in a text, in NFC, so a composed and a decomposed accent
+ * are the same word.
+ * @param text - Squashed text.
  */
-function valueWords(value: string): string[] {
-  return squash(unescaped(value)).match(/[\p{L}\p{M}]+/gu) ?? [];
+function letterRuns(text: string): string[] {
+  return text.normalize('NFC').match(/[\p{L}\p{M}]+/gu) ?? [];
 }
 
 /**
- * Whether a word occurs in a text as a whole word, with no letter either side.
- * @param text - The squashed document.
- * @param word - One word of a value, letters only.
+ * Whether the document has a word whole, or with a plural "s" or "es".
+ * @param page - The document's letter runs.
+ * @param word - One word of a value.
  */
-function hasWord(text: string, word: string): boolean {
-  return new RegExp(`(?<![\\p{L}\\p{M}])${word}(?![\\p{L}\\p{M}])`, 'u').test(text);
+function hasWord(page: Set<string>, word: string): boolean {
+  return page.has(word) || page.has(`${word}s`) || page.has(`${word}es`);
 }
 
 /**
- * The images an HTML page's text shows, in the form the gate compares, guarded
- * for the reason `documentUrls` guards the declared list.
+ * The images an HTML page's text shows, in the form the gate compares.
  * @param images - `metadata.images`.
  */
 function shownImages(images: unknown): Set<string> {
@@ -358,23 +357,14 @@ export function validateRecords(opts: {
   // A page's own images publish an image and nothing else, so they answer the
   // image fields here and never reach `published`.
   const images = shownImages(opts.images);
-  const publishedImage = (url: string | undefined): string | undefined => {
-    const declared = published(url);
-    if (declared !== undefined || !url) {
-      return declared;
-    }
-    const squashed = squashUrl(url);
-    if (images.has(squashed)) {
-      return squashed;
-    }
-    const resolved = resolvedAgainst(squashed, baseUrl);
-    return resolved && images.has(resolved) ? resolved : undefined;
-  };
+  const publishedImage = (url: string | undefined): string | undefined =>
+    published(url) ?? (url && images.has(squashUrl(url)) ? squashUrl(url) : undefined);
 
   const kept: ValidatedRecord[] = [];
   const pageBlob = () => `${opts.pageText}\n${opts.jsonLd?.length ? JSON.stringify(opts.jsonLd) : ''}`;
   let pageHaystack: string | null = null;
   let quotedHaystack: string | null = null;
+  let pageWords: Set<string> | null = null;
   const horizon = dayPlus(opts.today, config.recurrenceHorizonDays);
   const ownKey = pageKey(opts.ownUrl);
   const entryKey = pageKey(opts.entryUrl);
@@ -463,7 +453,7 @@ export function validateRecords(opts: {
     }
 
     // "Never guess a price" as a check rather than a request: every digit run
-    // in the value has to occur in the document, and a value with none has to
+    // in the value has to occur in the document, and a string with none has to
     // show each of its words there.
     for (const field of config.mustAppearInDocument ?? []) {
       const value = record.fields[field];
@@ -476,12 +466,14 @@ export function validateRecords(opts: {
       let missing: string | undefined;
       if (runs.length > 0 || typeof value !== 'string') {
         missing = runs.every(run => haystack.includes(run)) ? undefined : 'digits';
-      } else if (!valueWords(value).every(word => hasWord(haystack, word))) {
-        missing = 'words';
+      } else {
+        pageWords ??= new Set(letterRuns(haystack));
+        const page = pageWords;
+        missing = letterRuns(squash(unescaped(value))).every(word => hasWord(page, word)) ? undefined : 'words';
       }
       if (missing) {
         delete record.fields[field];
-        record.issues.push(`${field}: dropped, its ${missing} do not appear anywhere in the document`);
+        record.issues.push(`${field}: dropped "${String(value)}", its ${missing} do not appear anywhere in the document`);
         bump('dropped.not_in_document');
       }
     }

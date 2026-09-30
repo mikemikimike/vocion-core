@@ -233,19 +233,6 @@ describe('candidate extractor validation', () => {
     expect(out.counts['skipped.bad_category']).toBe(1);
   });
 
-  it('drops a price whose digits the document never printed', () => {
-    const config = configWith({ mustAppearInDocument: ['price'] });
-
-    const out = run([
-      record({ fields: { price: '$12' } }),
-      record({ fields: { title: 'Late Show', price: '$45' } }),
-    ], config);
-
-    expect(out.records[0]?.fields.price).toBe('$12');
-    expect(out.records[1]?.fields.price).toBeUndefined();
-    expect(out.records[1]?.issues.join(' ')).toContain('digits');
-  });
-
   it('drops a URL the page never published, and keeps the record', () => {
     const out = run([record({ sourceUrl: 'https://evil.example/pwn', imageUrl: 'https://cdn.example/poster.jpg' })], configWith(), {
       links: [{ url: 'https://cdn.example/poster.jpg', text: 'poster' }],
@@ -469,14 +456,48 @@ describe('candidate extractor validation', () => {
 describe('values the document has to print', () => {
   const priced = configWith({ mustAppearInDocument: ['price'] });
 
-  it('drops a price in words the document never printed as a word', () => {
+  it('drops a price whose digits the document never printed, naming it', () => {
+    const out = run([
+      record({ fields: { price: '$12' } }),
+      record({ fields: { title: 'Late Show', price: '$45' } }),
+    ], priced);
+
+    expect(out.records[0]?.fields.price).toBe('$12');
+    expect(out.records[1]?.fields.price).toBeUndefined();
+    expect(out.records[1]?.issues).toEqual(['price: dropped "$45", its digits do not appear anywhere in the document']);
+    expect(out.counts['dropped.not_in_document']).toBe(1);
+  });
+
+  it('drops a price in words the document never printed as a word, naming it', () => {
     const out = run([record({ fields: { price: 'Free' } })], priced, {
-      pageText: 'Open Mic Night, 12 November. Poster art from freepik.',
+      pageText: 'Open Mic Night, 12 November. Poster art from freeform.',
     });
 
     expect(out.records[0]?.fields.price).toBeUndefined();
-    expect(out.records[0]?.issues).toEqual(['price: dropped, its words do not appear anywhere in the document']);
+    expect(out.records[0]?.issues).toEqual(['price: dropped "Free", its words do not appear anywhere in the document']);
     expect(out.counts['dropped.not_in_document']).toBe(1);
+  });
+
+  it('reads a word the document printed with a plural "s" or "es", and no looser form', () => {
+    const out = run([
+      record({ fields: { price: 'Donation' } }),
+      record({ fields: { title: 'Late Show', price: 'Day pass' } }),
+      record({ fields: { title: 'Matinee', price: 'Donate' } }),
+    ], priced, { pageText: 'Suggested donations at the door. Day passes sold here.' });
+
+    expect(out.records.map(kept => kept.fields.price)).toEqual(['Donation', 'Day pass', undefined]);
+    expect(out.records[2]?.issues).toEqual(['price: dropped "Donate", its words do not appear anywhere in the document']);
+  });
+
+  it('matches an accent whether the document stored it composed or decomposed', () => {
+    const composed = 'Free for Caf\u00E9 members';
+    const decomposed = 'Free for Cafe\u0301 members';
+
+    const onDecomposed = run([record({ fields: { price: composed } })], priced, { pageText: decomposed });
+    const onComposed = run([record({ fields: { price: decomposed } })], priced, { pageText: composed });
+
+    expect(onDecomposed.records[0]?.fields.price).toBe(composed);
+    expect(onComposed.records[0]?.fields.price).toBe(decomposed);
   });
 
   it('keeps a price in words the document printed, however it joined or quoted them', () => {

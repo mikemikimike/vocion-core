@@ -1627,15 +1627,14 @@ const ITEM_TITLE_FIELDS = ['name', 'title', 'summary'] as const;
  * reason this list resolves relative values: `fullUrl` is a path, `/events/x`,
  * and the gate it feeds compares exactly, so an unresolved path can never
  * match what a model read and would drop the link it exists to keep.
+ * `assetUrl` is the entry's file, an image unless its `contentType` says
+ * otherwise.
  *
  * `imageUrl` is here because it is the extractor's own field name: an entry
  * that publishes its poster under the very key the pipeline reads it back out
  * of would otherwise lose it, which is the defect this whole list exists for.
  *
  * `localist_url` and `photo_url` are Localist's.
- *
- * `assetUrl` is the entry's file, which is an image only when the entry's own
- * `contentType` does not say otherwise.
  */
 const ITEM_URL_FIELDS = [
   'url',

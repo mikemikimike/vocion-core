@@ -40,11 +40,7 @@ export type PageStructure = {
    * by the page, and a gate wants the superset.
    */
   links?: PageLink[];
-  /**
-   * Every image the page's text shows as `[image](src)`, in document order,
-   * the og:image apart. Read after the chrome comes out, unlike `links`, so a
-   * header logo is not in it.
-   */
+  /** Every image the page's text shows as `[image](src)`, in document order, the og:image apart. */
   images?: string[];
   /** Set when a cap dropped something, so a reader knows the lists are partial. */
   truncated?: boolean;
@@ -66,7 +62,7 @@ export const LINK_CAP = 300;
 /** A link's visible text, sliced. Some sites put a paragraph inside an <a>. */
 export const LINK_TEXT_CAP = 200;
 
-/** Images kept per page. A listing page shows one per item it lists. */
+/** Images kept per page. */
 export const IMAGE_CAP = 200;
 
 /**

@@ -940,7 +940,6 @@ describe('the JSON per-event split', () => {
       ['https://cdn.venue.test/third.jpg'],
       ['https://cdn.venue.test/fourth.jpg'],
     ]);
-    // What the model reads, and the hash, are the entry as it was.
     expect(docs[0]?.content).toContain('https://cdn.venue.test/opening');
   });
 

@@ -509,7 +509,11 @@ describe('extractFromHtml, the structure it returns', () => {
   });
 
   it('returns the images the text shows, and not the og:image, a header logo, a placeholder or a pixel', () => {
-    const { content, structure } = extractFromHtml(DETAIL_HTML.replace('<nav', '<img src="/logo.png" alt="Bellwater Hall"><nav'), DETAIL_URL);
+    const html = DETAIL_HTML
+      .replace('<nav', '<img src="/logo.png" alt="Bellwater Hall"><nav')
+      .replace('<div class="event-images">', '<div class="event-images"><img src="https://bellwaterhall.example/?og_img=1&amp;pid=40405">');
+
+    const { content, structure } = extractFromHtml(html, DETAIL_URL);
 
     expect(structure?.images).toEqual([
       'https://images.tickethub.example/moonrise.jpg',
@@ -518,6 +522,7 @@ describe('extractFromHtml, the structure it returns', () => {
     expect(content).toContain('(https://images.tickethub.example/moonrise.jpg)');
     expect(content).toContain('(https://bellwaterhall.example/wp-content/uploads/moonrise-hero.jpg)');
     expect(content).not.toContain('logo.png');
+    expect(content).not.toContain('og_img=1');
   });
 
   it('declares the images it prints, and prints them as it always did', () => {
