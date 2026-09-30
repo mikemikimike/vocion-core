@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { expandRecurrence } from './recurrence';
+import { expandRecurrence, readRule, ruleEndedBefore } from './recurrence';
 import { instantInZone, isoInZone } from './zone';
 
 const NY = 'America/New_York';
@@ -72,6 +72,12 @@ describe('expandRecurrence', () => {
     expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule: 'FREQ=WEEKLY;BYDAY=TU,SU;WKST=XX', exdates: [], rdates: [], ...window })).toEqual([]);
   });
 
+  it('returns nothing for an UNTIL it cannot read, rather than running past it', () => {
+    for (const rule of ['FREQ=WEEKLY;UNTIL=20261231T235959', 'FREQ=WEEKLY;UNTIL=soon', 'FREQ=DAILY;UNTIL=']) {
+      expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
+    }
+  });
+
   it('reads INTERVAL and COUNT only as whole numbers, and an UNTIL only as a real date', () => {
     for (const rule of ['FREQ=WEEKLY;INTERVAL=abc', 'FREQ=WEEKLY;INTERVAL=1.5', 'FREQ=WEEKLY;INTERVAL=0', 'FREQ=WEEKLY;COUNT=1.5', 'FREQ=WEEKLY;UNTIL=20261231T250000Z', 'FREQ=WEEKLY;UNTIL=20261131']) {
       expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
@@ -101,5 +107,43 @@ describe('expandRecurrence', () => {
 
     expect(far).not.toThrow();
     expect(far()).toEqual([]);
+  });
+});
+
+describe('readRule', () => {
+  it('reads the rules the expander walks', () => {
+    for (const rule of ['FREQ=WEEKLY', 'FREQ=DAILY;INTERVAL=2;COUNT=5', 'FREQ=WEEKLY;BYDAY=MO,TH;UNTIL=20261231T235959Z;WKST=SU', 'freq=weekly;until=20261231']) {
+      expect(readRule(rule)).toBeDefined();
+    }
+
+    expect(readRule('FREQ=WEEKLY;BYDAY=MO,TH;UNTIL=20261231T235959Z;WKST=SU')).toEqual({ freq: 'WEEKLY', interval: 1, until: '20261231T235959Z', byDay: ['MO', 'TH'], wkst: 6 });
+  });
+
+  it('refuses exactly what the expander leaves to the model', () => {
+    for (const rule of ['FREQ=MONTHLY;BYDAY=3WE', 'FREQ=YEARLY', 'FREQ=WEEKLY;BYDAY=1TH', 'FREQ=DAILY;COUNT=5000', 'FREQ=WEEKLY;BYDAY=TU;BYMONTH=6,7,8', 'FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR', 'FREQ=WEEKLY;UNTIL=20261340', 'FREQ=WEEKLY;BYDAY=TU,SU;WKST=XX', 'FREQ=WEEKLY;INTERVAL=abc', 'FREQ=WEEKLY;INTERVAL=0', 'FREQ=WEEKLY;INTERVAL=1001', 'FREQ=WEEKLY;COUNT=1.5', 'FREQ=WEEKLY;UNTIL=20261231T250000Z', 'FREQ=WEEKLY;UNTIL=20261131']) {
+      expect(readRule(rule)).toBeUndefined();
+      expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
+    }
+  });
+});
+
+describe('ruleEndedBefore', () => {
+  it('reads an UNTIL by its day, whatever form the rest of it takes', () => {
+    expect(ruleEndedBefore('FREQ=MONTHLY;BYDAY=1FR;UNTIL=20260929T170000Z', '2026-09-30')).toBe(true);
+    expect(ruleEndedBefore('FREQ=MONTHLY;BYDAY=1FR;UNTIL=20260930T235959', '2026-09-30')).toBe(false);
+    expect(ruleEndedBefore('FREQ=YEARLY;UNTIL=20271231', '2026-09-30')).toBe(false);
+  });
+
+  it('runs a COUNT out at its longest period from the start', () => {
+    expect(ruleEndedBefore('FREQ=MONTHLY;BYDAY=1FR;COUNT=3', '2026-09-30', '20250801T190000')).toBe(true);
+    expect(ruleEndedBefore('FREQ=MONTHLY;BYDAY=1FR;COUNT=3', '2026-09-30', '20260801T190000')).toBe(false);
+    expect(ruleEndedBefore('FREQ=YEARLY;INTERVAL=2;COUNT=2', '2026-09-30', '20240801')).toBe(false);
+    expect(ruleEndedBefore('FREQ=YEARLY;INTERVAL=2;COUNT=2', '2029-09-30', '20240801')).toBe(true);
+  });
+
+  it('reads as still running whatever it cannot tell', () => {
+    for (const [rule, start] of [['FREQ=MONTHLY;BYDAY=1FR', '20200101'], ['FREQ=MONTHLY;UNTIL=soon', '20200101'], ['FREQ=MONTHLY;COUNT=3', ''], ['FREQ=MONTHLY;COUNT=many', '20200101'], ['FREQ=MONTHLY;COUNT=3;INTERVAL=x', '20200101']] as const) {
+      expect(ruleEndedBefore(rule, '2026-09-30', start)).toBe(false);
+    }
   });
 });

@@ -17,7 +17,8 @@
  *   - **It only runs for the outcomes it asks for.** `runsOn` defaults to
  *     created and updated, so an unchanged document costs nothing, unless
  *     its last run did not finish: a `retry`, a throw or a timeout is run
- *     again up to a cap.
+ *     again up to a cap. Or unless its last run said when its output goes
+ *     stale (`revisitAt`): the first sync after that runs it again.
  *   - **It spends from one shared budget.** Every processor invocation in a
  *     sync shares the same `SyncBudget`, because they run eight at a time.
  *
@@ -112,6 +113,13 @@ export type ProcessorResult = {
    * as a refused call or a budget that ran out first. Unset for a deliberate skip.
    */
   retry?: { reason: string; countsAsTry: boolean };
+  /**
+   * When a finished run's output goes stale though the document has not
+   * changed, such as a repeating entry read up to a horizon. The run holds
+   * until then, and the first sync after it runs the processor again. The
+   * runner ignores a missing or non-finite value, and a run that did not finish.
+   */
+  revisitAt?: Date;
 };
 
 export type DocumentProcessor<TConfig = unknown> = {

@@ -870,6 +870,7 @@ export async function runSync(opts: {
     const retrying = outcome.status === 'unchanged'
       && outcome.processorDue
       && outcome.processorAttempts < MAX_PROCESSOR_ATTEMPTS;
+    const revisiting = outcome.status === 'unchanged' && outcome.revisitDue === true;
     const mark = async (step: ProcessorRunMark): Promise<void> => {
       let attempts: number;
       try {
@@ -888,7 +889,7 @@ export async function runSync(opts: {
       }
     };
     try {
-      if (!processor.runsOn.has(outcome.status) && !retrying) {
+      if (!processor.runsOn.has(outcome.status) && !retrying && !revisiting) {
         return;
       }
       if (!outcome.documentId) {
@@ -901,8 +902,8 @@ export async function runSync(opts: {
         await mark({ kind: 'deferred', error: 'the sync ran out of time before this document', claimed: false });
         return;
       }
-      if (retrying && !processor.runsOn.has(outcome.status)) {
-        bumpProcessorCount('processorRetries');
+      if (!processor.runsOn.has(outcome.status)) {
+        bumpProcessorCount(retrying ? 'processorRetries' : 'processorRevisits');
       }
       await mark({ kind: 'started' });
       const { run } = await processor.load();
@@ -942,7 +943,8 @@ export async function runSync(opts: {
         }
       }
       if (!processed.retry) {
-        await mark({ kind: 'finished', contentHash: outcome.contentHash });
+        const revisitAt = processed.revisitAt instanceof Date && Number.isFinite(processed.revisitAt.getTime()) ? processed.revisitAt : undefined;
+        await mark({ kind: 'finished', contentHash: outcome.contentHash, ...(revisitAt ? { revisitAt } : {}) });
       } else if (processed.retry.countsAsTry) {
         await mark({ kind: 'failed', error: processed.retry.reason });
       } else {
