@@ -73,7 +73,7 @@ describe('expandRecurrence', () => {
   });
 
   it('returns nothing for an UNTIL it cannot read, rather than running past it', () => {
-    for (const rule of ['FREQ=WEEKLY;UNTIL=20261231T235959', 'FREQ=WEEKLY;UNTIL=soon', 'FREQ=DAILY;UNTIL=']) {
+    for (const rule of ['FREQ=WEEKLY;UNTIL=20261231T235959', 'FREQ=WEEKLY;UNTIL=2026-12-31', 'FREQ=WEEKLY;UNTIL=soon', 'FREQ=DAILY;UNTIL=']) {
       expect(expandRecurrence({ start: ny('2026-09-01T18:00:00'), anchorZone: NY, rule, exdates: [], rdates: [], ...window })).toEqual([]);
     }
   });

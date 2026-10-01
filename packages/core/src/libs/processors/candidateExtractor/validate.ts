@@ -227,6 +227,19 @@ function resolvedAgainst(value: string, baseUrl: string | undefined): string | u
 }
 
 /**
+ * Whether a link names an SVG file, a site's icon or logo rather than a
+ * picture of a record.
+ * @param url - The image's address.
+ */
+function namesSvg(url: string): boolean {
+  try {
+    return /\.svg$/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Every URL the document itself published, the gate a model-returned URL has
  * to pass. Named apart from the `publishedUrls` option it reads, which is one
  * of its four inputs rather than the whole answer.
@@ -674,9 +687,17 @@ export function validateRecords(opts: {
   // `documentUrls` was told about it, so the fallback cannot outlive the
   // declaration that justifies it: take the og:image back out of the gate and
   // this fills nothing, rather than quietly writing past it.
+  //
+  // An SVG og:image is a site's icon or logo: share previews, the reason
+  // og:image exists, do not render SVG.
   const oneRecord = records.length > 0 && new Set(records.map(record => originOf.get(record))).size === 1;
   const documentImage = ogImage && oneRecord ? publishedImage(ogImage) : undefined;
+  const svg = documentImage !== undefined && namesSvg(documentImage);
   for (const record of documentImage === undefined ? [] : records.filter(candidate => !candidate.imageUrl)) {
+    if (svg) {
+      bump('image_from_document.svg');
+      continue;
+    }
     record.imageUrl = documentImage;
     // Said on the card, because a reviewer reading a picture of the wrong
     // thing should be able to see where it came from.
