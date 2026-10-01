@@ -10,8 +10,9 @@
  * first pass of `validateRecords`, so every written record then meets the
  * same gates as the model's own.
  *
- *   stated on a page:  the model's own record for a date wins; a guard that
- *                      refuses the rule leaves the record single
+ *   stated on a page:  the model's own record for a date wins; a rule that
+ *                      ended before today drops the record, and a guard
+ *                      that refuses the rule leaves the record single
  *   calendar entry:    the feed wins; a record on a day its rule does not
  *                      produce is dropped, and an entry whose rule is not
  *                      read is left to the model as it is
@@ -21,7 +22,7 @@ import type { CandidateExtractorConfig } from './config';
 import type { ExtractedRecord } from './model';
 import type { IcsDuration, icsRecurrence } from '@/libs/sources/web';
 import { normaliseForKey } from '@/libs/actions/objects-propose-candidate';
-import { expandRecurrence, readRule } from '@/libs/time/recurrence';
+import { expandRecurrence, readRule, until } from '@/libs/time/recurrence';
 import { dayKey, dayPlus, daysBetween, endOfDay, instantInZone, isoInZone, resolveTimeZone, startOfDay } from '@/libs/time/zone';
 import { RULE_EVIDENCE_CAP, STATED_RULE_PARTS } from './config';
 
@@ -30,6 +31,7 @@ export const LOOKAHEAD_DAYS = 3_653;
 
 /** Occurrences one rule writes at most, about the timed dates a calendar entry's list of dates used to carry. */
 const PER_RULE_CAP = 150;
+const LOCAL_UNTIL = /^(\d{4})-?(\d{2})-?(\d{2})(?:T(\d{2}):?(\d{2})(?::?(\d{2}))?)?$/;
 const DATED = /^(\d{4}-\d{2}-\d{2})(?:([T ])(\d{2}:\d{2}(?::\d{2})?)(?:\.\d+)?)?(Z|[+-]\d{2}(?::?\d{2})?)?$/i;
 
 /** A split calendar component, as the prompt, the revisit time and the expander read it. */
@@ -113,6 +115,37 @@ function readWall(value: unknown, zone: string): { wall: string; timed: boolean 
   }
   const wall = `${m[1]}T${(m[3] ?? '00:00').padEnd(8, ':00')}`;
   return Number.isNaN(instantInZone(wall, 'UTC').getTime()) ? undefined : { wall, timed: m[3] !== undefined };
+}
+
+/**
+ * A stated rule with its `UNTIL` in the form the expander reads, a date with
+ * dashes or a local time read on the record's clock, and the end it names.
+ * Any other value is left as written, for the expander to refuse.
+ * @param rule - the rule as the model wrote it.
+ * @param zone - the zone the record's dates are local to.
+ */
+function statedRule(rule: string, zone: string): { stated: string; ends?: Date } {
+  const parts = rule.split(';');
+  let ends: Date | undefined;
+  for (const [index, part] of parts.entries()) {
+    const at = part.indexOf('=');
+    if (at < 0 || part.slice(0, at).trim().toUpperCase() !== 'UNTIL') {
+      continue;
+    }
+    const value = part.slice(at + 1).trim().toUpperCase();
+    const m = LOCAL_UNTIL.exec(value);
+    let written = value;
+    if (m?.[4] !== undefined) {
+      const end = instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] ?? '00'}`, zone);
+      written = Number.isNaN(end.getTime()) ? value : `${end.toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`;
+    } else if (m) {
+      written = `${m[1]}${m[2]}${m[3]}`;
+    }
+    parts[index] = written === value ? part : `UNTIL=${written}`;
+    ends = until(written, zone);
+  }
+  const stated = parts.join(';');
+  return ends ? { stated, ends } : { stated };
 }
 
 /**
@@ -258,8 +291,14 @@ export function expandOccurrences(opts: {
       });
     }
   } else {
-    records.forEach((record, origin) => kept.push({ record, origin }));
-    for (const { record } of kept) {
+    const queued = (record: ExtractedRecord) => record.duplicateOf !== undefined && opts.knownIds.has(record.duplicateOf);
+    for (const [origin, record] of records.entries()) {
+      const ends = record.repeats && !queued(record) ? statedRule(record.repeats.rule, zone).ends : undefined;
+      if (ends && dayKey(ends, zone) < opts.today) {
+        bump('skipped.series_ended');
+        continue;
+      }
+      kept.push({ record, origin });
       held.add(keyOf(record, dayIn(record.fields[fields.day])));
     }
     for (const item of kept) {
@@ -271,7 +310,7 @@ export function expandOccurrences(opts: {
         bump(key);
         item.issues = [`repeats: ${why}, so only this date was proposed`];
       };
-      if (duplicateOf !== undefined && opts.knownIds.has(duplicateOf)) {
+      if (queued(item.record)) {
         refuse('expansion.template_duplicate', `the record duplicates #${duplicateOf}, already waiting for review`);
         continue;
       }
@@ -280,12 +319,18 @@ export function expandOccurrences(opts: {
         refuse('expansion.evidence_not_in_document', 'the words stating the rule are not in the document');
         continue;
       }
-      if (!readRule(repeats.rule)) {
+      const { stated } = statedRule(repeats.rule, zone);
+      const read = readRule(stated);
+      if (!read) {
         refuse('expansion.rule_unread', `"${repeats.rule}" is not a rule core reads`);
         continue;
       }
-      if (repeats.rule.split(';').filter(part => part.trim()).some(part => !(STATED_RULE_PARTS as readonly string[]).includes(part.split('=')[0]!.trim().toUpperCase()))) {
+      if (stated.split(';').filter(part => part.trim()).some(part => !(STATED_RULE_PARTS as readonly string[]).includes(part.split('=')[0]!.trim().toUpperCase()))) {
         refuse('expansion.rule_counts', `"${repeats.rule}" counts its dates from the series' first date, which this record need not be`);
+        continue;
+      }
+      if (read.byDay.some(day => /^-[2-5]/.test(day))) {
+        refuse('expansion.rule_from_end', `"${repeats.rule}" counts a weekday back from the month's end other than the last`);
         continue;
       }
       const anchorDay = dayIn(item.record.fields[fields.day]);
@@ -295,7 +340,7 @@ export function expandOccurrences(opts: {
         continue;
       }
       const clock = [fields.start, fields.day].map(field => field ? readWall(item.record.fields[field], zone) : undefined).find(read => read?.timed);
-      const rule: Recurrence = { start: instantInZone(`${anchorDay}T${clock ? clock.wall.slice(11) : '12:00:00'}`, zone), anchorZone: zone, rule: repeats.rule, exdates: [], rdates: [] };
+      const rule: Recurrence = { start: instantInZone(`${anchorDay}T${clock ? clock.wall.slice(11) : '12:00:00'}`, zone), anchorZone: zone, rule: stated, exdates: [], rdates: [] };
       if (Number.isNaN(rule.start.getTime()) || expandRecurrence({ ...rule, from: rule.start, to: rule.start }).length === 0) {
         refuse('expansion.anchor_not_in_rule', `its date is not one "${repeats.rule}" produces`);
         continue;

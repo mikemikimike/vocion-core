@@ -41,7 +41,7 @@ function parts(rule: string): Map<string, string> {
  * @param value - `YYYYMMDDTHHMMSSZ` or `YYYYMMDD`.
  * @param anchorZone - the rule's own zone.
  */
-function until(value: string, anchorZone: string): Date | undefined {
+export function until(value: string, anchorZone: string): Date | undefined {
   const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z)?$/.exec(value);
   if (!m) {
     return undefined;

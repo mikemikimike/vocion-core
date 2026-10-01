@@ -565,6 +565,13 @@ describe('a source that opts into occurrence fields', () => {
     expect(system).toContain('Never use "repeats" for a document that starts BEGIN:VEVENT');
   });
 
+  it('asks for a stated end in the rule', () => {
+    const { system } = built();
+
+    expect(system).toContain('put that day in the rule as UNTIL=YYYYMMDD');
+    expect(system).toContain('for its next date on or after today');
+  });
+
   it('names an entry\'s next date after the opening every document shares, so the cached prefix does not move', () => {
     const plain = built();
     const hinted = built({ nextDate: '2026-10-01T19:00:00-04:00' });

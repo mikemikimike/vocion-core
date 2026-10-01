@@ -351,6 +351,35 @@ describe('candidate extractor validation', () => {
     expect(out.counts.image_from_document).toBe(1);
   });
 
+  it('leaves an SVG og:image off the record, and counts it', () => {
+    const out = run([record()], configWith(), { ogImage: 'https://bellwaterhall.example/assets/facebook-icon.svg?v=2' });
+
+    expect(out.records[0]?.imageUrl).toBeUndefined();
+    expect(out.records[0]?.issues).toEqual([]);
+    expect(out.counts).toMatchObject({ 'image_from_document.svg': 1 });
+    expect(out.counts.image_from_document).toBeUndefined();
+  });
+
+  it('still keeps an SVG the model read off the page', () => {
+    const poster = 'https://bellwaterhall.example/uploads/poster.svg';
+    const out = run([record({ imageUrl: poster })], configWith(), { images: [poster], ogImage: 'https://bellwaterhall.example/assets/facebook-icon.svg' });
+
+    expect(out.records[0]?.imageUrl).toBe(poster);
+    expect(out.counts['image_from_document.svg']).toBeUndefined();
+  });
+
+  it('leaves an SVG og:image off every occurrence written from a stated rule, and counts each one', () => {
+    const template = record({ fields: { start: '2026-11-12T19:00' }, repeats: { rule: 'FREQ=WEEKLY;UNTIL=20261126', evidence: 'every Thursday' } });
+    const out = run([template], configWith({ occurrenceFields: { day: 'startDate', start: 'start' } }), {
+      pageText: 'Open Mic Night, every Thursday from 2026-11-12, doors at 19:00.',
+      ogImage: 'https://bellwaterhall.example/assets/facebook-icon.svg',
+    });
+
+    expect(out.records.map(r => r.fields.startDate)).toEqual(['2026-11-12', '2026-11-19', '2026-11-26']);
+    expect(out.records.some(r => r.imageUrl)).toBe(false);
+    expect(out.counts['image_from_document.svg']).toBe(out.records.length);
+  });
+
   it('leaves a document that published no image of its own exactly as it was', () => {
     const out = run([record()]);
 
@@ -759,6 +788,7 @@ describe('occurrences written from a stated rule', () => {
   const knob = (over: Record<string, unknown> = {}) => configWith({ occurrenceFields: { day: 'startDate', start: 'start' }, ...over });
   const weekly = (over: Record<string, unknown> = {}) => record({ fields: { start: '2026-11-12T19:00' }, repeats: { rule: 'FREQ=WEEKLY', evidence: 'every Thursday' }, ...over });
   const page = { pageText: 'Open Mic Night, every Thursday from 2026-11-12, doors at 19:00. Tickets $12.' };
+  const endsOn = (end: string, over: Record<string, unknown> = {}) => weekly({ repeats: { rule: `FREQ=WEEKLY;UNTIL=${end}`, evidence: 'every Thursday' }, ...over });
 
   it('holds the template to the document, and never the dates it computed', () => {
     const out = run([weekly()], knob({ mustAppearInDocument: ['startDate', 'start'], quotedFields: ['start'] }), page);
@@ -793,6 +823,64 @@ describe('occurrences written from a stated rule', () => {
     expect(excepted.records[0]?.issues).toContain('repeats: its date is one the document says the rule skips, so only this date was proposed');
     expect(duplicate.records).toHaveLength(1);
     expect(duplicate.counts).toMatchObject({ 'expansion.template_duplicate': 1 });
+  });
+
+  it('reads an UNTIL written with dashes, or as a local time, on the record\'s clock', () => {
+    for (const end of ['2026-11-26', '20261126T190000', '2026-11-26T19:00']) {
+      expect(run([endsOn(end)], knob(), page).records.map(r => r.fields.start)).toEqual(['2026-11-12T19:00', '2026-11-19T19:00', '2026-11-26T19:00']);
+    }
+
+    expect(run([endsOn('20261126T185959')], knob(), page).records.map(r => r.fields.startDate)).toEqual(['2026-11-12', '2026-11-19']);
+
+    // Local noon today in Auckland is 23:00 UTC yesterday, so the series has not ended.
+    const auckland = run([endsOn('20261110T120000', { fields: { startDate: TODAY, start: `${TODAY}T09:00` } })], knob({ timezone: 'Pacific/Auckland' }), page);
+
+    expect(auckland.records.map(r => r.fields.startDate)).toEqual([TODAY]);
+    expect(auckland.records[0]?.issues).toEqual([]);
+    expect(auckland.counts).toEqual({});
+  });
+
+  it('still refuses an UNTIL it cannot read', () => {
+    for (const end of ['Nov 26', '2025-13-45']) {
+      const out = run([endsOn(end)], knob(), page);
+
+      expect(out.records).toHaveLength(1);
+      expect(out.counts).toMatchObject({ 'expansion.rule_unread': 1 });
+    }
+  });
+
+  it('drops a record whose own rule ended before today, and holds none of its days', () => {
+    for (const end of ['20261031', '2026-10-31']) {
+      const out = run([endsOn(end)], knob(), page);
+
+      expect(out.records).toEqual([]);
+      expect(out.counts).toMatchObject({ 'skipped.series_ended': 1 });
+    }
+
+    const ended = endsOn('20261031', { fields: { startDate: '2026-11-19', start: '2026-11-19T19:00' } });
+    const out = run([ended, weekly()], knob(), page);
+
+    expect(out.records.slice(0, 2).map(r => r.fields.startDate)).toEqual(['2026-11-12', '2026-11-19']);
+    expect(out.records[1]?.issues).toEqual(['date computed from the stated rule: every Thursday']);
+    expect(out.counts).toMatchObject({ 'skipped.series_ended': 1 });
+    expect(out.counts['expansion.held']).toBeUndefined();
+  });
+
+  it('leaves a record single when its date falls after its own rule\'s end', () => {
+    const out = run([endsOn('20261119', { fields: { startDate: '2026-11-26', start: '2026-11-26T19:00' } })], knob(), page);
+
+    expect(out.records).toHaveLength(1);
+    expect(out.counts).toMatchObject({ 'expansion.anchor_not_in_rule': 1 });
+  });
+
+  it('refuses a weekday counted back from the month\'s end, other than the last', () => {
+    const listed = run([weekly({ fields: { startDate: '2026-12-02', start: '2026-12-02T10:00' }, repeats: { rule: 'FREQ=MONTHLY;BYDAY=1WE,-3WE', evidence: 'every Thursday' } })], knob(), page);
+    const last = run([weekly({ fields: { startDate: '2026-11-24', start: '2026-11-24T19:00' }, repeats: { rule: 'FREQ=MONTHLY;BYDAY=-1TU', evidence: 'every Thursday' } })], knob(), page);
+
+    expect(listed.records).toHaveLength(1);
+    expect(listed.counts).toMatchObject({ 'expansion.rule_from_end': 1 });
+    expect(listed.records[0]?.issues).toContain('repeats: "FREQ=MONTHLY;BYDAY=1WE,-3WE" counts a weekday back from the month\'s end other than the last, so only this date was proposed');
+    expect(last.records.map(r => r.fields.startDate)).toEqual(['2026-11-24', '2026-12-29']);
   });
 
   it('holds a date the model returned with an offset, so one occurrence is one record', () => {
