@@ -578,6 +578,15 @@ export async function emitEvent(input: EmitEventInput): Promise<EmitEventResult>
     await closeMergeCardsOnMerge(input.orgId, payload).catch((err) => {
       console.warn('[events] could not close merge cards', { error: (err as Error).message });
     });
+    // The merge, written on the request it carried, with the runs it started
+    // — so its page says what is carrying it to the release (#269). Off the
+    // event's path: it reads GitHub, and the subscribers below need nothing
+    // from it. A merge it misses is written by the reconcile from this event.
+    void import('@/services/factory/delivery')
+      .then(({ recordMerge }) => recordMerge(input.orgId, payload))
+      .catch((err) => {
+        console.warn('[events] could not record the merge on its request', { error: (err as Error).message });
+      });
   }
 
   // Find active workflows subscribed to this event type whose filter matches.
