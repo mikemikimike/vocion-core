@@ -95,7 +95,12 @@ on-box target alone.
 | Target | How the container starts | When it claims |
 |---|---|---|
 | `on-box` | the `vocion-runner` service in the box's compose (`infra/aws/docker-compose.prod.yml`), looping, one run at a time, capped at `RUNNER_CPUS` (1) and `RUNNER_MEMORY` (4g), with its own throwaway `vocion-runner-db` | a run that has waited `RUNNER_CLAIM_AFTER` (120 s) unclaimed; 0 makes it primary where there is no cloud target |
-| `aws-fargate` | a task in the installation's AWS account, provisioned by the instance's own IaC | at once |
+| `aws-fargate` | a task in the installation's AWS account, provisioned by the instance's own IaC. Vocion starts one per run when the run is queued (`services/runners/targets.ts`, on the app's own AWS credentials: `ecs:RunTask` on the runner task definitions and `iam:PassRole` on their roles), and the instance's scheduled poll starts one more every minute as the fallback | at once (`RUNNER_CLAIM_AFTER=0`); the poll takes what waited a minute |
+
+Every start is written on the run's progress, where the Runs page reads it: the target and task
+it started, or why it could not and who takes the run instead. A failed start never fails the
+dispatch, because the backup and the poll still build. A target is a small driver (`start(target,
+run)`); Azure Container Apps or a custom host would be one more of the same shape.
 
 A runner claims with the installation runner token (`VOCION_RUNNER_TOKEN`, the same value in the
 app and in the runner's secrets): `POST /api/v1/runner/claim { target, workerId, workerVersion,
@@ -129,7 +134,7 @@ The same image runs everywhere. A deploy target only decides where the container
 | `ANTHROPIC_API_KEY` | the model key, the only secret the engineer's process keeps |
 | `GITHUB_TOKEN` | the repository token the runner's own git and `gh` use; the engineer never sees it |
 | `MAX_BUDGET_USD`, `WALL_CLOCK_MINUTES` | ceilings; the run's own cap and deadline tighten them |
-| `RUNNER_POSTGRES_URL` | where `postgres` answers when the contract names no url |
+| `RUNNER_POSTGRES_URL` | the database the target starts beside the runner; it wins over a repo record's url, which cannot know the address on every target |
 | `QA_EVIDENCE_BUCKET`, `QA_EVIDENCE_REGION`, `PRESIGN_ACCESS_KEY_ID`, `PRESIGN_SECRET_ACCESS_KEY` | where screenshots are stored; without a bucket they go into Vocion inline |
 | `DEFAULT_REPO`, `DEFAULT_PRODUCT` | only for a run queued with a bare message and no contract |
 | `LOCAL_TASK`, `LOCAL_TASK_JSON` | run a contract with no Vocion at all (`-` reads stdin) |
