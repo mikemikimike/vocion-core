@@ -10,13 +10,17 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/libs/DB');
+// Whether this installation can draw, as the tests need it.
+const renderer = vi.hoisted(() => ({ ok: true, reason: 'Chromium missing' }));
+vi.mock('@/libs/documents/render', () => ({ renderAvailable: async () => (renderer.ok ? { ok: true } : { ok: false, reason: renderer.reason }) }));
 
 const { db } = await import('@/libs/DB');
 const { automationRunSchema, automationSchema, businessObjectSchema, eventLogSchema, toolCallSchema } = await import('@/models/Schema');
 const { createObjectType } = await import('@/services/BusinessObjectService');
 const { and, eq } = await import('drizzle-orm');
 const { emitEvent } = await import('@/services/EventService');
-const { defaultMockupEnded, requestDefaultMockup, sweepDefaultMockups } = await import('./mockupDefault');
+const { defaultMockupEnded, mockupInfrastructureFailed, requestDefaultMockup, sweepDefaultMockups } = await import('./mockupDefault');
+const { askSchema } = await import('@/models/Schema');
 
 const ORG = 'org_mockup_default';
 let typeId = 0;
@@ -38,6 +42,7 @@ beforeAll(async () => {
   // The plugin's wiring, as the workspace applies it.
   await db.insert(automationSchema).values([
     { orgId: ORG, slug: 'design-mockup-default', name: 'A request with a UI has no mockup', status: 'active', whenConfig: { event: ['object.created', 'object.updated'], filter: { objectType: 'request' } }, doConfig: { job: 'mockup-default', input: RULE }, ownerAgentSlug: 'designer' },
+    { orgId: ORG, slug: 'design-mockup-ended', name: 'A mockup drawing ended', status: 'active', whenConfig: { event: 'never.raised' }, doConfig: { job: 'mockup-ended', input: { attempts: 2, operator: 'ops-seat' } }, ownerAgentSlug: 'designer' },
     { orgId: ORG, slug: 'design-mockup', name: 'Draw the mockup a request owes', status: 'active', whenConfig: { event: 'mockup.requested', filter: { recordType: 'never-matches' } }, doConfig: { checkMission: 'show-it-first', requireTool: 'draw_mockup' } },
   ] as never);
 });
@@ -177,5 +182,77 @@ describe('the hourly sweep', () => {
     const again = await sweepDefaultMockups(ORG, { ...RULE, objectType: 'request' });
 
     expect(again.requested).not.toContain(skippedAtFiling.id);
+  });
+});
+
+describe('an installation that cannot draw (#269)', () => {
+  it('writes it on the record typed, tells the operator the reason once, and a second failure files nothing', async () => {
+    const a = await request({ surface: 'ui', visuals: { mockupDraw: { state: 'drawing', attempt: 1, at: new Date().toISOString() } } }, 'Theme switch for visitors');
+    const b = await request({ surface: 'ui' }, 'Copy link on each row');
+
+    const first = await mockupInfrastructureFailed(ORG, a.id, 'the renderer is not available on this installation (Chromium missing)');
+    const second = await mockupInfrastructureFailed(ORG, b.id, 'the renderer is not available on this installation (Chromium missing)');
+
+    expect(first.asked).toBe(true);
+    expect(second).toEqual({ asked: false, askId: first.askId });
+    expect(((await meta(a.id)).visuals as Record<string, unknown>).mockupDraw).toMatchObject({ state: 'drawing', attempt: 1, cause: 'infrastructure' });
+    // One that was not being drawn (asked for in chat) is written down as failed.
+    expect(((await meta(b.id)).visuals as Record<string, unknown>).mockupDraw).toMatchObject({ state: 'failed', cause: 'infrastructure' });
+
+    const asks = (await db.select().from(askSchema).where(eq(askSchema.orgId, ORG))).filter(x => String(x.sourceRef).startsWith('mockup-infrastructure:'));
+
+    expect(asks).toHaveLength(1);
+    // The operator the plugin names, with the detail; the record's page gets none of it.
+    expect(asks[0]).toMatchObject({ agentSlug: 'ops-seat', status: 'open' });
+    expect(asks[0]!.body).toContain('Chromium missing');
+
+    // The fire ends: no retry into the same wall, and the account says only that it could not be drawn.
+    const [run] = await db.insert(automationRunSchema).values({ orgId: ORG, slug: 'design-mockup', kind: 'mission_check', status: 'ok', invokedBy: 'event:mockup.requested', input: { recordId: a.id, recordType: 'request', attempt: 1 }, finishedAt: new Date() } as never).returning();
+    const ended = await defaultMockupEnded(ORG, { automationRunId: run!.id, attempts: 2 });
+
+    expect(ended.did).toBe('gave-up');
+    expect(await asked(a.id)).toHaveLength(0);
+
+    const after = await meta(a.id);
+
+    expect((after.visuals as Record<string, unknown>).mockupDraw).toMatchObject({ state: 'failed', cause: 'infrastructure' });
+    expect(JSON.stringify(after.recovery)).not.toContain('Chromium');
+  });
+});
+
+describe('once the installation can draw again', () => {
+  it('draws an infrastructure failure again from the start — no attempt spent — only when it can, and closes the operator\'s ask', async () => {
+    const r = await request({ surface: 'ui' }, 'Pin a room to the top of the list');
+    const { askId } = await mockupInfrastructureFailed(ORG, r.id, 'the renderer is not available on this installation (Chromium missing)');
+
+    renderer.ok = false;
+
+    expect((await requestDefaultMockup(ORG, { ...RULE, objectId: r.id, objectType: 'request' })).did).toBe('this installation still cannot draw');
+    expect(await asked(r.id)).toHaveLength(0);
+
+    renderer.ok = true;
+    const out = await sweepDefaultMockups(ORG, { ...RULE, objectType: 'request' });
+
+    expect(out.requested).toContain(r.id);
+    expect(((await meta(r.id)).visuals as Record<string, unknown>).mockupDraw).toMatchObject({ state: 'drawing', attempt: 1 });
+    expect((await asked(r.id)).map(e => e.payload.attempt)).toEqual([1]);
+
+    const [ask] = await db.select().from(askSchema).where(eq(askSchema.id, askId!));
+
+    expect(ask!.status).not.toBe('open');
+  });
+
+  it('gives a failure of no recorded kind one fresh attempt, and then never again (#269)', async () => {
+    const legacy = await request({ surface: 'ui', visuals: { mockupDraw: { state: 'failed', attempt: 2, at: '2026-09-30T22:39:07Z', reason: 'its last draw_mockup call drew nothing — words nobody parses' } } }, 'Switch theme on a shared room');
+
+    expect((await requestDefaultMockup(ORG, { ...RULE, objectId: legacy.id, objectType: 'request' })).did).toBe('requested:1');
+
+    // The fresh attempt draws nothing, twice: written down with its kind, and left.
+    const fire = async (attempt: number) => (await db.insert(automationRunSchema).values({ orgId: ORG, slug: 'design-mockup', kind: 'mission_check', status: 'ok', invokedBy: 'event:mockup.requested', input: { recordId: legacy.id, recordType: 'request', attempt }, finishedAt: new Date() } as never).returning())[0]!.id;
+
+    expect((await defaultMockupEnded(ORG, { automationRunId: await fire(1), error: 'refused', attempts: 2 })).did).toBe('retry:2');
+    expect((await defaultMockupEnded(ORG, { automationRunId: await fire(2), error: 'refused', attempts: 2 })).did).toBe('gave-up');
+    expect(((await meta(legacy.id)).visuals as Record<string, unknown>).mockupDraw).toMatchObject({ state: 'failed', attempt: 2, cause: 'content' });
+    expect((await requestDefaultMockup(ORG, { ...RULE, objectId: legacy.id, objectType: 'request' })).did).toMatch(/^drew nothing after 2 attempts/);
   });
 });
