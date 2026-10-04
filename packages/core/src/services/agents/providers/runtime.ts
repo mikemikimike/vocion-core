@@ -109,6 +109,11 @@ export async function runAgentOnRuntime(opts: RuntimeRunOptions): Promise<{
   toolCalls: Array<{ tool: string; input: Record<string, unknown>; output: string }>;
 }> {
   const emit = opts.onEvent ?? (() => {});
+  const runtimeArn = process.env.VOCION_AGENT_RUNTIME_ARN;
+  const runtimeSecret = runtimeArn ? undefined : RUNTIME_SECRET();
+  if (!runtimeArn && !runtimeSecret) {
+    throw new Error('VOCION_AGENT_RUNTIME_SECRET must be set when invoking the runtime over HTTP');
+  }
 
   const [row] = await db
     .select()
@@ -382,7 +387,6 @@ export async function runAgentOnRuntime(opts: RuntimeRunOptions): Promise<{
   // typed error event first, mirroring loop.ts's own catch, then rethrow
   // so the caller's promise still rejects exactly as before.
   try {
-    const runtimeArn = process.env.VOCION_AGENT_RUNTIME_ARN;
     if (runtimeArn) {
       // Deployed transport: InvokeAgentRuntime (SigV4) against AgentCore.
       const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = await import('@aws-sdk/client-bedrock-agentcore');
@@ -409,10 +413,6 @@ export async function runAgentOnRuntime(opts: RuntimeRunOptions): Promise<{
       }
     } else {
       // Local transport: plain HTTP to the artifact.
-      const runtimeSecret = RUNTIME_SECRET();
-      if (!runtimeSecret) {
-        throw new Error('VOCION_AGENT_RUNTIME_SECRET must be set when invoking the runtime over HTTP');
-      }
       const res = await fetch(`${RUNTIME_URL()}/invocations`, {
         method: 'POST',
         headers: {

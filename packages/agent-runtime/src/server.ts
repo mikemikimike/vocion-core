@@ -21,6 +21,11 @@ import { runInvocation } from './loop.js';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
+function bearerSecret(authorization: string | undefined): string | undefined {
+  const match = authorization?.match(/^Bearer[ \t]+(\S+)$/i);
+  return match?.[1];
+}
+
 /**
  * AgentCore authenticates InvokeAgentRuntime with SigV4 before the request
  * reaches this process. Local HTTP has no such boundary, so it must use a
@@ -38,11 +43,7 @@ function isAuthorized(req: IncomingMessage): boolean {
   }
 
   const expectedSecret = process.env.VOCION_AGENT_RUNTIME_SECRET;
-  const authorization = req.headers.authorization;
-  const prefix = 'Bearer ';
-  const providedSecret = authorization?.startsWith(prefix)
-    ? authorization.slice(prefix.length)
-    : undefined;
+  const providedSecret = bearerSecret(req.headers.authorization);
   if (!expectedSecret || !providedSecret) {
     return false;
   }

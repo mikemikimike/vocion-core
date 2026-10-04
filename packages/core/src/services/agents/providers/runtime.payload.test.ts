@@ -33,12 +33,22 @@ const { agentSchema } = await import('@/models/Schema');
 const { runAgentOnRuntime } = await import('./runtime');
 
 const ORG = 'org_runtime_payload';
+const originalRuntimeSecret = process.env.VOCION_AGENT_RUNTIME_SECRET;
+const originalRuntimeArn = process.env.VOCION_AGENT_RUNTIME_ARN;
 const SESSION = {
   accessKeyId: 'ASIADDDDDDDDDDDDDDDD',
   secretAccessKey: 'session-secret',
   sessionToken: 'session-token',
   expiresAt: '2026-09-04T18:00:00.000Z',
 };
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
 
 /** Captures the body of the single POST the provider makes. */
 function captureInvocation(): { payload: () => Record<string, unknown> } {
@@ -73,7 +83,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await db.delete(agentSchema);
-  delete process.env.VOCION_AGENT_RUNTIME_SECRET;
+  restoreEnv('VOCION_AGENT_RUNTIME_SECRET', originalRuntimeSecret);
+  restoreEnv('VOCION_AGENT_RUNTIME_ARN', originalRuntimeArn);
   vi.unstubAllGlobals();
 });
 

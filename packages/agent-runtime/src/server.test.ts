@@ -101,6 +101,13 @@ describe('POST /invocations authentication', () => {
     expect(runInvocation).toHaveBeenCalledOnce();
   });
 
+  it.each(['bearer runtime-test-secret', 'BEARER  runtime-test-secret'])('accepts a standard bearer scheme variant: %s', async (authorization) => {
+    const response = await post({ authorization });
+
+    expect(response.status).toBe(200);
+    expect(runInvocation).toHaveBeenCalledOnce();
+  });
+
   it('fails closed when the local runtime has no configured secret', async () => {
     delete process.env.VOCION_AGENT_RUNTIME_SECRET;
 
