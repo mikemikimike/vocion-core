@@ -21,6 +21,8 @@
 # kept low: a burst of green checks is more likely a symptom than a workload.
 slug: contract-red-team-evidence
 name: Green checks are not the same as a proven contract
+label: QA reviewed
+doing: QA reviewing
 description: >-
   When every check on a factory pull request has passed, the change reviewer
   reads each acceptance criterion against the evidence attached to it: is this
@@ -30,8 +32,13 @@ status: active
 agent: change-reviewer
 when:
   event: pr.checks_completed
+  # Open pull requests only: a closed one is an attempt that was replaced or
+  # given up, and a late check event about it is history (request 224,
+  # 2026-10-02: a review of closed PR #159 sent back a superseded attempt and
+  # queued a build of a feature that had shipped).
   filter:
     conclusion: success
+    state: open
   maxFiresPer10m: 4
 do:
   checkMission: prove-the-contract
@@ -49,6 +56,20 @@ do:
     to someone who did not write it? A passing check is not evidence for a
     criterion it does not exercise; a screenshot of the wrong state is not
     evidence; a criterion with no link is unproven.
+
+    The contract graded is the task's acceptanceContract: the request's
+    frozen criteria AND the plan's risk lines ("The plan's risk is handled:
+    …"). Judge the risk lines too, usually by a named test.
+
+    The task's stored test run lists every test that ran on the branch, each
+    with an id: cite the tests that prove a criterion by id in its `tests`.
+
+    When the run stored no screenshot (its QA evidence says the surface could
+    not be built or reached), a line only the running product can show is
+    `live`, not unproven: judge everything else, approve when the rest is
+    proven, and the live check after deploy proves those lines in production.
+    A named test that matched no test that ran is the engineer's naming gap,
+    not a skipped test; judge the criterion on the tests that did run.
 
     End by calling record_verdict with every criterion judged proven, unproven
     or unchecked, the evidence for each proven one, and one sentence for the

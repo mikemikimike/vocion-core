@@ -43,6 +43,7 @@ import type { IngestDoc } from '@/services/IngestionService';
 import { createHash } from 'node:crypto';
 import { load } from 'cheerio';
 import { z } from 'zod';
+import { dayKey, dayPlus, instantInZone, isoInZone, isValidTimeZone } from '@/libs/time/zone';
 import { JSON_LD_BLOCK_CAP, pageMetadata } from './pageMetadata';
 
 const urlsFromSchema = z.object({
@@ -604,19 +605,33 @@ function splitFeed(page: FetchedPage): IngestDoc[] | null {
 const ICS_EXPORT_STAMP = 'DTSTAMP';
 
 /**
+ * How many overridden instances a repeating entry's metadata keeps, the
+ * latest when a feed writes more, so one broken or hostile feed cannot write
+ * an arbitrarily large row and a long series keeps the ones still ahead. Only
+ * a value shaped like a date or a date-time counts, which bounds each one at
+ * sixteen characters.
+ */
+const OVERRIDDEN_CAP = 50;
+const ICS_INSTANCE_RE = /^\d{8}(?:T\d{6}Z?)?$/i;
+
+/**
  * Split an ICS body on `BEGIN:VEVENT` … `END:VEVENT`.
  *
- * A text split and nothing more: no TZID arithmetic, no RRULE expansion. Every
- * property read as a value is unfolded, because RFC 5545 makes a fold a fact
- * about the line rather than about the value, so reading one without unfolding
- * simply truncates it. A recurring event stays one document unless the feed
- * itself writes separate components with RECURRENCE-ID.
+ * A text split with no RRULE expansion. Every property read as a value is
+ * unfolded, because RFC 5545 makes a fold a fact about the line rather than
+ * about the value, so reading one without unfolding simply truncates it. A
+ * recurring event stays one document unless the feed itself writes separate
+ * components with RECURRENCE-ID.
  *
- * The component is kept verbatim but for `ICS_EXPORT_STAMP`, which says when
- * the file was written and would otherwise make a re-export read as an edit.
+ * The document text is the component without `ICS_EXPORT_STAMP`, which says
+ * when the file was written and would otherwise make a re-export read as an
+ * edit, with its lines unfolded and, when the calendar declares its zone, its
+ * UTC times written as that zone's wall clock (see `icsModelLines`). Keys are
+ * read from the component as written.
  * @param page - the fetched feed.
  */
 function splitIcs(page: FetchedPage): IngestDoc[] | null {
+  const zone = calendarTimeZone(page.raw);
   const blocks: string[][] = [];
   let current: string[] | null = null;
   for (const line of page.raw.split(/\r?\n/)) {
@@ -640,6 +655,15 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     return null;
   }
 
+  const overrides = new Map<string, Set<string>>();
+  for (const block of blocks) {
+    const rid = icsValue(block, 'RECURRENCE-ID');
+    if (ICS_INSTANCE_RE.test(rid)) {
+      const uid = icsValue(block, 'UID');
+      overrides.set(uid, (overrides.get(uid) ?? new Set<string>()).add(rid));
+    }
+  }
+
   const docs: IngestDoc[] = [];
   const seen = new Set<string>();
   for (const block of blocks) {
@@ -656,11 +680,14 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
     }
     seen.add(externalId);
     const published = icsPublishedUrls(block, page.url);
+    const entryUrl = icsPublishedValues(block, 'URL').find(isFetchableUrl);
+    const endsOn = icsEndsOn(block, zone);
+    const overridden = recurrenceId ? [] : [...(overrides.get(uid) ?? [])].sort().slice(-OVERRIDDEN_CAP);
     docs.push({
       externalId,
       uri: externalId,
       title: icsValue(block, 'SUMMARY') || uid,
-      content: withoutIcsProperty(block, ICS_EXPORT_STAMP).join('\n'),
+      content: icsModelLines(withoutIcsProperty(block, ICS_EXPORT_STAMP), zone).join('\n'),
       // Feed-wide headers say nothing about one event inside it.
       etag: null,
       lastModifiedAt: null,
@@ -670,6 +697,10 @@ function splitIcs(page: FetchedPage): IngestDoc[] | null {
         // Omitted when empty: an entry that publishes no URL must keep writing
         // the metadata it wrote before, or every sync reports a refresh.
         ...(published.length ? { publishedUrls: published } : {}),
+        ...(entryUrl ? { entryUrl } : {}),
+        ...(endsOn ? { endsOn } : {}),
+        ...(zone ? { calendarZone: zone } : {}),
+        ...(overridden.length ? { overridden } : {}),
       },
     });
   }
@@ -852,6 +883,22 @@ function icsValueColon(line: string): { colon: number; guessed: boolean } {
 const ICS_FOLD_RE = /^[ \t]/;
 
 /**
+ * Lines with every fold joined back to the line it continues.
+ * @param lines - content lines, as written.
+ */
+function unfoldIcs(lines: string[]): string[] {
+  const out: string[] = [];
+  for (const line of lines) {
+    if (ICS_FOLD_RE.test(line) && out.length > 0) {
+      out[out.length - 1] += line.slice(1);
+    } else {
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/**
  * One occurrence of a property, unfolded, with what the scanner knows about
  * it: whether the event itself wrote it rather than a component nested inside
  * it, and whether the split between its name and its value had to be guessed.
@@ -920,6 +967,268 @@ function withoutIcsProperty(lines: string[], name: string): string[] {
   return drop.size === 0 ? lines : lines.filter((_, i) => !drop.has(i));
 }
 
+/** Properties whose UTC date-times `icsModelLines` writes as local wall clock. */
+const ICS_ZONED_PROPERTIES = new Set(['DTSTART', 'DTEND', 'RECURRENCE-ID', 'EXDATE', 'RDATE']);
+const ICS_UTC_TIME_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i;
+/** How far a zone's clocks jump at a change: half an hour, one or two. */
+const CLOCK_SHIFTS_MS = [1_800_000, 3_600_000, 7_200_000];
+
+/**
+ * The zone a calendar declares for itself in its header (`X-WR-TIMEZONE`).
+ * @param raw - the whole calendar file.
+ */
+function calendarTimeZone(raw: string): string | undefined {
+  const start = raw.search(/^BEGIN:VEVENT/im);
+  return knownTimeZone(icsValue((start < 0 ? raw : raw.slice(0, start)).split(/\r?\n/), 'X-WR-TIMEZONE'));
+}
+
+/**
+ * A UTC date-time as a Date.
+ * @param value - `YYYYMMDDTHHMMSSZ`.
+ */
+function icsUtcInstant(value: string): Date | undefined {
+  const m = ICS_UTC_TIME_RE.exec(value);
+  return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))) : undefined;
+}
+
+/**
+ * A UTC date-time as the same moment on a zone's wall clock, in ICS form, or
+ * undefined for a wall time the zone shows twice (when its clocks go back):
+ * RFC 5545 reads that as the first one, which would move the event.
+ * @param value - `YYYYMMDDTHHMMSSZ`.
+ * @param zone - an IANA time zone name.
+ */
+function icsWallClock(value: string, zone: string): string | undefined {
+  const at = icsUtcInstant(value);
+  if (!at) {
+    return undefined;
+  }
+  const wall = (d: Date) => isoInZone(d, zone).slice(0, 19);
+  const local = wall(at);
+  const repeated = CLOCK_SHIFTS_MS.some(shift => wall(new Date(at.getTime() + shift)) === local || wall(new Date(at.getTime() - shift)) === local);
+  return repeated ? undefined : local.replaceAll('-', '').replaceAll(':', '');
+}
+
+/**
+ * One content line with its UTC times written in the calendar's zone, as
+ * `DTSTART;TZID=<zone>:<local>`. Lines that already name a zone, carry
+ * dates rather than date-times, or mix forms are left as they are.
+ * @param line - one unfolded content line.
+ * @param zone - the calendar's declared zone.
+ */
+function icsLineInZone(line: string, zone: string): string {
+  const { colon, guessed } = icsValueColon(line);
+  if (colon < 0 || guessed) {
+    return line;
+  }
+  const [name = '', ...params] = line.slice(0, colon).split(';');
+  if (!ICS_ZONED_PROPERTIES.has(name.toUpperCase()) || params.some(param => /^(?:TZID=|VALUE=(?:DATE|PERIOD)$)/i.test(param))) {
+    return line;
+  }
+  const local = line.slice(colon + 1).split(',').map(value => icsWallClock(value, zone));
+  if (local.includes(undefined)) {
+    return line;
+  }
+  return `${[name, `TZID=${zone}`, ...params].join(';')}:${local.join(',')}`;
+}
+
+/**
+ * Whether the component's times repeat in UTC: it has its own RRULE, or it is
+ * an override that also moves every later occurrence (`RANGE=THISANDFUTURE`).
+ * @param lines - the component's lines, as written.
+ */
+function icsRepeatsInUtc(lines: string[]): boolean {
+  return icsOwnValue(lines, 'RRULE') !== '' || unfoldIcs(lines).some(line => /^RECURRENCE-ID;[^:]*RANGE=THISANDFUTURE/i.test(line));
+}
+
+/**
+ * Whether the component repeats on its own: a rule, an override that moves
+ * every later occurrence, or extra dates.
+ * @param lines - the component's lines, as written or as the model reads them.
+ */
+export function icsRepeats(lines: string[]): boolean {
+  return icsRepeatsInUtc(lines) || icsOwnValue(lines, 'RDATE') !== '';
+}
+
+/**
+ * The component as the model reads it: every folded line joined back to the
+ * line it continues, so a URL or a description arrives whole, and, when the
+ * calendar declares a zone, UTC times on the wall clock of that zone. A
+ * component whose times repeat in UTC keeps them, since a local start would
+ * move every occurrence after a clock change.
+ * @param lines - the component's lines, as written.
+ * @param zone - the calendar's declared zone, if any.
+ */
+function icsModelLines(lines: string[], zone?: string): string[] {
+  const out = unfoldIcs(lines);
+  return zone && !icsRepeatsInUtc(lines) ? out.map(line => icsLineInZone(line, zone)) : out;
+}
+
+/**
+ * The last calendar day a one-off entry covers, `YYYY-MM-DD`, or undefined
+ * when the entry repeats, overrides every later occurrence
+ * (`RANGE=THISANDFUTURE`), or ends by `DURATION`. An all-day `DTEND` is
+ * exclusive, so the day before it.
+ * @param block - the component's lines, as written.
+ * @param zone - the calendar's declared zone, if any.
+ */
+function icsEndsOn(block: string[], zone?: string): string | undefined {
+  if (icsRepeats(block)) {
+    return undefined;
+  }
+  const end = icsOwnValue(block, 'DTEND');
+  if (!end && icsOwnValue(block, 'DURATION')) {
+    return undefined;
+  }
+  const value = end || icsOwnValue(block, 'DTSTART');
+  if (zone) {
+    const at = icsUtcInstant(value);
+    if (at) {
+      return dayKey(at, zone);
+    }
+  }
+  const m = /^(\d{4})(\d{2})(\d{2})(T\d{6}Z?)?$/i.exec(value);
+  if (!m) {
+    return undefined;
+  }
+  const day = `${m[1]}-${m[2]}-${m[3]}`;
+  return end && !m[4] ? dayPlus(day, -1) : day;
+}
+
+/** How long each occurrence lasts: whole days on the series' clock, then exact milliseconds. */
+export type IcsDuration = { days: number; ms: number };
+
+/**
+ * A `DURATION` value, or undefined for a negative, empty or unreadable one.
+ * @param value - `P1W`, `P1DT2H`, `PT1H30M`, ...
+ */
+function icsDuration(value: string): IcsDuration | undefined {
+  const m = /^\+?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/i.exec(value);
+  if (!m || /T$/i.test(value) || m.slice(1).every(part => part === undefined)) {
+    return undefined;
+  }
+  const [weeks, days, hours, minutes, seconds] = m.slice(1).map(part => Number(part ?? '0')) as [number, number, number, number, number];
+  return { days: weeks * 7 + days, ms: ((hours * 60 + minutes) * 60 + seconds) * 1000 };
+}
+
+/**
+ * A repeating component's rule and anchor, for a caller that expands it.
+ * Undefined when the component has no RRULE of its own, more than one, or an
+ * EXRULE, or when its start or any EXDATE or RDATE line cannot be read, or is
+ * a date where the start is a time (or the reverse): a cancelled date the
+ * reader skipped would otherwise stay in the list as if it were certain. How
+ * long each occurrence lasts comes from `DTEND` or `DURATION`, and is left
+ * unknown when neither reads or the end is not after the start.
+ * @param lines - the component's lines, as written or as the model reads them.
+ * @param fallbackZone - the zone an all-day or floating start runs in.
+ */
+export function icsRecurrence(lines: string[], fallbackZone = 'UTC'): { start: Date; anchorZone: string; rule: string; exdates: Date[]; rdates: Date[]; allDay: boolean; duration?: IcsDuration } | undefined {
+  const rules = icsOwnValues(lines, 'RRULE');
+  if (rules.length !== 1 || icsOwnValues(lines, 'EXRULE').length > 0) {
+    return undefined;
+  }
+  const rule = rules[0]!;
+  const unfolded = unfoldIcs(lines);
+  const startLine = unfolded.find(line => /^DTSTART[;:]/i.test(line));
+  const read = startLine ? icsInstants(startLine, fallbackZone) : undefined;
+  if (!read || read.instants.length !== 1) {
+    return undefined;
+  }
+  const exdates: Date[] = [];
+  const rdates: Date[] = [];
+  for (const line of unfolded) {
+    const name = /^(EXDATE|RDATE)[;:]/i.exec(line)?.[1]?.toUpperCase();
+    if (!name) {
+      continue;
+    }
+    const extra = icsInstants(line, fallbackZone);
+    if (!extra || extra.allDay !== read.allDay) {
+      return undefined;
+    }
+    (name === 'EXDATE' ? exdates : rdates).push(...extra.instants);
+  }
+  const start = read.instants[0]!;
+  const endLine = unfolded.find(line => /^DTEND[;:]/i.test(line));
+  const ends = endLine ? icsInstants(endLine, fallbackZone) : undefined;
+  const lasts = ends?.instants.length === 1 && ends.allDay === read.allDay ? ends.instants[0]!.getTime() - start.getTime() : undefined;
+  const duration = lasts === undefined
+    ? (endLine ? undefined : icsDuration(icsOwnValue(lines, 'DURATION')))
+    : read.allDay ? { days: Math.round(lasts / 86_400_000), ms: 0 } : { days: 0, ms: lasts };
+  return { start, anchorZone: read.anchorZone, rule, exdates, rdates, allDay: read.allDay, ...(duration && (duration.days > 0 || duration.ms > 0) ? { duration } : {}) };
+}
+
+/**
+ * The instants one date or date-time property line names, with the clock they
+ * run on: `Z` is UTC, `TZID=` is that zone, a floating time is the fallback
+ * zone, and a bare date is noon there, so a zone whose clocks jump at
+ * midnight still names that day. Undefined for a period, a zone the runtime
+ * does not know, a list that mixes dates and date-times, a date or time that
+ * does not exist, or any other form.
+ * @param line - one unfolded content line.
+ * @param fallbackZone - the zone a date or a floating time runs in.
+ */
+function icsInstants(line: string, fallbackZone: string): { instants: Date[]; anchorZone: string; allDay: boolean } | undefined {
+  const { colon, guessed } = icsValueColon(line);
+  if (colon < 0 || guessed) {
+    return undefined;
+  }
+  const params = line.slice(0, colon).split(';').slice(1);
+  if (params.some(p => /^VALUE=PERIOD$/i.test(p))) {
+    return undefined;
+  }
+  const tzid = params.find(p => /^TZID=/i.test(p))?.slice(5);
+  const zone = tzid ? knownTimeZone(tzid) : undefined;
+  if (tzid && !zone) {
+    return undefined;
+  }
+  const instants: Date[] = [];
+  const kinds = new Set<'date' | 'local' | 'utc'>();
+  for (const value of line.slice(colon + 1).split(',')) {
+    const read = icsValueInstant(value, zone ?? fallbackZone);
+    if (!read) {
+      return undefined;
+    }
+    kinds.add(read.kind);
+    instants.push(read.at);
+  }
+  if (kinds.has('date') && kinds.size > 1) {
+    return undefined;
+  }
+  return { instants, anchorZone: kinds.size === 1 && kinds.has('utc') ? 'UTC' : (zone ?? fallbackZone), allDay: kinds.has('date') };
+}
+
+/**
+ * One date or date-time value as an instant: `Z` is UTC, a local time is on
+ * the zone's clock, and a bare date is noon there. Undefined for any other
+ * form, or a date or time that does not exist.
+ * @param value - `YYYYMMDD`, `YYYYMMDDTHHMMSS` or `YYYYMMDDTHHMMSSZ`.
+ * @param zone - the clock a date or a local time runs on.
+ */
+function icsValueInstant(value: string, zone: string): { at: Date; kind: 'date' | 'local' | 'utc' } | undefined {
+  const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/i.exec(value);
+  if (!m) {
+    return undefined;
+  }
+  const kind = m[4] === undefined ? 'date' : m[7] ? 'utc' : 'local';
+  const at = instantInZone(`${m[1]}-${m[2]}-${m[3]}T${m[4] ?? '12'}:${m[5] ?? '00'}:${m[6] ?? '00'}`, kind === 'utc' ? 'UTC' : zone);
+  return Number.isNaN(at.getTime()) ? undefined : { at, kind };
+}
+
+/**
+ * The instant a stored `overridden` value names, read the way `icsRecurrence`
+ * reads the series: RFC 5545 writes a RECURRENCE-ID in its start's own form, so
+ * a local time runs on the series' clock and a date is noon there. Undefined
+ * for a date on a timed series, a time on an all-day one, or any other form.
+ * @param value - one value `splitIcs` stored, as the feed wrote it.
+ * @param series - the series as `icsRecurrence` read it.
+ * @param series.anchorZone - the clock the series runs on.
+ * @param series.allDay - whether the series is all-day.
+ */
+export function icsOverriddenInstant(value: string, series: { anchorZone: string; allDay: boolean }): Date | undefined {
+  const read = icsValueInstant(value, series.anchorZone);
+  return read && (read.kind === 'date') === series.allDay ? read.at : undefined;
+}
+
 /**
  * Every occurrence of one property in a VEVENT block, unfolded, each marked
  * with whether it is the event's own.
@@ -968,6 +1277,16 @@ function icsProperties(lines: string[], name: string): IcsProperty[] {
 }
 
 /**
+ * Every value of one property the component carries itself, never a nested
+ * alarm's.
+ * @param lines - the component's lines, as written or as the model reads them.
+ * @param name - the property name, uppercase.
+ */
+export function icsOwnValues(lines: string[], name: string): string[] {
+  return icsProperties(lines, name).filter(p => p.own).map(p => p.value);
+}
+
+/**
  * Every occurrence of one property that the event itself certainly published.
  *
  * Two exclusions, both about not putting words in a document's mouth. A
@@ -1002,6 +1321,15 @@ function icsPublishedValues(lines: string[], name: string): string[] {
 function icsValue(lines: string[], name: string): string {
   const found = icsProperties(lines, name);
   return (found.find(p => p.own) ?? found[0])?.value ?? '';
+}
+
+/**
+ * The component's own value for a property, never one of a nested alarm's.
+ * @param lines - the block's lines, starting at its own `BEGIN:`.
+ * @param name - the property name, uppercase.
+ */
+function icsOwnValue(lines: string[], name: string): string {
+  return icsProperties(lines, name).find(p => p.own)?.value ?? '';
 }
 
 /**
@@ -1071,10 +1399,8 @@ function feedEntries(page: FetchedPage): unknown[] | null {
   if (!page.contentType.includes('json')) {
     return null;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(page.raw);
-  } catch {
+  const parsed = pageJson(page);
+  if (parsed === undefined) {
     return null;
   }
   const bare = entryArray(parsed);
@@ -1170,6 +1496,56 @@ function plainText(value: string): string {
   return MARKUP_RE.test(value) ? flatten(textFromMarkup(value)) : value;
 }
 
+/** A region zone (`Area/City`); offsets such as `+05:30` and the `Etc/` aliases are not. */
+const REGION_ZONE_RE = /^(?!Etc\/)[A-Z][\w+-]*(?:\/[\w+-]+)+$/i;
+
+/**
+ * A zone name a feed declared, kept only when it is a region zone the runtime
+ * knows, in its canonical spelling: an offset would break a TZID parameter,
+ * and UTC needs no rewrite.
+ * @param value - whatever the feed wrote where a zone name belongs.
+ */
+function knownTimeZone(value: unknown): string | undefined {
+  const zone = typeof value === 'string' ? value.trim() : '';
+  if (!REGION_ZONE_RE.test(zone) || !isValidTimeZone(zone)) {
+    return undefined;
+  }
+  return new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
+}
+
+const parsedBodies = new WeakMap<FetchedPage, unknown>();
+
+/**
+ * The page's body parsed as JSON, once per page, or undefined when it does not parse.
+ * @param page - the fetched page.
+ */
+function pageJson(page: FetchedPage): unknown {
+  if (!parsedBodies.has(page)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(page.raw);
+    } catch {
+      parsed = undefined;
+    }
+    parsedBodies.set(page, parsed);
+  }
+  return parsedBodies.get(page);
+}
+
+/**
+ * The time zone a JSON feed declares for itself: Squarespace writes it under
+ * `website.timeZone`, other feeds at the top level.
+ * @param page - the fetched feed.
+ */
+function feedTimeZone(page: FetchedPage): string | undefined {
+  const parsed = pageJson(page);
+  if (!isRecord(parsed)) {
+    return undefined;
+  }
+  const website = isRecord(parsed.website) ? parsed.website : {};
+  return knownTimeZone(parsed.timeZone) ?? knownTimeZone(parsed.timezone) ?? knownTimeZone(website.timeZone);
+}
+
 /**
  * The entry as it reads: markup reduced to the text it renders, a millisecond
  * timestamp written as the instant it names, view counters left out.
@@ -1183,10 +1559,14 @@ function plainText(value: string): string {
  * also what a reader, human or model, was going to read anyway: an epoch
  * integer is a date nobody can check, and the markup is several times the size
  * of the words inside it.
+ *
+ * An instant is written in the feed's own time zone when the feed names one,
+ * because a model asked for local times copies a UTC hour as if it were local.
  * @param value - any JSON value from the entry.
  * @param key - the key it sat under, where it had one.
+ * @param zone - the time zone the feed declares, if any.
  */
-function readable(value: unknown, key?: string): unknown {
+function readable(value: unknown, key?: string, zone?: string): unknown {
   if (typeof value === 'string') {
     return MARKUP_RE.test(value) ? textFromMarkup(value) : value;
   }
@@ -1196,15 +1576,18 @@ function readable(value: unknown, key?: string): unknown {
       && Number.isInteger(value)
       && value >= EPOCH_MS_MIN
       && value <= EPOCH_MS_MAX;
-    return isInstant ? new Date(value).toISOString() : value;
+    if (!isInstant) {
+      return value;
+    }
+    return zone ? isoInZone(new Date(value), zone) : new Date(value).toISOString();
   }
   if (Array.isArray(value)) {
-    return value.map(entry => readable(entry, key));
+    return value.map(entry => readable(entry, key, zone));
   }
   if (isRecord(value)) {
     return Object.fromEntries(Object.entries(value)
       .filter(([k]) => !ITEM_VOLATILE_FIELDS.has(k))
-      .map(([k, v]) => [k, readable(v, k)]));
+      .map(([k, v]) => [k, readable(v, k, zone)]));
   }
   return value;
 }
@@ -1217,6 +1600,7 @@ function readable(value: unknown, key?: string): unknown {
  * @param items - the entries, as `feedEntries` found them.
  */
 function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null {
+  const zone = feedTimeZone(page);
   if (!items.length) {
     // Unreachable from the one caller, because `feedEntries` answers only with
     // null or a non-empty list. Kept rather than dropped because of what
@@ -1253,18 +1637,20 @@ function splitJsonArray(page: FetchedPage, items: unknown[]): IngestDoc[] | null
     }
     seen.add(externalId);
     const published = declaredUrls(item, page.url);
+    const entryUrl = declaredPageUrl(item, page.url);
     const declared = declaredTitle(item);
     docs.push({
       externalId,
       uri: externalId,
       title: declared === undefined ? key : plainText(declared),
-      content: JSON.stringify(readable(item)) ?? body,
+      content: JSON.stringify(readable(item, undefined, zone)) ?? body,
       etag: null,
       lastModifiedAt: null,
       metadata: {
         contentType: page.contentType,
         feedUrl: page.url,
         ...(published.length ? { publishedUrls: published } : {}),
+        ...(entryUrl ? { entryUrl } : {}),
       },
     });
   }
@@ -1285,6 +1671,8 @@ const ITEM_TITLE_FIELDS = ['name', 'title', 'summary'] as const;
  * reason this list resolves relative values: `fullUrl` is a path, `/events/x`,
  * and the gate it feeds compares exactly, so an unresolved path can never
  * match what a model read and would drop the link it exists to keep.
+ * `assetUrl` is the entry's file, an image unless its `contentType` says
+ * otherwise.
  *
  * `imageUrl` is here because it is the extractor's own field name: an entry
  * that publishes its poster under the very key the pipeline reads it back out
@@ -1303,6 +1691,9 @@ const ITEM_URL_FIELDS = [
   'assetUrl',
   'photo_url',
 ] as const;
+
+/** The keys of `ITEM_URL_FIELDS` that name the item's own page. */
+const ITEM_PAGE_FIELDS = ['url', 'link'] as const satisfies ReadonlyArray<typeof ITEM_URL_FIELDS[number]>;
 
 /**
  * A value with no `/`, `.` or `:` cannot be a link, whatever key it sits under.
@@ -1421,26 +1812,40 @@ function declaredUrls(item: unknown, baseUrl: string): string[] {
   if (!fields) {
     return [];
   }
-  const out: string[] = [];
-  for (const field of ITEM_URL_FIELDS) {
-    const value = fields[field];
-    if (typeof value !== 'string') {
-      continue;
-    }
-    // Resolved against the feed's own URL, which is where the entry was
-    // published. A base that will not parse leaves the value as written, and
-    // a path that stays a path then fails the fetchable test below.
-    if (UNLINKABLE_VALUE_RE.test(value.trim())) {
-      continue;
-    }
-    const url = absoluteUrl(value, baseUrl) ?? '';
-    if (isFetchableUrl(url)) {
-      out.push(url);
-    }
-  }
+  const notImage = typeof fields.contentType === 'string' && !fields.contentType.toLowerCase().startsWith('image/');
+  const out = ITEM_URL_FIELDS
+    .filter(field => !(notImage && field === 'assetUrl'))
+    .map(field => declaredUrl(fields[field], baseUrl))
+    .filter(url => url !== undefined);
   // A CMS export routinely repeats one link under two keys, so the dedupe is
   // what keeps the stored row honest rather than a formality.
   return dedupe(out).slice(0, PUBLISHED_URL_CAP);
+}
+
+/**
+ * The page the item names as its own, read the way `declaredUrls` reads it.
+ * @param item - one entry from the array.
+ * @param baseUrl - the feed's own URL, which a relative value resolves against.
+ */
+function declaredPageUrl(item: unknown, baseUrl: string): string | undefined {
+  const fields = entryFields(item);
+  return fields ? ITEM_PAGE_FIELDS.map(field => declaredUrl(fields[field], baseUrl)).find(url => url !== undefined) : undefined;
+}
+
+/**
+ * One top-level value of an item as a fetchable URL, or undefined.
+ * @param value - the value under one of `ITEM_URL_FIELDS`.
+ * @param baseUrl - the feed's own URL, which a relative value resolves against.
+ */
+function declaredUrl(value: unknown, baseUrl: string): string | undefined {
+  // Resolved against the feed's own URL, which is where the entry was
+  // published. A base that will not parse leaves the value as written, and
+  // a path that stays a path then fails the fetchable test below.
+  if (typeof value !== 'string' || UNLINKABLE_VALUE_RE.test(value.trim())) {
+    return undefined;
+  }
+  const url = absoluteUrl(value, baseUrl) ?? '';
+  return isFetchableUrl(url) ? url : undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1667,11 +2072,7 @@ function looksLikeFeed(kind: FeedCandidate['kind'], page: FetchedPage): boolean 
  * @param page - the fetched candidate.
  */
 function jsonObjectBody(page: FetchedPage): boolean {
-  try {
-    return isRecord(JSON.parse(page.raw));
-  } catch {
-    return false;
-  }
+  return isRecord(pageJson(page));
 }
 
 /**
@@ -1742,7 +2143,8 @@ const JSON_LD_TRUNCATED = '[structured data truncated]';
  * properly instead, so we can drop the chrome and keep the facts.
  *
  * `structure` is the same walk's structured half, the parsed JSON-LD, the
- * og:image and every URL the page published, kept instead of thrown away.
+ * og:image, every URL the page published and every image its text shows,
+ * kept instead of thrown away.
  * It is optional on the return type because the callers write
  * `{ title: undefined, content: raw, structure: undefined }` for non-HTML
  * bodies.
@@ -1790,7 +2192,7 @@ export function extractFromHtml(html: string, baseUrl?: string, ignore: readonly
   // file as the hero image in the body.
   const renderedImages = new Set<string>(image ? [image] : []);
   const renderedLinks = new Set<string>();
-  renderImages($, baseUrl, renderedImages);
+  const shown = renderImages($, baseUrl, renderedImages);
   renderTimes($);
   renderLinks($, baseUrl, renderedLinks);
   markBreaks($);
@@ -1819,6 +2221,9 @@ export function extractFromHtml(html: string, baseUrl?: string, ignore: readonly
   }
   if (published.length) {
     structure.links = published;
+  }
+  if (shown.length) {
+    structure.images = shown;
   }
 
   return { title, content: parts.join('\n\n'), structure };
@@ -1987,12 +2392,14 @@ function removeBoilerplate($: CheerioAPI): void {
 }
 
 /**
- * Replace each image with `[image: alt](src)`.
+ * Replace each image with `[image: alt](src)`, and return the srcs printed, in
+ * document order.
  * @param $ - the parsed page
  * @param baseUrl - the page URL, when the caller knows it
  * @param rendered - srcs already spoken for, added to as we go
  */
-function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<string>): void {
+function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<string>): string[] {
+  const printed: string[] = [];
   $('img').each((_i, el) => {
     const $el = $(el);
     // A lazy-loading theme puts a placeholder in `src` and the real file in a
@@ -2010,9 +2417,11 @@ function renderImages($: CheerioAPI, baseUrl: string | undefined, rendered: Set<
       return;
     }
     rendered.add(src);
+    printed.push(src);
     const alt = ($el.attr('alt') ?? '').replace(/\s+/g, ' ').trim();
     $el.replaceWith(textNode($, alt ? `[image: ${alt}](${src})` : `[image](${src})`));
   });
+  return printed;
 }
 
 /**

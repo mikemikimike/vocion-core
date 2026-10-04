@@ -51,7 +51,9 @@ function readTypeDir(objectsDir: string, into: RollupDeclaration[], seenTypes: S
     return;
   }
   for (const name of readdirSync(objectsDir).sort()) {
-    const file = ['type.yaml', 'type.yml'].map(f => join(objectsDir, name, f)).find(f => existsSync(f));
+    // turbopackIgnore: this path is only known at runtime, so the build must not
+    // trace it, or Next copies the whole project into the image (next.config.ts, #832).
+    const file = ['type.yaml', 'type.yml'].map(f => join(/* turbopackIgnore: true */ objectsDir, name, f)).find(f => existsSync(f));
     if (!file) {
       continue;
     }
@@ -82,7 +84,7 @@ export async function readRollupDeclarations(orgId: string): Promise<RollupDecla
   const seenTypes = new Set<string>();
   const seenPlugins = new Set<string>();
   const ws = process.env.WORKSPACE_PATH ?? process.env.CONTEXT_PATH ?? null;
-  if (ws && existsSync(ws)) {
+  if (ws && existsSync(/* turbopackIgnore: true */ ws)) {
     readTypeDir(join(ws, 'objects'), out, seenTypes);
     for (const plugin of enabledPluginsFromWorkspaceDir(ws)) {
       seenPlugins.add(plugin.manifest.slug);
@@ -328,8 +330,12 @@ export async function recomputeRollups(opts: { orgId: string; childType: string;
           ? children.reduce((acc, c) => acc + numberOf((c.metadata ?? {})[rollup.sum!]), 0)
           : children.length;
       }
+      // MERGED, NEVER REWRITTEN (Walks 17–18): writing the whole metadata from
+      // the copy read above put back a status line the request's flow had just
+      // written ("QA is reviewing" over "QA could not finish"). Only the
+      // rollup fields are merged in, so a concurrent write to any other key stands.
       await db.update(businessObjectSchema)
-        .set({ metadata: { ...(parent.metadata ?? {}), ...fields, rollupsUpdatedAt: now.toISOString() } })
+        .set({ metadata: sql`coalesce(${businessObjectSchema.metadata}, '{}'::jsonb) || ${JSON.stringify({ ...fields, rollupsUpdatedAt: now.toISOString() })}::jsonb` })
         .where(eq(businessObjectSchema.id, parent.id));
       written.push({ type: parentType, id: parent.id, fields });
     }

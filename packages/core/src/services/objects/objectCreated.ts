@@ -1,0 +1,143 @@
+/**
+ * FILING STARTS THE WORK (backlog 038). A record that exists says so.
+ *
+ * Every create path for a business object — the dashboard, an agent's
+ * approved proposal, a worker writing over the API, a service — calls this
+ * once the row is in, so an automation can act on the record the moment it
+ * exists. Before this nothing did: a P1 filed in chat sat in Proposed until a
+ * person noticed it, because the only intake listened for an outside
+ * `request.created` nobody posts from inside Vocion.
+ *
+ * Never fails the write that raised it: the row is already committed, and an
+ * event that cannot be recorded is a warning, not a lost record.
+ */
+
+import type { ObjectCreatedPayload } from '@/services/EventService';
+
+/** Where a record came from, as the create path knows it. */
+export type ObjectOrigin = {
+  source: 'app' | 'proposal' | 'api' | 'service';
+  conversationId?: number | null;
+  /** A user id, `agent:<slug>`, `token:<id>` or `system`. */
+  actor?: string | null;
+  /** True when a person asked for it. Defaults from the actor: anything but an agent, a token or the system. */
+  byPerson?: boolean;
+};
+
+/**
+ * WHERE A RECORD CAME FROM, KEPT ON THE RECORD (Chris, 2026-09-30, #269: the
+ * chat that started a request was on no page, because the only link was on
+ * the action that filed it). A record filed from a conversation carries
+ * `metadata.origin` from the write that made it; `relatedOf` reads it first
+ * and falls back to the filing action run for records filed before this.
+ */
+export type RecordOriginMeta = { conversationId: number; userId: string | null; at: string };
+
+/**
+ * The `metadata.origin` a create path writes, or null when no conversation
+ * asked for the record.
+ * @param origin - Where the create path says it came from.
+ * @param origin.conversationId - The thread.
+ * @param origin.userId - The person whose turn it was, or the actor.
+ * @param at - When.
+ */
+export function originMeta(origin: { conversationId?: number | null; userId?: string | null } | null | undefined, at: Date = new Date()): RecordOriginMeta | null {
+  const id = origin?.conversationId;
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0
+    ? { conversationId: id, userId: origin?.userId?.trim() || null, at: at.toISOString() }
+    : null;
+}
+
+/**
+ * Whether an actor id names a person rather than a machine.
+ * @param actor - A user id, `agent:<slug>`, `token:<id>`, `system`, …
+ */
+export function actorIsPerson(actor: string | null | undefined): boolean {
+  const a = String(actor ?? '').trim();
+  return a !== '' && a !== 'system' && a !== 'unknown' && !/^(?:agent|token|automation|mission|worker_run|workflow|event|webhook|trust-ladder)\b/.test(a);
+}
+
+/**
+ * The payload an `object.created` event carries. Pure, so the shape is tested
+ * without a bus.
+ * @param orgId - Tenant.
+ * @param object - The row as written.
+ * @param object.id - Its id.
+ * @param object.title - Its title.
+ * @param object.metadata - What it was born with, for `fields`.
+ * @param objectType - Its type's slug.
+ * @param origin - Where it came from.
+ */
+export function objectCreatedPayload(orgId: string, object: { id: number; title: string; metadata?: Record<string, unknown> | null }, objectType: string, origin: ObjectOrigin): ObjectCreatedPayload {
+  const actor = origin.actor?.trim() || 'system';
+  return {
+    // Every field the record was born with is a field that was written, so
+    // an automation that names the fields it reads (`fieldsAny`) hears the
+    // create and the later write alike (`object.updated`'s `fields`).
+    fields: Object.keys(object.metadata ?? {}).filter(k => object.metadata![k] !== null && object.metadata![k] !== undefined).sort().join(','),
+    orgId,
+    objectId: object.id,
+    objectType,
+    title: object.title.slice(0, 200),
+    source: origin.source,
+    conversationId: typeof origin.conversationId === 'number' && origin.conversationId > 0 ? origin.conversationId : null,
+    actor,
+    byPerson: origin.byPerson ?? actorIsPerson(actor),
+  };
+}
+
+/**
+ * Raise `object.created` for a row that was just written.
+ * @param orgId - Tenant.
+ * @param object - The row.
+ * @param object.id - Its id.
+ * @param object.title - Its title.
+ * @param objectType - Its type's slug.
+ * @param origin - Where it came from.
+ */
+export async function announceObjectCreated(orgId: string, object: { id: number; title: string }, objectType: string, origin: ObjectOrigin): Promise<void> {
+  // A RECORD IS BORN WITH ITS BODY (backlog 035). Every create path comes
+  // through here, so this is where v1 is written: request #227 (2026-09-29),
+  // filed through file_request, had no body and no versions, and the first
+  // change on its page had nothing to be a version of. Never throws.
+  try {
+    const { ensureRecordBody } = await import('@/services/objects/recordBody');
+    await ensureRecordBody(orgId, object.id);
+  } catch (error) {
+    console.warn(`[objects] could not write the body of #${object.id}`, error);
+  }
+  try {
+    // Dynamic, like every other emitter: the bus imports the automation
+    // service, which reaches the create paths that call this.
+    const { emitEvent, OBJECT_CREATED } = await import('@/services/EventService');
+    const metadata = await recordMetadata(orgId, object.id);
+    await emitEvent({
+      orgId,
+      type: OBJECT_CREATED,
+      payload: objectCreatedPayload(orgId, { ...object, metadata }, objectType, origin),
+      dedupeKey: `${OBJECT_CREATED}:${object.id}`,
+      invokedBy: origin.actor?.trim() || 'system',
+      dispatchMode: 'auto',
+    });
+  } catch (error) {
+    console.warn(`[objects] could not raise object.created for #${object.id}`, error);
+  }
+}
+
+/**
+ * The record's metadata as written, for the fields it was born with; empty
+ * when it cannot be read (the event still goes out).
+ * @param orgId - Tenant.
+ * @param id - The record.
+ */
+async function recordMetadata(orgId: string, id: number): Promise<Record<string, unknown>> {
+  try {
+    const { and, eq } = await import('drizzle-orm');
+    const { db } = await import('@/libs/DB');
+    const { businessObjectSchema } = await import('@/models/Schema');
+    const [row] = await db.select({ metadata: businessObjectSchema.metadata }).from(businessObjectSchema).where(and(eq(businessObjectSchema.orgId, orgId), eq(businessObjectSchema.id, id))).limit(1);
+    return (row?.metadata ?? {}) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}

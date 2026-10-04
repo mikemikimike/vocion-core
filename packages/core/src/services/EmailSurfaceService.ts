@@ -9,6 +9,7 @@ import { fetchReceivedEmail, htmlToText, normaliseSubject, referencedMessageIds,
 import { accountMembershipSchema, conversationSchema, emailThreadSchema, projectSchema, userSchema } from '@/models/Schema';
 import { runAgentDeep } from '@/services/AgentService';
 import { upsertAsk } from '@/services/AskService';
+import { withRunCost } from '@/services/budget/runCost';
 import { preflightCheck } from '@/services/BudgetService';
 import { appendMessage, createConversation, listMessages, toHistoryTurns } from '@/services/ConversationService';
 
@@ -232,7 +233,7 @@ export async function handleInboundEmail(meta: EmailInboundMeta, deps: EmailHand
   if (!known) {
     // A stranger wrote to the workspace. No agent turn: file it for a person,
     // acknowledge the sender, remember the mail so a redelivery is dropped.
-    const conv = await createConversation({ orgId, agentSlug, createdBy: `email:${meta.from}`, scopeRef: `email:${inboundMessageId}`, initialTitle: meta.subject || `Mail from ${meta.from}` });
+    const conv = await createConversation({ orgId, agentSlug, createdBy: `email:${meta.from}`, scopeRef: `email:${inboundMessageId}`, initialTitle: meta.subject || `Mail from ${meta.from}`, ...(meta.subject ? { titleSource: 'person' as const } : {}) });
     await db.update(conversationSchema).set({ surface: 'email' }).where(eq(conversationSchema.id, conv.id));
     await appendMessage({ orgId, conversationId: conv.id, role: 'user', content: body || '(empty message)', userId: `email:${meta.from}` });
     await db.insert(emailThreadSchema).values({ orgId, conversationId: conv.id, messageId: inboundMessageId, receivedEmailId: meta.receivedEmailId, direction: 'in', fromAddress: meta.from, subject: meta.subject });
@@ -294,7 +295,7 @@ export async function handleInboundEmail(meta: EmailInboundMeta, deps: EmailHand
   if (existingId !== null) {
     conversationId = existingId;
   } else {
-    const conv = await createConversation({ orgId, agentSlug, createdBy: `email:${meta.from}`, scopeRef: `email:${inboundMessageId}`, initialTitle: meta.subject || `Mail from ${meta.from}` });
+    const conv = await createConversation({ orgId, agentSlug, createdBy: `email:${meta.from}`, scopeRef: `email:${inboundMessageId}`, initialTitle: meta.subject || `Mail from ${meta.from}`, ...(meta.subject ? { titleSource: 'person' as const } : {}) });
     await db.update(conversationSchema).set({ surface: 'email' }).where(eq(conversationSchema.id, conv.id));
     conversationId = conv.id;
     created = true;
@@ -309,18 +310,20 @@ export async function handleInboundEmail(meta: EmailInboundMeta, deps: EmailHand
   await appendMessage({ orgId, conversationId, role: 'user', content: messageText, userId: `email:${meta.from}` });
 
   try {
-    const result = await deps.runAgent({
+    // What the turn spent is counted while it runs and written with the
+    // answer (`services/budget/runCost.ts`).
+    const { cost, result } = await withRunCost({ conversationId }, async scope => ({ cost: scope, result: await deps.runAgent({
       orgId,
       agentSlug,
       message: `${messageText}\n\n--- how I am reaching you ---\nThis arrived by email at ${box.address} from ${meta.fromRaw}${meta.subject ? ` with the subject "${meta.subject}"` : ''}. Answer as an email reply: plain prose, no markdown tables, links written out in full.`,
       userId: `email:${meta.from}`,
       conversationId,
       conversationHistory: history,
-    });
+    }) }));
     const text = result.response.trim() || '(no reply)';
     // The reply went out, so the turn finished: say so rather than leaving a
     // NULL that a reader has to guess at (#114).
-    await appendMessage({ orgId, conversationId, role: 'assistant', content: text, status: 'complete' });
+    await appendMessage({ orgId, conversationId, role: 'assistant', content: text, status: 'complete', cost: { tokens: cost.tokens, microCents: cost.microCents } });
     let mailId: string | null = null;
     if (mailEnabled()) {
       const outId = outboundMessageId(domain);

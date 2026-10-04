@@ -1,4 +1,5 @@
 import { os } from '@orpc/server';
+import { z } from 'zod';
 import { clerkAuth as auth } from '@/libs/Auth';
 import { logger } from '@/libs/Logger';
 import {
@@ -68,7 +69,7 @@ export const create = os
   .handler(async ({ input }) => {
     const { orgId } = await guardAuth();
     const { userId } = await auth();
-    const obj = await createBusinessObject(input, orgId, userId ?? 'unknown');
+    const obj = await createBusinessObject(input, orgId, userId ?? 'unknown', { source: 'app', actor: userId ?? null, byPerson: Boolean(userId) });
     logger.info(`Business object "${input.title}" created (type: ${input.typeSlug})`);
     return obj;
   });
@@ -156,4 +157,41 @@ export const generateSummary = os
 
     logger.info(`Summary generated for business object ${input.id}`);
     return updated;
+  });
+
+/* ---- The record's body: history, restore, change (backlog 035) ---- */
+
+/**
+ * A record's versions — who, when, why, and what each write changed. The
+ * versions are its body artifact's (`services/objects/recordBody.ts`), not a
+ * second history.
+ */
+export const history = os
+  .input(z.object({ id: z.number().int().positive(), limit: z.number().int().min(1).max(200).optional() }))
+  .handler(async ({ input }) => {
+    const { orgId } = await guardAuth();
+    const { recordHistory } = await import('@/services/objects/recordBody');
+    const out = await recordHistory(orgId, input.id, input.limit);
+    if (!out) {
+      throw ApiError.notFound();
+    }
+    return out;
+  });
+
+/**
+ * Put a record back to one of its versions, through `objects.update_meta`,
+ * so trust rules, Undo and the ledger apply and the restore is a version.
+ */
+export const restore = os
+  .input(z.object({ id: z.number().int().positive(), version: z.number().int().positive() }))
+  .handler(async ({ input }) => {
+    const { orgId, userId } = await guardAuth();
+    const { restoreRecordVersion } = await import('@/services/objects/recordBody');
+    try {
+      return await restoreRecordVersion({ orgId, objectId: input.id, version: input.version, userId: userId ?? 'unknown' });
+    } catch (err) {
+      // A refused write (a gate, a value the schema no longer accepts) is a
+      // sentence for the person, not a 500.
+      throw ApiError.badRequest((err as Error).message);
+    }
   });

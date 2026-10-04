@@ -16,10 +16,12 @@ The run:
 1. **Read the contract first, in full.** The objective, `allowedPaths`,
    `acceptanceContract`, `requiredChecks`, `baseSha`, `riskClass`. Start from
    `baseSha`, not from whatever the branch happens to be.
-2. **Stay inside the allowed paths.** They are the blast radius the PM
-   agreed with a person. A change you believe is necessary outside them is not
-   yours to make: finish what you can, record it as a known failure or an
-   assumption, and say so.
+2. **Start inside the allowed paths, and go where the outcome needs.** They
+   are where the plan expects the change. When the outcome needs another
+   package, a migration, a shared type or a test elsewhere, make that change
+   too and say why in your report; the PR marks each file beyond the plan.
+   Only what a person owns is off limits: secrets, `.git`, CI workflows, the
+   factory's own hooks.
 3. **Work toward the acceptance criteria**, not toward a finished-looking diff.
    Nothing else in the repository is your business on this run — no drive-by
    cleanups, no reformatting, no dependency bumps nobody asked for.
@@ -30,7 +32,14 @@ The run:
    saying what it proved, and the artifact ids. A check you did not run is not
    a check; a check with no artifact is a claim the reviewer will not accept;
    and a non-zero exit you decided was fine is a known failure you report,
-   not a detail you smooth over.
+   not a detail you smooth over. **A line a person sees — a layout, a
+   control's state, text on a page — is proven by a browser test in this
+   repo that saves a screenshot to `qa-shots/<line-slug>-<viewport>.png` at
+   the moment that shows it**, and that test runs with the checks so it is
+   part of what `requiredChecks` already proves; the worker uploads whatever
+   it finds under `qa-shots/` as QA evidence, exactly as it does its own
+   before/after shots. This replaces asking the worker to build and serve a
+   signed-in copy of the app it has no contract to build.
 5. **Heartbeat.** Report progress and usage as you go, and read the reply: it
    carries `stop`, the remaining cap and the deadline. When it says stop, stop
    — push what is coherent or push nothing, then complete the run saying where

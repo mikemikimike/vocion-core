@@ -1,0 +1,60 @@
+# The moment a release people use is linked to what it shipped, QA checks the
+# change on the live product, signed in as the product's QA account, and the
+# release and each feature say what QA saw (backlog 043).
+#
+# Release #280 (2026-09-30) is why: the product's deploy script replayed QA's
+# pre-merge flows on production, waited for the mock build's records, reached
+# 0 of 6 states, and the release still read healthy. Here QA looks at the live
+# app itself in this run's browser (the `browser_*` tools: a page's
+# accessibility snapshot, acting by ref, screenshots and responses with ids),
+# and `record_live_check` writes what it saw of every acceptance line, each
+# citing that evidence — seen, partly seen, or not seen with its reason.
+#
+# 3.5.0 (2026-10-03, FE-402 line 6): the step language this replaced had QA
+# write `click: "Save"` for "a blank name is not saved"; Save was correctly
+# disabled, the click waited 15 s, and a correct feature read broken. In a
+# snapshot QA sees `button "Save" [disabled]` and judges it in one move.
+#
+# Core raises `release.linked` (`services/factory/releasePack.ts`) and the
+# retry `release.live_check.requested` (`release-live-check-ended`); the
+# browser runs where the agents' tools run (`services/factory/liveBrowser.ts`).
+slug: release-live-check
+name: Check the release on the live product
+label: Checked it live
+doing: Checking it live
+description: >-
+  Fires when a release that changed something people use is linked, and once
+  more when the first check did not see the change. QA reads each shipped
+  feature's acceptance lines, opens the live product in its browser as the
+  product's QA account, looks and acts the way a person would, screenshots
+  what proves each line, and records every line with record_live_check: seen
+  or not seen citing what it captured, or not observable (proven before merge
+  by QA's verdict when it was). The release gets its live shots, liveEvidence,
+  liveState and the announcement image; each feature its liveCheck and its
+  Live pictures. Never touches the product's code, and leaves no data behind
+  that it made.
+status: active
+agent: change-reviewer
+when:
+  event: [release.linked, release.live_check.requested]
+  filter:
+    userFacing: true
+do:
+  checkMission: prove-the-contract
+  requireTool: record_live_check
+  prompt: >-
+    Release #{{releaseId}} of {{product}} just went out, carrying requests
+    {{requestIds}}. Check it on the live product, as the product's QA
+    account, and record what you saw with record_live_check. Follow
+    check-the-live-release.
+    Attempt {{attempt}} (blank is the first). On a retry, the last attempt
+    did not see the change because: {{lastFailure}}
+    Open the live product with browser_open (release_id {{releaseId}}): its
+    answer lists each shipped request's acceptance lines, numbered. Look at
+    each line on the live product: read the snapshot, act by ref, screenshot
+    what proves it, and use browser_responses for a line about an API. If you
+    make anything to check a line, remove it after.
+    Then call record_live_check once with every line: seen or not_seen citing
+    the ids your browser calls returned, or not_observable with why production
+    cannot show it. Do not change any record yourself: record_live_check
+    writes the release and the features. Report in one line what was seen live.

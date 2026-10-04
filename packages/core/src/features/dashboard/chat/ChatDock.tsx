@@ -4,11 +4,13 @@ import type { AgentSurfaceRequest } from './agentSurface';
 import type { AgentOption } from './types';
 import type { ReviewCardRun } from '@/features/review/ReviewSurface';
 import type { PageContext } from '@/services/chat/pageContext';
-import { MessageSquare, PanelRightClose, X } from 'lucide-react';
+import { MessageSquare, X } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { InlineTitle } from '@/components/ui/inline-title';
+import { PanelCloseButton } from '@/components/ui/panel-close-button';
+import { Sheet, SheetContent, SheetDescription, SheetGrabber, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewportBelow } from '@/components/ui/useMobile';
 import { CommentChips } from '@/features/comments/AnchoredComments';
@@ -18,9 +20,12 @@ import { contentIdForAsk } from '@/features/personalization/guidedFlow';
 import { useGuidedReview } from '@/features/personalization/GuidedReview';
 import { GuidedReviewPanel } from '@/features/personalization/GuidedReviewPanel';
 import { SequencePointer } from '@/features/personalization/SequencePointer';
+import { closePreview, openPreview, useOpenPreviewRef } from '@/features/preview/previewState';
 import { client } from '@/libs/Orpc';
-import { pageShowsRecord, scopeRefToRecord } from '@/services/chat/pageContext';
-import { AGENT_SURFACE_EVENT, agentSurfaceRequestOf, focusAgentComposer } from './agentSurface';
+import { setLiveSources } from '@/libs/preview/liveSources';
+import { parseSourcesRefId, sourcesPreviewRef } from '@/libs/preview/sourcesRef';
+import { pageShowsRecord, recordFromPath, scopeRefToRecord } from '@/services/chat/pageContext';
+import { AGENT_SURFACE_EVENT, agentSurfaceRequestOf, focusAgentComposer, followExcludeOf } from './agentSurface';
 import { AUTONOMY_SETTING_ID, autonomyFromOption, autonomyMenuSetting } from './autonomyOptions';
 import { CardDecisionProvider } from './cards/CardDecisions';
 import { ChatComposer } from './ChatComposer';
@@ -280,6 +285,9 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     };
   }, [pageContext, intent, recordDismissed]);
   const session = useChatSession({ agents, scopeRef, pageContext: effectiveContext, resumeConversationId });
+  // The record the page beside the rail is about — it refreshes itself, so
+  // the turn's follow chips leave it out (Chris, 2026-09-29).
+  const pageRecord = useMemo(() => followExcludeOf(effectiveContext?.record ?? (effectiveContext?.path ? recordFromPath(effectiveContext.path) : null) ?? (scopeRef ? scopeRefToRecord(scopeRef) : null)), [effectiveContext, scopeRef]);
   // A card's decision becomes a typed user turn in THIS conversation (backlog 025).
   const recordCardDecision = useCallback((d: { cardId: string; label: string; action: 'approve' | 'reject' | 'defer' | 'undo'; runId?: number }) => {
     if (session.conversationId === null) {
@@ -290,7 +298,18 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
     });
   }, [session.conversationId]);
   const queueProps = useComposerQueueProps(session);
-  const onCommand = useChatCommands(session.handleNewChat);
+  const asideRef = useRef<HTMLElement | null>(null);
+  const openSources = useCallback((messageId?: number) => {
+    if (session.conversationId !== null) {
+      openPreview(sourcesPreviewRef(session.conversationId, messageId), document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    }
+  }, [session.conversationId]);
+  // `/new` lands the caret in the rail's box, as the header's New chat does.
+  const startNewChat = useCallback(() => {
+    session.handleNewChat();
+    focusAgentComposer(asideRef.current);
+  }, [session]);
+  const onCommand = useChatCommands(startNewChat);
   // The rail IS on a page, so `(+)` offers `@page` and the record in view
   // beside `@artifact` — the same list `@` resolves against. `@change` joins
   // it only where a sequence draft is in view, which is exactly where the
@@ -302,7 +321,6 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
   useEffect(() => {
     sessionRef.current = session;
   });
-  const asideRef = useRef<HTMLElement | null>(null);
   const narrow = useNarrowViewport();
   // `document` exists only on the client; the rail paints nothing on the
   // server, which is already true of everything it depends on (localStorage,
@@ -335,6 +353,27 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
   const cardsScrolledAway = cardAnchor < lastMessageIndex;
   const recallCards = () => setCardAnchor(lastMessageIndex);
 
+  const openRef = useOpenPreviewRef();
+  const previewOpen = openRef !== null;
+  // A STREAMING ANSWER'S SOURCES REACH THE PANE (`liveSources.ts`): published
+  // while the turn runs; once the answer is stored, a sources pane opened
+  // mid-turn is pointed at that answer, which the server now has.
+  const latest = session.messages[session.messages.length - 1];
+  const latestDocs = latest?.role === 'assistant' ? latest.documents : undefined;
+  useEffect(() => {
+    if (session.conversationId === null) {
+      return;
+    }
+    if (session.isStreaming) {
+      setLiveSources(session.conversationId, latestDocs ?? null);
+      return;
+    }
+    setLiveSources(session.conversationId, null);
+    const open = openRef?.type === 'conversation' ? parseSourcesRefId(openRef.id) : null;
+    if (open && open.conversationId === session.conversationId && open.messageId === null && latest?.id) {
+      openPreview(sourcesPreviewRef(session.conversationId, latest.id), null);
+    }
+  }, [session.conversationId, session.isStreaming, latestDocs, latest?.id, openRef]);
   const setCollapsedPersisted = useCallback((next: boolean) => {
     setCollapsed(next);
     writeCollapsed(next);
@@ -619,7 +658,23 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
         <div className="flex min-w-0 flex-1 items-center gap-2">
           {/* Unscoped, the rail is titled "Chat" with the bubble — not the workspace's name, which the sidebar already says (Chris, 2026-09-18). */}
           {!scopeRef && <MessageSquare className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
-          <span className="truncate text-sm font-semibold">{scopeRef ? headerName : t('rail_title')}</span>
+          {/* Unscoped, the header names the THREAD once there is one — click
+              it to rename — and says "Chat" for a new one. Scoped, it names
+              the record the thread is about. */}
+          {scopeRef
+            ? <span className="truncate text-sm font-semibold">{headerName}</span>
+            : session.conversationTitle
+              ? (
+                  <InlineTitle
+                    value={session.conversationTitle}
+                    onRename={next => void session.renameConversation(next)}
+                    label={t('rename_conversation')}
+                    inputLabel={t('conversation_title')}
+                    className="text-sm font-semibold"
+                    testId="rail-title"
+                  />
+                )
+              : <span className="truncate text-sm font-semibold" data-testid="rail-title">{t('rail_title')}</span>}
           {/* The drawer's scope, when an affordance opened it with one
               (`docs/specs/personalization-v2.md`): one line naming the
               subject, so an ask has an unambiguous referent. Not a panel and
@@ -650,23 +705,19 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
                 search: session.searchConversations,
               }}
           compact={narrow}
+          fullPageHref={session.conversationId !== null ? `/dashboard/chat/${session.conversationId}` : '/dashboard/chat'}
         />
         {/* The sheet carries its own close control in this corner; a second
             one underneath it was two buttons in one 32px square. */}
+        {/* The same X every side pane closes with (PanelCloseButton): it
+            collapses the rail to its edge tab, as ⌘J does. */}
         {!narrow && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => setCollapsedPersisted(true)}
-                aria-label={t('collapse_rail')}
-                className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground"
-              >
-                <PanelRightClose className="size-4" aria-hidden="true" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" align="end" collisionPadding={8}>{t('collapse_rail')}</TooltipContent>
-          </Tooltip>
+          <PanelCloseButton
+            onClick={() => setCollapsedPersisted(true)}
+            label={t('close_rail')}
+            tooltip={t('close_rail_hint')}
+            testId="rail-close"
+          />
         )}
       </div>
 
@@ -694,6 +745,12 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
                     agentName={session.workspaceName}
                     streaming={session.isStreaming}
                     activity={session.activity}
+                    // The rail's second pane is the preview pane: a turn's
+                    // sources open there, beside the thread (Chris,
+                    // 2026-09-29: "clicking source … doesn't do anything").
+                    pageRecord={pageRecord}
+                    onShowSources={openSources}
+                    onCitationClick={(_n, messageId) => openSources(messageId)}
                     blocks={blocks}
                     onFeedback={session.handleFeedback}
                     autonomy={session.autonomy}
@@ -797,7 +854,8 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
           onStop={session.handleStop}
           placeholder={session.composerPlaceholder}
           commandHint={parseSearchCommand(session.composerValue).searchOnly ? t('search_mode') : undefined}
-          armed={(comments?.open.length ?? 0) > 0}
+          // A highlighted passage is something to send on its own.
+          armed={(comments?.open.length ?? 0) > 0 || Boolean(effectiveContext?.selection?.text)}
           pastedText={session.pastedText}
           onPasteText={session.setPastedText}
           onClearPasted={() => session.setPastedText(null)}
@@ -926,20 +984,42 @@ function ChatDockInner({ agents, scopeRef, scopeLabel, pageContext, defaultColla
       aria-label={ariaLabel}
       frame={narrow
         ? content => (
-          <Sheet open onOpenChange={open => setCollapsedPersisted(!open)}>
+          // ONE CLOSE, AND IT CLOSES. On a phone the preview stands in this
+          // sheet; the sheet's X (and a tap outside) only collapsed chat, so
+          // with a preview open the sheet stayed, and its X sat on top of the
+          // preview's own — two X's, neither doing anything (Chris,
+          // 2026-09-27, an engineering run on #132). Closing the sheet closes
+          // what is in it; with a preview showing, the pane's header owns the
+          // close and the sheet draws none.
+          <Sheet
+            open
+            onOpenChange={(open) => {
+              if (!open) {
+                closePreview();
+              }
+              setCollapsedPersisted(!open);
+            }}
+          >
             <SheetContent
               side="bottom"
               className="flex h-[88dvh] w-full min-w-0 flex-col gap-0 overflow-x-clip rounded-t-2xl p-0"
               // The grabber (16px) then a 48px header row puts that row's
               // centre at 40px; the close belongs on it, beside the ⋯ menu,
               // not in the sheet's corner 24px above everything it sits with.
-              closeClassName="top-10 right-3 -translate-y-1/2"
+              closeClassName={previewOpen ? 'hidden' : 'top-10 right-3 -translate-y-1/2'}
               aria-label={ariaLabel}
             >
-              {/* The grabber. It is not a control — the sheet is dismissed by
-                  its close button or the overlay — but it is what tells a
-                  reader at a glance which edge this surface belongs to. */}
-              <div aria-hidden className="mx-auto mt-2 mb-1 h-1 w-9 shrink-0 rounded-full bg-border" />
+              {/* The grabber: it says which edge the sheet belongs to, and
+                  dragging it down closes the sheet, as a phone expects. */}
+              <SheetGrabber
+                // A 28px band to drag, laid out in the old grabber's 16px,
+                // so the header row and its close stay where they were.
+                className="-mb-3"
+                onDismiss={() => {
+                  closePreview();
+                  setCollapsedPersisted(true);
+                }}
+              />
               <SheetHeader className="sr-only">
                 <SheetTitle>{ariaLabel}</SheetTitle>
                 {/* One identity (§9.10): the sheet is described as the workspace, never an agent. */}

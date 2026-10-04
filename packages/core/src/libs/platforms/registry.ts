@@ -43,16 +43,25 @@ export type CredentialPlatformId
     | 'azure-openai'
     | 'aws'
     | 'custom'
+  // A sign-in to an app the workspace builds, for its QA (several per org).
+    | 'app-login'
   // Connector platforms. One per API-key connector, so a workspace types its
   // Jira or Strapi key once and every connector install can point at it.
     | 'apollo'
+    | 'elevenlabs'
     | 'github'
     | 'granola'
     | 'hubspot'
     | 'jira'
     | 'notion'
     | 'posthog'
+    | 'sentry'
+    | 'slate'
     | 'strapi'
+  // Any bearer-token REST API the workspace declares endpoints for
+  // (`libs/sources/rest.ts`). One-live for the same reason as `apollo` — see
+  // the descriptor — so a workspace holds one REST credential today.
+    | 'rest'
   // One credential, several connectors. A Google OAuth client is consented
   // once and its refresh token then serves Gmail, Drive, Calendar, Analytics
   // and Ads together; a Slack bot token reads every channel the workspace
@@ -535,6 +544,91 @@ const PLATFORMS: readonly CredentialPlatform[] = [
     ],
   },
   {
+    id: 'sentry',
+    label: 'Sentry',
+    keySource: 'supplied',
+    // `one-live`, for the reason Apollo, Notion and PostHog are: widening the
+    // cap means rebuilding `api_token_org_platform_live_idx`, and one token
+    // reads every project of the organization it was made in.
+    credentialsPerOrg: 'one-live',
+    connectorSlugs: ['sentry'],
+    credentialsShareable: true,
+    llmProvider: null,
+    toolProvider: null,
+    keyPattern: null,
+    keyShapeHint: 'a Sentry region host, the organization slug, and an auth token',
+    helpText: 'A Sentry auth token (Settings → Auth Tokens, or an internal integration) with org:read, project:read and event:read — read-only: Vocion never resolves, assigns or comments on an issue. The organization slug is the part of your Sentry address before .sentry.io; the host is your data region (https://us.sentry.io, https://de.sentry.io) or your own install. A DSN is NOT what goes here: it can only send events.',
+    fields: [
+      {
+        name: 'host',
+        label: 'Sentry host',
+        pattern: /^https?:\/\/[^\s/]+\/?$/i,
+        shapeHint: 'is an address such as https://us.sentry.io, https://de.sentry.io, or your own install',
+        // Where the token is spent; shown in full, and what tells a US
+        // organization apart from an EU one in the credential list.
+        secret: false,
+      },
+      {
+        name: 'org',
+        label: 'Organization slug',
+        pattern: /^[\w-]+$/,
+        shapeHint: 'is the organization slug: letters, digits and dashes, as in <slug>.sentry.io',
+        secret: false,
+      },
+      {
+        name: 'token',
+        label: 'Auth token',
+        // A DSN is a URL with a public key in it; refusing it here turns
+        // "every read is unauthorized" into a sentence at paste time.
+        pattern: /^(?!https?:\/\/)\S{16,}$/i,
+        shapeHint: 'is an auth token (sntrys_… or sntryu_…), not a DSN — a DSN is an https:// address that can only send events',
+        secret: true,
+      },
+    ],
+  },
+  {
+    id: 'slate',
+    label: 'Slate',
+    keySource: 'supplied',
+    // `one-live`, like Sentry and PostHog: the factory asks for "the org's
+    // video host" with no row id in hand, and one account uploads everything.
+    credentialsPerOrg: 'one-live',
+    connectorSlugs: ['slate'],
+    credentialsShareable: true,
+    llmProvider: null,
+    toolProvider: null,
+    keyPattern: null,
+    keyShapeHint: 'a Slate session token (slt_…)',
+    helpText: 'A Slate session token (slt_…, about 90 days) for the account recordings are uploaded as — sign in to Slate\'s desktop or command-line app and copy its token. The account needs a paid seat to upload a file. Recordings are shared with that account\'s Slate team unless the connector says otherwise.',
+    fields: [
+      {
+        name: 'token',
+        label: 'Session token',
+        pattern: /^slt_\S{8,}$/,
+        shapeHint: 'is a Slate session token, starting slt_',
+        secret: true,
+      },
+    ],
+  },
+  {
+    id: 'elevenlabs',
+    label: 'ElevenLabs',
+    keySource: 'supplied',
+    // `one-live`, for the reason Apollo, Notion, PostHog and Sentry are:
+    // widening the cap means rebuilding `api_token_org_platform_live_idx`, and
+    // one key speaks in every voice of the account.
+    credentialsPerOrg: 'one-live',
+    connectorSlugs: ['elevenlabs'],
+    credentialsShareable: true,
+    llmProvider: null,
+    toolProvider: null,
+    keyPattern: null,
+    keyShapeHint: 'an ElevenLabs API key',
+    helpText: 'An ElevenLabs API key, from Developers → API Keys. It needs Text to Speech and Voices (read); User (read) lets Test connection show the characters left. Speaking a line spends the account\'s characters, so the usage lands on your own ElevenLabs plan.',
+    // `apiKey`: the key `libs/voice/elevenlabs.ts` reads out of the credential.
+    fields: singleKeyField('API key', /^\S{16,}$/, 'is an API key with no spaces, at least 16 characters (sk_…)'),
+  },
+  {
     id: 'strapi',
     label: 'Strapi',
     keySource: 'supplied',
@@ -562,6 +656,49 @@ const PLATFORMS: readonly CredentialPlatform[] = [
       {
         name: 'token',
         label: 'API token',
+        pattern: null,
+        shapeHint: 'is any non-empty token',
+        secret: true,
+      },
+    ],
+  },
+  {
+    id: 'rest',
+    label: 'REST API (bearer token)',
+    keySource: 'supplied',
+    // `many`, like `strapi`, and for the same reason: the credential is a token
+    // plus the base URL it was issued for, so it names one API and a workspace
+    // with two APIs needs two. Migration 0153 carved `rest` out of
+    // `api_token_org_platform_live_idx` to allow it — before that, connecting a
+    // second REST source silently revoked the first, because a one-live
+    // platform reads a second save as a rotation. Each source names the
+    // credential it uses through `knowledge_source.api_token_id`.
+    //
+    // The token is sent as `Authorization: Bearer <token>` on every call; there
+    // is no other header scheme, on purpose — one shape, and the first API to
+    // need another can add a `headerName` field beside these two.
+    credentialsPerOrg: 'many',
+    connectorSlugs: ['rest'],
+    credentialsShareable: false,
+    llmProvider: null,
+    toolProvider: null,
+    keyPattern: null,
+    keyShapeHint: 'an API base URL plus its bearer token',
+    helpText: 'A bearer token for a REST API of your own, and the base URL it was issued for. The token goes out as "Authorization: Bearer <token>" on every call: read rights for the read tools, write rights only for the endpoints the source declares as actions.',
+    fields: [
+      {
+        name: 'baseUrl',
+        label: 'API base URL',
+        pattern: /^https?:\/\/\S+$/i,
+        shapeHint: 'starts with http:// or https://',
+        // Part of the credential, as with Strapi: a token is issued for one
+        // API, so the two rotate together. Non-secret, so the credential
+        // list can show which API a token is for.
+        secret: false,
+      },
+      {
+        name: 'token',
+        label: 'Bearer token',
         pattern: null,
         shapeHint: 'is any non-empty token',
         secret: true,
@@ -782,6 +919,47 @@ const PLATFORMS: readonly CredentialPlatform[] = [
     keyShapeHint: 'starts with "fc-" followed by at least 8 more characters',
     helpText: 'Your Firecrawl API key, from firecrawl.dev. Pages this workspace fetches through Firecrawl bill your Firecrawl account.',
     fields: singleKeyField('Firecrawl key', /^fc-[\w-]{8,}$/i, 'starts with "fc-" followed by at least 8 more characters'),
+  },
+  {
+    id: 'app-login',
+    label: 'App sign-in',
+    keySource: 'supplied',
+    // `many`: a workspace that builds products holds one sign-in per product
+    // environment it checks (2026-09-30: the factory's QA signs in to each
+    // product's production app to capture live evidence after a release). An
+    // environment record names the row it uses (`qaLoginCredentialId`).
+    credentialsPerOrg: 'many',
+    connectorSlugs: [],
+    credentialsShareable: false,
+    llmProvider: null,
+    toolProvider: null,
+    keyPattern: null,
+    keyShapeHint: 'a sign-in URL, an email and a password',
+    helpText: 'A sign-in to an app this workspace builds, for its QA to use: the sign-in page, the account email and its password. Use a dedicated QA account, never a person\'s own. Stored encrypted; only agents granted product_access can read it.',
+    fields: [
+      {
+        name: 'signInUrl',
+        label: 'Sign-in page',
+        pattern: /^https?:\/\/\S+$/i,
+        shapeHint: 'starts with http:// or https://',
+        secret: false,
+      },
+      {
+        name: 'email',
+        label: 'Account email',
+        pattern: /^\S[^\s@]*@\S+$/,
+        shapeHint: 'is an email address',
+        // Non-secret, so the credential list shows which account this is.
+        secret: false,
+      },
+      {
+        name: 'password',
+        label: 'Password',
+        pattern: null,
+        shapeHint: 'is any non-empty password',
+        secret: true,
+      },
+    ],
   },
   {
     id: 'custom',

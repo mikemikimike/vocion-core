@@ -2,13 +2,14 @@ import type { ZodType } from 'zod';
 import type { ActivatedPack, ComposedEntry, FolderEntry, PackRaw, RawEntry } from './compose';
 import type { Origin } from './merge';
 import type { LoadedPlugin } from './plugins';
-import type { AgentManifest, AutomationManifest, EvalDatasetManifest, LearningStepManifest, MissionManifest, ObjectTypeManifest, OperatingIntentManifest, PackManifest, PlaybookManifest, SourceManifest, TeamManifest, TrustManifest, VoiceManifest, WorkflowManifest, WorkspaceManifest } from './schemas';
+import type { AgentManifest, AutomationManifest, EvalDatasetManifest, LearningStepManifest, MissionManifest, NotificationRuleManifest, ObjectTypeManifest, OperatingIntentManifest, PackManifest, PlaybookManifest, SourceManifest, TeamManifest, TrustManifest, VoiceManifest, WorkflowManifest, WorkspaceManifest } from './schemas';
 import type { LoadedWikiPage } from './wiki-pages';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { isSurfaceId, SURFACE_IDS } from '@/features/navigation/surfaces';
+import { assignTypeCodes } from '@/libs/codes';
 import { fromRepoRoot } from '@/libs/repo-root';
 import { composeKind, resolveActivation } from './compose';
 import { assertEvalCheckPaths } from './evalCheckPaths';
@@ -51,10 +52,42 @@ export type LoadedAgent = AgentManifest & {
   /** Provenance: base default, workspace resource, or a merge of the two. */
   origin: Origin;
 };
-export type LoadedObjectType = ObjectTypeManifest & { resolvedClassificationPrompt: string | null; sourceFile: string; origin: Origin };
+/** `resolvedCode` is the code this type's records read by, settled across the workspace (`libs/codes.ts`). */
+export type LoadedObjectType = ObjectTypeManifest & { resolvedClassificationPrompt: string | null; sourceFile: string; origin: Origin; resolvedCode?: string };
 export type LoadedWorkflow = WorkflowManifest & { sourceFile: string };
 export type LoadedMission = MissionManifest & { sourceFile: string; origin: Origin };
 export type LoadedAutomation = AutomationManifest & { sourceFile: string };
+
+/**
+ * A declared notification kind, and the layer that declared it: `workspace`,
+ * or `plugin:<slug>` (backlog 048).
+ */
+export type LoadedNotification = NotificationRuleManifest & { source: string };
+
+/**
+ * The notification kinds a workspace has on: every enabled plugin's, in load
+ * order, then the workspace's own, a workspace entry replacing a plugin's of
+ * the same kind whole (the whole-file rule automations use). Two plugins
+ * declaring one kind is an error — a kind belongs to one plugin.
+ * @param plugins - The resolved plugins.
+ * @param manifest - The workspace manifest.
+ */
+export function composeNotifications(plugins: readonly LoadedPlugin[], manifest: Pick<WorkspaceManifest, 'notifications'>): LoadedNotification[] {
+  const byKind = new Map<string, LoadedNotification>();
+  for (const plugin of plugins) {
+    for (const rule of plugin.manifest.notifications ?? []) {
+      const prior = byKind.get(rule.kind);
+      if (prior) {
+        throw new Error(`notification kind "${rule.kind}" is declared by both ${prior.source} and plugin:${plugin.manifest.slug} — a kind belongs to one plugin`);
+      }
+      byKind.set(rule.kind, { ...rule, source: `plugin:${plugin.manifest.slug}` });
+    }
+  }
+  for (const rule of manifest.notifications ?? []) {
+    byKind.set(rule.kind, { ...rule, source: 'workspace' });
+  }
+  return [...byKind.values()];
+}
 
 export type LoadedLearningStep = LearningStepManifest & { sourceFile: string };
 export type LoadedEvalDataset = EvalDatasetManifest & { sourceFile: string };
@@ -93,6 +126,13 @@ export type LoadedPlaybook = PlaybookManifest & {
    * override: workspace copy whole-file-replacing an activated base twin.
    */
   origin: FolderOrigin;
+  /**
+   * On an override: the SHA-256 of the body it replaces — the base or
+   * plugin twin's SKILL.md as it stands at this load. The applier keeps the
+   * one in force when the override was last edited, so a later change to the
+   * twin reads as drift (`services/plugins/configureData.ts`).
+   */
+  baseSha?: string;
 };
 
 /**
@@ -131,6 +171,8 @@ export type LoadedWorkspace = {
   workflows: LoadedWorkflow[];
   missions: LoadedMission[];
   automations: LoadedAutomation[];
+  /** Declared notification kinds, plugins' and the workspace's (`composeNotifications`). */
+  notifications: LoadedNotification[];
   trust: TrustManifest | null;
   /** The workspace's voice rules from voice.yaml, or null when unauthored. */
   voice: VoiceManifest | null;
@@ -207,7 +249,7 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
   }
   const skills = composeFolders('skill', join(abs, 'skills'), layer?.active.skills, layer?.full.skills, files);
 
-  const objectTypes = composeEntries('object type', join(abs, 'objects'), isObjectFile, layer?.full.objectTypes, layer?.active.objectTypes, files)
+  const objectTypes: LoadedObjectType[] = composeEntries('object type', join(abs, 'objects'), isObjectFile, layer?.full.objectTypes, layer?.active.objectTypes, files)
     .map((entry) => {
       const parsed = validateOrThrow(ObjectTypeManifestSchema, entry.raw, entry.sourceFile, 'objectType');
       const resolvedClassificationPrompt = parsed.classificationPromptFile || parsed.classificationPrompt
@@ -230,19 +272,21 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
       return { ...parsed, sourceFile: entry.sourceFile, origin: entry.origin };
     });
 
-  const trustPath = ['trust.yaml', 'trust.yml'].map(n => join(abs, n)).find(existsSync) ?? null;
+  // turbopackIgnore: this path is only known at runtime, so the build must not
+  // trace it, or Next copies the whole project into the image (next.config.ts, #832).
+  const trustPath = ['trust.yaml', 'trust.yml'].map(n => join(/* turbopackIgnore: true */ abs, n)).find(existsSync) ?? null;
   const workspaceTrust: TrustManifest | null = trustPath
     ? (() => {
         files.push(trustPath);
         return parseFile(trustPath, TrustManifestSchema, 'trust') as TrustManifest;
       })()
     : null;
-  const extras = loadPluginExtras(plugins);
+  const extras = loadPluginExtras(plugins, manifest.pluginSettings ?? {});
   const trust = mergeTrust(extras.trust, workspaceTrust);
 
   // Voice rules: one top-level file, same shape as trust.yaml. Absent means
   // the workspace inherits core's platform floor and nothing else.
-  const voicePath = ['voice.yaml', 'voice.yml'].map(n => join(abs, n)).find(existsSync) ?? null;
+  const voicePath = ['voice.yaml', 'voice.yml'].map(n => join(/* turbopackIgnore: true */ abs, n)).find(existsSync) ?? null;
   const voice: VoiceManifest | null = voicePath
     ? (() => {
         files.push(voicePath);
@@ -254,7 +298,7 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
   // top-level file, same shape as trust.yaml and voice.yaml. Absent means the
   // factory has been told nothing, which is not the same as being told
   // "anything goes", and the agents say so rather than assuming.
-  const intentPath = ['operating-intent.yaml', 'operating-intent.yml'].map(n => join(abs, n)).find(existsSync) ?? null;
+  const intentPath = ['operating-intent.yaml', 'operating-intent.yml'].map(n => join(/* turbopackIgnore: true */ abs, n)).find(existsSync) ?? null;
   const operatingIntent: OperatingIntentManifest | null = intentPath
     ? (() => {
         files.push(intentPath);
@@ -271,6 +315,9 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
       .map((file) => {
         files.push(file);
         const parsed = parseFile(file, AutomationManifestSchema, 'automation');
+        if (parsed.setting) {
+          throw new Error(`automation "${parsed.slug}" (${file}): setting: is for a plugin's automations — a workspace turns its own on or off with status:`);
+        }
         return { ...parsed, sourceFile: file };
       }),
     extras.automations,
@@ -346,6 +393,10 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
   assertTeams(agents, teams, manifest);
   assertUniqueSlugs(skills, 'skill');
   assertUniqueSlugs(objectTypes, 'object type');
+  const objectTypeCodes = assertTypeCodes(objectTypes);
+  for (const ot of objectTypes) {
+    ot.resolvedCode = objectTypeCodes.get(ot.slug);
+  }
   assertNamedRefs(agents, skills, playbooks);
   assertUniqueSlugs(workflows, 'workflow');
   assertUniqueSlugs(missions, 'mission');
@@ -380,6 +431,7 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
     workflows,
     missions,
     automations,
+    notifications: composeNotifications(plugins, manifest),
     trust,
     voice,
     operatingIntent,
@@ -398,7 +450,7 @@ export function loadWorkspace(contextPath: string): LoadedWorkspace {
 function loadManifest(abs: string): WorkspaceManifest {
   const candidates = ['workspace.yaml', 'workspace.yml'];
   for (const c of candidates) {
-    const p = join(abs, c);
+    const p = join(/* turbopackIgnore: true */ abs, c);
     try {
       const raw = readWorkspaceTextFile(p);
       const parsed = parseYaml(raw);
@@ -452,7 +504,7 @@ function resolvePackDir(name: string): string {
 function loadPack(spec: string): LoadedPack {
   const { name, version } = parseExtends(spec);
   const dir = resolvePackDir(name);
-  const packFile = ['pack.yaml', 'pack.yml'].map(n => join(dir, n)).find(existsSync);
+  const packFile = ['pack.yaml', 'pack.yml'].map(n => join(/* turbopackIgnore: true */ dir, n)).find(existsSync);
   if (!packFile) {
     throw new Error(`base pack "${name}" is missing pack.yaml at ${dir}`);
   }
@@ -609,7 +661,7 @@ function composeFolders(
         .filter(f => basename(f) !== 'SKILL.md' && !basename(f).startsWith('.'))
         .map(f => relative(baseFolder, f));
       const merged = new Set([...loaded.sourceFiles, ...baseSiblings]);
-      out.push({ ...loaded, origin: 'override', sourceFiles: [...merged], resources: [...merged] });
+      out.push({ ...loaded, origin: 'override', sourceFiles: [...merged], resources: [...merged], baseSha: skillBodySha(join(baseFolder, 'SKILL.md')) ?? undefined });
     } else {
       if (packEntries?.has(loaded.slug) && !isOverride) {
         throw new Error(
@@ -766,14 +818,59 @@ type PluginExtras = {
 };
 
 /**
+ * Every `pluginSettings` entry names an enabled plugin and a setting it
+ * declares, so a typo fails the load instead of leaving a switch silently off.
+ * @param plugins - enabled plugins
+ * @param pluginSettings - workspace.yaml `pluginSettings`
+ */
+function assertPluginSettings(plugins: LoadedPlugin[], pluginSettings: Record<string, Record<string, boolean>>): void {
+  for (const [slug, values] of Object.entries(pluginSettings)) {
+    const plugin = plugins.find(p => p.manifest.slug === slug);
+    if (!plugin) {
+      throw new Error(`pluginSettings names plugin "${slug}", which is not on — add it to plugins: first`);
+    }
+    const declared = plugin.manifest.settings ?? {};
+    for (const key of Object.keys(values)) {
+      if (!declared[key]) {
+        const known = Object.keys(declared);
+        throw new Error(`pluginSettings.${slug}.${key}: plugin "${slug}" has no setting "${key}"${known.length > 0 ? ` (it has ${known.join(', ')})` : ' (it declares none)'}`);
+      }
+    }
+  }
+}
+
+/**
+ * Whether a plugin automation runs here: always, unless it names a `setting`
+ * — then that setting's value in this workspace, else the plugin's default.
+ * @param plugin - the plugin that ships it
+ * @param automation - the parsed automation
+ * @param automation.slug - its slug
+ * @param automation.setting - the setting it waits for, if any
+ * @param pluginSettings - workspace.yaml `pluginSettings`
+ */
+function settingAllows(plugin: LoadedPlugin, automation: { slug: string; setting?: string }, pluginSettings: Record<string, Record<string, boolean>>): boolean {
+  if (!automation.setting) {
+    return true;
+  }
+  const slug = plugin.manifest.slug;
+  const declared = plugin.manifest.settings?.[automation.setting];
+  if (!declared) {
+    throw new Error(`automation "${automation.slug}" of plugin "${slug}" waits for setting "${automation.setting}", which the plugin does not declare under settings:`);
+  }
+  return pluginSettings[slug]?.[automation.setting] ?? declared.default;
+}
+
+/**
  * The non-composable kinds a plugin ships: automations, teams, learning steps
  * and trust rules. Read as shipped (no {{env}} substitution, not sha-tracked —
  * the plugin version covers provenance). Two plugins shipping one automation or
  * team slug is an error, like the composable kinds.
  * @param plugins - enabled plugins, in load order
+ * @param pluginSettings - workspace.yaml `pluginSettings`, which turns setting-gated automations on
  */
-function loadPluginExtras(plugins: LoadedPlugin[]): PluginExtras {
+function loadPluginExtras(plugins: LoadedPlugin[], pluginSettings: Record<string, Record<string, boolean>> = {}): PluginExtras {
   const out: PluginExtras = { automations: [], teams: [], learningSteps: [], trust: [] };
+  assertPluginSettings(plugins, pluginSettings);
   const seen = new Map<string, string>();
   const claim = (kind: string, slug: string, plugin: string) => {
     const key = `${kind}:${slug}`;
@@ -789,7 +886,7 @@ function loadPluginExtras(plugins: LoadedPlugin[]): PluginExtras {
     for (const file of walkDir(join(root, 'automations')).filter(isYamlFile)) {
       const parsed = validateOrThrow(AutomationManifestSchema, parseYaml(readFileSync(file, 'utf8')), file, 'automation');
       claim('automation', parsed.slug, name);
-      out.automations.push({ ...parsed, sourceFile: file });
+      out.automations.push({ ...parsed, status: settingAllows(plugin, parsed, pluginSettings) ? parsed.status : 'disabled', sourceFile: file });
     }
     for (const file of walkDir(join(root, 'teams')).filter(isYamlFile)) {
       const team = loadTeam(file, null);
@@ -801,7 +898,7 @@ function loadPluginExtras(plugins: LoadedPlugin[]): PluginExtras {
       claim('learning step', parsed.name, name);
       out.learningSteps.push({ ...parsed, sourceFile: file });
     }
-    const trustFile = ['trust.yaml', 'trust.yml'].map(n => join(root, n)).find(existsSync);
+    const trustFile = ['trust.yaml', 'trust.yml'].map(n => join(/* turbopackIgnore: true */ root, n)).find(existsSync);
     if (trustFile) {
       out.trust.push(validateOrThrow(TrustManifestSchema, parseYaml(readFileSync(trustFile, 'utf8')), trustFile, 'trust') as TrustManifest);
     }
@@ -977,6 +1074,25 @@ function assertNamedRefs(agents: LoadedAgent[], skills: LoadedPlaybook[], playbo
   }
 }
 
+/**
+ * The SHA-256 of a SKILL.md body — the same digest `contentSha` is — or null
+ * when the file is missing or has no frontmatter. What an override's twin is
+ * compared by: the body, never the frontmatter, so a reworded description is
+ * not drift.
+ * @param file - Absolute path of a SKILL.md.
+ */
+export function skillBodySha(file: string): string | null {
+  if (!existsSync(file)) {
+    return null;
+  }
+  try {
+    const fm = parseFrontmatter(readFileSync(file, 'utf8'), file);
+    return createHash('sha256').update(fm.body, 'utf8').digest('hex');
+  } catch {
+    return null;
+  }
+}
+
 function parseFrontmatter(raw: string, file: string): { data: unknown; body: string } {
   const fmRegex = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
   const match = raw.match(fmRegex);
@@ -1023,6 +1139,22 @@ function walkDir(dir: string): string[] {
     }
     throw err;
   }
+}
+
+/**
+ * Every object type reads its records by a code (FE-294, `libs/codes.ts`), and
+ * a code names one type in a workspace: two types declaring the same code, or
+ * one taking a core noun's (RUN, ACT…), is refused here with both named. A
+ * type that declares none gets one derived from its slug, widened past any
+ * clash. Returns slug → code, which the applier stores on each type row.
+ * @param objectTypes - Every object type the workspace loads, plugins' included.
+ */
+function assertTypeCodes(objectTypes: ReadonlyArray<{ slug: string; code?: string }>): Map<string, string> {
+  const { codes, problems } = assignTypeCodes(objectTypes);
+  if (problems.length > 0) {
+    throw new Error(`object type codes clash:\n  - ${problems.join('\n  - ')}`);
+  }
+  return codes;
 }
 
 function assertUniqueSlugs<T extends { slug: string }>(items: T[], kind: string): void {

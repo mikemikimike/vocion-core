@@ -1,0 +1,33 @@
+# Configure. What drives the factory, in one place: its seats, its skills and
+# playbooks (each overridable), its automations, its trust rules, what it
+# learned from use and its measures — each a tab, a hairline list with a
+# count — with how it is doing, what needs attention and what changed beside
+# them. It used to be one collapsed disclosure over a paragraph (Chris,
+# 2026-09-30: "make this page better: main block with sidebar blocks. or
+# tabs. c'mon").
+#
+# Declared here, drawn by core (`archetype: configure`,
+# features/dashboard/configure): the blocks below name the plugin's relations
+# and core reads them for whichever plugin ships the page, so another
+# plugin's Configure page is this file with its own title. `?tab=` names the
+# tab; a row opens where the thing it names is edited, and a seat opens its
+# agent in the preview pane.
+slug: configure
+title: Configure
+description: What drives the factory — its measures, seats, skills, rules and automations, and what it learned from use.
+icon: settings
+nav: {section: Software factory, order: 9, secondary: true}
+archetype: configure
+pluginPanel: false
+configure:
+  tabs:
+    - {kind: seats}
+    - {kind: skills}
+    - {kind: automations}
+    - {kind: trust}
+    - {kind: learned}
+    - {kind: measures}
+  aside:
+    - {kind: health}
+    - {kind: attention}
+    - {kind: changes}

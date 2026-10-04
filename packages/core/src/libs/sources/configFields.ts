@@ -543,6 +543,76 @@ export const CONFIG_FIELDS: Record<string, ConfigField[]> = {
       help: 'The Notion-Version header sent on every request. Bump deliberately — later versions rename parts of the payload this connector reads.',
     },
   ],
+  // A REST source's endpoints (`tools`, `actions`) are declared in the
+  // workspace manifest, not typed into a form — the form asks only for the
+  // two scalars. The credential (base URL + bearer token) is taken by Connect.
+  'rest': [
+    {
+      key: 'toolPrefix',
+      label: 'Tool prefix',
+      type: 'text',
+      placeholder: 'billing_api',
+      help: 'The first word of every tool this source offers an agent. Leave blank to use the source slug.',
+    },
+    {
+      key: 'healthPath',
+      label: 'Health path',
+      type: 'text',
+      defaultValue: '/',
+      help: 'The path Test connection GETs with the token. Any 2xx counts.',
+    },
+  ],
+
+  // Sentry is read live and syncs nothing: the token, organization and host
+  // are the credential, taken by Connect; which project an environment reports
+  // to is on the environment's record. This only lets Test connection confirm
+  // the projects a workspace expects the token to see.
+  'sentry': [
+    {
+      key: 'projects',
+      label: 'Projects to confirm',
+      type: 'stringArray',
+      placeholder: 'northwind-api, northwind-web',
+      help: 'Optional. Project slugs Test connection checks the token can see. Leave blank for every project.',
+    },
+  ],
+
+  // Slate is a destination and syncs nothing: the session token is the
+  // credential, taken by Connect. This says who may watch what the factory
+  // uploads, and, for a non-production Slate, where it lives.
+  'slate': [
+    {
+      key: 'visibility',
+      label: 'Who may watch uploaded recordings',
+      type: 'select',
+      defaultValue: 'team',
+      options: [
+        { value: 'team', label: 'Your Slate team' },
+        { value: 'signedIn', label: 'Anyone signed in to Slate' },
+        { value: 'private', label: 'Only the account that uploads' },
+        { value: 'public', label: 'Anyone with the link' },
+      ],
+      help: 'Team by default. Public only when every recording may be seen by anyone holding its link.',
+    },
+    {
+      key: 'apiBase',
+      label: 'API base URL',
+      type: 'url',
+      advanced: true,
+      defaultValue: 'https://api.slatevideo.com',
+    },
+    {
+      key: 'webOrigin',
+      label: 'Player address',
+      type: 'url',
+      advanced: true,
+      defaultValue: 'https://slatevideo.com',
+    },
+  ],
+  // A voice is called, never synced: the API key is the whole connection,
+  // taken by Connect. Nothing to configure here.
+  'elevenlabs': [],
+
   'posthog': [
     {
       key: 'projectName',

@@ -42,6 +42,7 @@ export async function missionRunReport(orgId: string, missionRunId: number): Pro
  * @param opts.missionRunId - The run the call is recorded against.
  * @param opts.report - The run's written report.
  * @param opts.context - What the fire was about (the event payload), as JSON.
+ * @param opts.invokedBy - Who the run acts for (`mission_run.created_by`); the pass acts for the same.
  * @returns Whether an accepted call landed, and the tool's last answer.
  */
 export async function forceRequiredTool(opts: {
@@ -51,7 +52,13 @@ export async function forceRequiredTool(opts: {
   missionRunId: number;
   report: string;
   context?: Record<string, unknown>;
+  invokedBy?: string;
 }): Promise<{ called: boolean; answer: string }> {
+  // `tool` or `tool:action`: the pass binds the tool and, for an action,
+  // says which one; only an accepted call for that action counts.
+  const { isRefusal, namesAction, parseToolRequirement } = await import('./toolRequirement');
+  const req = parseToolRequirement(opts.toolName);
+  const toolName = req.tool;
   if (!opts.report) {
     return { called: false, answer: 'the run wrote no report to record' };
   }
@@ -59,49 +66,179 @@ export async function forceRequiredTool(opts: {
   if (!agent) {
     return { called: false, answer: `no agent "${opts.agentSlug}" in this workspace` };
   }
-  const ctx: RuntimeContext = {
-    orgId: opts.orgId,
-    citationSeq: { current: 0 },
-    agentSlug: agent.slug,
-    connectorSources: agent.connectorSources ?? [],
-    objectTypeSlugs: agent.objectTypeSlugs ?? [],
-    searchConfig: (agent.searchConfig as RuntimeContext['searchConfig']) ?? {},
-    harnessConfig: agent.harnessConfig ?? {},
+  // THE SAME BELT THE RUN HAD — typed filing tools and REST sources included.
+  // A requirement of `file_<type>` (the planner's `file_architecture_plan`,
+  // 2026-09-28) found no such tool here while the pass built its belt by hand
+  // without the agent's filing types; the shared builder cannot leave them out.
+  const { runtimeContextForAgent } = await import('@/services/agents/runtimeContext');
+  const ctx = await runtimeContextForAgent(opts.orgId, agent, {
     missionRunId: opts.missionRunId,
-    emit: () => {},
-  } as RuntimeContext;
+    // THE PASS ACTS FOR WHOEVER THE RUN ACTED FOR (prod 2026-09-29: the
+    // planner's plans for #130 and #224 were refused "13 of 10" five times
+    // over). Without the run's actor the pass read as the agent's own
+    // initiative, so a factory step (`isFactoryStep`) was charged the weekly
+    // idea cap the run itself is exempt from.
+    ...(opts.invokedBy ? { userId: opts.invokedBy } : {}),
+  });
   const { buildDomainTools } = await import('@/services/agents/tools/registry');
-  const tool = buildDomainTools(ctx).find(t => t.name === opts.toolName) as StructuredToolInterface | undefined;
+  const tool = buildDomainTools(ctx).find(t => t.name === toolName) as StructuredToolInterface | undefined;
   if (!tool) {
-    return { called: false, answer: `${opts.agentSlug} does not hold ${opts.toolName} (not granted, or excluded)` };
+    return { called: false, answer: `${opts.agentSlug} does not hold ${toolName} (not granted, or excluded)` };
   }
+  // THE PASS LOOKS, IN CODE. Review run 5638 was refused twice for judging
+  // fifteen screenshots it never opened — the refusal listed every link — and
+  // it called record_verdict again instead of opening one (2026-09-27). When
+  // the run's last refusal lists screenshots, this pass fetches them
+  // server-side, records each as opened, and puts the pictures in front of the
+  // model beside its report, so the verdict is taken looking at the evidence.
+  const shots = await openShots(ctx, listedShots(await lastRefusal(ctx, toolName)));
+  if (shots.length > 0) {
+    ctx.evidenceOpened = true;
+  }
+  console.warn('[automation] recording pass', { missionRunId: opts.missionRunId, tool: opts.toolName, shotsAttached: shots.length });
   const { buildChatModelForOrg } = await import('@/libs/llm');
   const { HumanMessage, SystemMessage, ToolMessage } = await import('@langchain/core/messages');
   const base = await buildChatModelForOrg('extractor', opts.orgId, { temperature: 0, streaming: false, maxTokens: 6000 });
   if (!base.bindTools) {
     return { called: false, answer: 'the model cannot bind tools' };
   }
-  const model = base.bindTools([tool], { tool_choice: opts.toolName } as never);
+  const model = base.bindTools([tool], { tool_choice: toolName } as never);
   const messages: BaseMessage[] = [
-    new SystemMessage(`${agent.systemPrompt ?? ''}\n\nRECORDING PASS: the report below is your own finished work. Your only job is to call ${opts.toolName} once, carrying exactly what the report concluded — the same verdict, the same judgement of each item, the same evidence. Do not re-judge and do not soften it.`),
-    new HumanMessage(`${opts.context ? `What this was about:\n${JSON.stringify(opts.context)}\n\n` : ''}Your report:\n\n${opts.report.slice(0, 40_000)}`),
+    new SystemMessage(`${agent.systemPrompt ?? ''}\n\nRECORDING PASS: the report below is your own finished work. Your only job is to call ${toolName}${req.action ? ` for ${req.action}` : ''} once, carrying what the report concluded${shots.length > 0 ? ', corrected by what the attached screenshots actually show' : ' — the same verdict, the same judgement of each item, the same evidence. Do not re-judge and do not soften it'}.`),
+    new HumanMessage({
+      content: [
+        { type: 'text', text: `${opts.context ? `What this was about:\n${JSON.stringify(opts.context)}\n\n` : ''}Your report:\n\n${opts.report.slice(0, 40_000)}${shots.length > 0 ? `\n\nThe screenshots, opened for you. Judge each criterion by what these show, and cite the link of the one that proves it:` : ''}` },
+        ...shots.flatMap(shot => [
+          { type: 'text' as const, text: `${shot.title}: ${shot.link}` },
+          { type: 'image_url' as const, image_url: { url: shot.dataUri } },
+        ]),
+      ],
+    }),
   ];
   let answer = '';
   // Two tries: a refusal ("Not recorded: …") names what to fix, and the
-  // second call gets to fix it. Nothing more — this is a backstop, not a loop.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // second call gets to fix it. Opening the screenshots a refusal listed earns
+  // one more (review 5718 opened twelve after its last try and used none), so
+  // never more than three — this is a backstop, not a loop.
+  let tries = 2;
+  for (let attempt = 0; attempt < tries; attempt++) {
     const res = await model.invoke(messages as never);
-    const call = (res.tool_calls ?? []).find(c => c.name === opts.toolName);
+    // A recording pass is a paid call like any turn, and spend the run it
+    // closes should carry (`budget/runCost.ts`). It charged nothing before.
+    await chargeRecordingPass(opts.orgId, opts.agentSlug, res);
+    const call = (res.tool_calls ?? []).find(c => c.name === toolName);
     if (!call) {
       return { called: false, answer: answer || 'the model returned no tool call' };
     }
     // A call that misses the tool's own schema is a refusal too: it names what
     // to fix, and the second try gets to fix it (fire 7051).
-    answer = await tool.invoke(call.args).then(String, (err: Error) => `Not recorded: the call did not match the tool's schema. ${err.message}`);
-    if (!answer.startsWith('Not recorded')) {
+    answer = !namesAction(req, call.args)
+      ? `Not recorded: this pass must call ${toolName} for ${req.action}.`
+      : await tool.invoke(call.args).then(String, (err: Error) => `Not recorded: the call did not match the tool's schema. ${err.message}`);
+    if (!isRefusal(answer)) {
       return { called: true, answer };
     }
-    messages.push(res as BaseMessage, new ToolMessage({ content: answer, tool_call_id: call.id ?? `${opts.toolName}-${attempt}` }));
+    messages.push(res as BaseMessage, new ToolMessage({ content: answer, tool_call_id: call.id ?? `${toolName}-${attempt}` }));
+    // ITS OWN REFUSAL LISTS THE EVIDENCE TOO. Review 5715 read the PR and
+    // quit without calling the tool at all, so there was no earlier refusal to
+    // take screenshots from; the pass's first try was refused for not looking,
+    // and the second repeated it. When this pass is refused with a list of
+    // screenshots and has none open, it opens them and tries once more looking.
+    if (shots.length === 0) {
+      const opened = await openShots(ctx, listedShots(answer));
+      if (opened.length > 0) {
+        ctx.evidenceOpened = true;
+        shots.push(...opened);
+        tries = 3;
+        messages.push(new HumanMessage({ content: [{ type: 'text', text: 'The screenshots, opened for you. Judge each criterion by what these show, and cite the link of the one that proves it:' }, ...opened.flatMap(shot => [{ type: 'text' as const, text: `${shot.title}: ${shot.link}` }, { type: 'image_url' as const, image_url: { url: shot.dataUri } }])] }));
+      }
+    }
   }
   return { called: false, answer };
+}
+
+/**
+ * The run's newest refusal of the required tool that lists screenshots, or ''.
+ * @param ctx - The run's context (org, missionRunId).
+ * @param toolName - The required tool whose refusal is read.
+ */
+async function lastRefusal(ctx: RuntimeContext, toolName: string): Promise<string> {
+  if (!ctx.missionRunId) {
+    return '';
+  }
+  const { desc, sql } = await import('drizzle-orm');
+  const { toolCallSchema } = await import('@/models/Schema');
+  const [last] = await db
+    .select({ output: toolCallSchema.output })
+    .from(toolCallSchema)
+    .where(and(eq(toolCallSchema.orgId, ctx.orgId), eq(toolCallSchema.missionRunId, ctx.missionRunId), eq(toolCallSchema.tool, toolName), sql`${toolCallSchema.output}::text like '%Not recorded%'`, sql`${toolCallSchema.output}::text like '%/dashboard/artifacts/%'`))
+    .orderBy(desc(toolCallSchema.id))
+    .limit(1);
+  return typeof last?.output === 'string' ? last.output : JSON.stringify(last?.output ?? '');
+}
+
+/**
+ * The listed screenshots, fetched and recorded as opened in this run.
+ * @param ctx - The run's context.
+ * @param listed - What a refusal listed.
+ */
+async function openShots(ctx: RuntimeContext, listed: Array<{ title: string; link: string }>): Promise<Array<{ title: string; link: string; dataUri: string }>> {
+  if (listed.length === 0) {
+    return [];
+  }
+  const { artifactImageUrl } = await import('@/services/agents/tools/fetchImage');
+  const { openImage } = await import('@/libs/tools/artifacts/ingest');
+  const { persistToolCall } = await import('@/services/agents/toolCallRecord');
+  const out: Array<{ title: string; link: string; dataUri: string }> = [];
+  for (const { title, link } of listed) {
+    const stored = await artifactImageUrl(ctx.orgId, link).catch(() => null);
+    if (!stored) {
+      continue;
+    }
+    const started = Date.now();
+    // Vocion's stored copy is read from the store; a link out is fetched.
+    const got = await openImage(ctx.orgId, stored, { maxEdge: 800 }).catch(() => null);
+    if (!got) {
+      continue;
+    }
+    out.push({ title, link, dataUri: got.dataUri });
+    await persistToolCall({ ctx, tool: 'fetch_image', input: { url: link, by: 'recording pass' }, output: `Image fetched and verified: ${got.contentType}, ${got.width}×${got.height}, from ${link} (opened by the recording pass)`, durationMs: Date.now() - started, ns: '' });
+  }
+  return out;
+}
+
+/**
+ * The screenshots a refusal lists (`- <title>: <artifact page link>`), at most twenty-four.
+ * @param text - The refusal.
+ * @param raw
+ */
+export function listedShots(raw: string): Array<{ title: string; link: string }> {
+  // tool_call.output can hold the refusal JSON-quoted, newlines as "\\n".
+  const text = raw.replace(/\\n/g, '\n');
+  // Twenty-four, not twelve: task 179 had fifteen and the two that proved the
+  // URL-state criterion were cut, so QA recorded them "not provided" (review
+  // 5750). Each is fetched smaller (800px) so the pass costs about the same.
+  return [...text.matchAll(/- ([^\n]+?): (https?:\/\/\S+\/dashboard\/artifacts\/\d+)/g)].slice(0, 24).map(m => ({ title: m[1]!, link: m[2]! }));
+}
+
+/**
+ * Charge one recording-pass call to the agent it speaks for. Never throws: the
+ * call already happened, and the accounting failing must not fail the pass.
+ * @param orgId - Tenant.
+ * @param agentSlug - The agent whose report it records.
+ * @param response - What the model returned.
+ */
+async function chargeRecordingPass(orgId: string, agentSlug: string, response: unknown): Promise<void> {
+  try {
+    const { modelIdOf, tokenUsageOf } = await import('@/libs/llm/usage');
+    const usage = tokenUsageOf(response);
+    if (!usage) {
+      return;
+    }
+    const { resolvedModelId } = await import('@/libs/llm');
+    const { chargeUsage } = await import('@/services/BudgetService');
+    await chargeUsage({ orgId, agentSlug: agentSlug || undefined, model: modelIdOf(response) ?? resolvedModelId('extractor'), usage });
+  } catch (error) {
+    console.warn('[automation] recording pass was not charged', { orgId, agentSlug, error: (error as Error).message });
+  }
 }

@@ -65,12 +65,39 @@
  * posted.
  */
 
+import type { BlockerFacts } from './blocker';
+import type { CarouselSection, EvidenceSource } from './carouselSource';
 import type { PlanDecision, PlanRecord } from './planRule';
+import type { LiveMissionRunInput, LiveRun, RecordStatus, StatusMove, StatusYou } from '@/libs/factory/liveStatus';
+import type { PullSignals, WorkFacts } from '@/libs/factory/workFacts';
+import type { ProofCriterion } from '@/libs/workspace/featureProof';
+import type { RecordLinker } from '@/libs/workspace/recordHref';
+import { MERGE_ACTION_ID } from '@/libs/actions/mergeAction';
+import { nounCode } from '@/libs/codes';
+import { deliveryStage, failedRun, pausedAnswerLine, readDelivery, runName, runningRun } from '@/libs/factory/delivery';
+import { LIVE_RECHECKS, readRequestLive } from '@/libs/factory/liveCheck';
+import { blockedYou, pickLive, prLabel, youOf } from '@/libs/factory/liveStatus';
+import { resolveLiveUrl } from '@/libs/factory/liveUrl';
+import { hasMockups, readMockupDraw } from '@/libs/factory/mockupDefault';
+import { ciFact, mergeRuleFact, nextForAttempt, NO_PULL_SIGNALS, normalisePullUrl, pullFact, REQUEST_STAGE_LINE, requestStageOf, verdictFact } from '@/libs/factory/workFacts';
+import { liveTopic } from '@/libs/live/topics';
+import { narratedRole } from '@/libs/media/roles';
+import { shotParts } from '@/libs/workspace/criterionEvidence';
+import { featureProof, risksLine, shippedTaskIdsOf } from '@/libs/workspace/featureProof';
+import { genericRecordLinker } from '@/libs/workspace/recordHref';
+import { recordName } from '@/libs/workspace/recordName';
+import { inboxHref } from '@/services/inbox/inboxRef';
+import { blockerResolution } from './blocker';
+import { captionOf, CAROUSEL_SECTIONS, sourceOf } from './carouselSource';
+import { buildHistory } from './featureHistory';
 import { planRecordFromTask, planRequirementForTask } from './planRule';
+import { bare, classifyFailure, nextAfter, readRecovery, recoveryStage, waitingOnOf } from './recovery';
 
 /** A business object as the report reads it — request, task or release. */
 export type ReportObject = {
   id: number;
+  /** Its object type's slug, read off the record: what a link to it opens. */
+  type?: string | null;
   title: string;
   status: string | null;
   createdAt: Date | null;
@@ -107,6 +134,8 @@ export type ReportWorkerRun = {
   input: Record<string, unknown>;
   result: Record<string, unknown> | null;
   progress: Record<string, unknown>;
+  /** The run's own failures (`check:<name>`, `contract`, …), when it failed. */
+  failures?: Array<{ scope?: string; message?: string }>;
 };
 
 /** An `ask` row — a ruling or recommendation a person decided. */
@@ -152,6 +181,10 @@ export type ReportArtifact = {
   spec: Record<string, unknown>;
   url: string | null;
   createdAt: Date;
+  /** Who made it, by name — an agent's, a person's — when the loader could read it. */
+  author?: string | null;
+  /** The conversation it was made in, when it was. */
+  conversationId?: number | null;
 };
 
 export type FeatureReportInput = {
@@ -166,6 +199,59 @@ export type FeatureReportInput = {
   artifacts: ReportArtifact[];
   /** The clock, passed in so "elapsed" is testable. */
   now: Date;
+  /** Display names for the user ids the records carry (an approver), so no raw id reaches the page. */
+  people?: Record<string, string>;
+  /** Where a record opens in this workspace (`libs/workspace/recordHref.ts`); absent, the generic view. */
+  link?: RecordLinker;
+  /** The product's production environment URLs, the one a person uses first (`resolveLiveUrl`). */
+  liveBases?: readonly string[];
+  /**
+   * Agent runs working on this record right now or lately — the planning run
+   * an automation fire started for it, a reviewer's run over its change
+   * (`featureReportData.loadMissionRuns`). Absent, no agent run is known.
+   */
+  missionRuns?: LiveMissionRunInput[];
+  /**
+   * What the agent runs that served it and the chat turns about it cost
+   * (`featureSpend.ts`), beside its own worker runs. Absent, only the worker
+   * runs are known.
+   */
+  spend?: { agentCents: number; chatCents: number };
+  /**
+   * What GitHub and the merge action recorded about each pull request the
+   * tasks carry — merged, closed, CI (`services/factory/pullSignals.ts`).
+   * Absent, nothing is known, and nothing is said as a "no".
+   */
+  pulls?: ReadonlyMap<string, PullSignals>;
+  /**
+   * The request's durable workflow status, when one owns it (backlog 054):
+   * what is carrying it, in the workflow's own sentence, in place of the
+   * recovery state the event handlers keep for requests no workflow owns.
+   */
+  workflow?: { stage: string; line: string } | null;
+  /**
+   * THE REQUEST'S STATUS (its type's `x-groups`, `libs/objects/statusModel.ts`):
+   * the Current state's label and tone, the same words Work's badge reads.
+   * The sentence, the move and the lines under it are still read off the
+   * records. Absent, the label is read off them too.
+   */
+  place?: { label: string; tone: Tone } | null;
+  /**
+   * Whether QA's approve merges the current attempt on its own — the trust
+   * ladder's answer for its class (`pullSignals.mergeRunsItself`). Absent,
+   * not established.
+   */
+  mergeRule?: { runsItself: boolean | null; riskClass: string | null };
+  /**
+   * Who watches the work between the merge and the release — the seat that
+   * owns the pipeline's reconcile ("the Release engineer"), by name. Absent,
+   * nobody is named.
+   */
+  watcher?: string | null;
+  /** Every conversation and agent run tied to it (`featureReportData.loadActivity`), for its Timeline. */
+  activity?: ReportActivity[];
+  /** The records' codes (PL-371, REL-375), by id. Absent, rows carry none. */
+  codes?: ReadonlyMap<number, string>;
 };
 
 /** One labelled figure in a section. `value` null renders as "not recorded". */
@@ -211,7 +297,15 @@ export type ReportEvidence = {
   caption: string | null;
   url: string | null;
   at: Date;
+  /** Where a picture sits in the story — Mockup, Today, Plan, QA before, QA after, Live, Reported in chat (`carouselSource.ts`). */
+  section?: CarouselSection;
+  /** Who or what made it and when, linked to where it came from. */
+  source?: EvidenceSource | null;
 };
+
+/** The records a picture's source line is read from: the runs and releases of the work. */
+type PictureContext = { runs: readonly ReportWorkerRun[]; releases: readonly ReportObject[] };
+const NO_PICTURE_CONTEXT: PictureContext = { runs: [], releases: [] };
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'info' | 'muted';
 
@@ -317,6 +411,10 @@ export type MoneyLine = {
   variancePct: number | null;
   /** What was actually charged across the worker runs, whatever the task rollup says. */
   runCents: number;
+  /** The three parts of `actualCents`: engineering (worker runs), agents and chat. */
+  engineeringCents: number | null;
+  agentCents: number;
+  chatCents: number;
   estimateSource: string;
   actualSource: string;
 };
@@ -333,11 +431,91 @@ export type ReportActivity = {
   at: Date;
   status: string | null;
   detail: string | null;
+  /** The conversation the feature was requested in: the oldest entry, closing its Activity. */
+  origin?: boolean;
+  /** How many agent runs of the same title this row stands for. */
+  count?: number;
+  /**
+   * An agent run's words, from the automation that started it: `label` what
+   * it did ("Checked it live"), `doing` while it runs, each falling back to
+   * the automation's name (`libs/factory/runTitle.ts`). Absent, no
+   * automation started it.
+   */
+  label?: string | null;
+  doing?: string | null;
+  /** The run's own stored title, kept as the last resort for a run no automation started. */
+  stored?: string | null;
+  /** The run's status column (`status` above may be a sentence: why its fire failed). */
+  runStatus?: string | null;
+  /** When the run started and ended, for matching what it wrote to it. */
+  startedAt?: Date | null;
+  endedAt?: Date | null;
+  /** The record ids its tool calls named — this request, one of its tasks. */
+  touched?: number[];
+  /** When each of its tool calls landed: which run wrote a record is the one with a call at that moment. */
+  calls?: Date[];
+  /** What it cost, when that is recorded. Null is "not recorded", never free. */
+  cents?: number | null;
+};
+
+/**
+ * ONE ROW OF THE FEATURE'S TIMELINE (Chris, 2026-10-02): what happened,
+ * newest first — the chat, the plan, each attempt with its build and QA's
+ * reviews under it, the merge, the deploy, the release, the live check, and
+ * the factory's own notes. The page draws a few; the side panel draws them
+ * all, with the same component (`features/dashboard/factory/FeatureTimeline.tsx`).
+ * Assembled in `services/factory/featureHistory.ts`.
+ */
+export type HistoryRow = {
+  key: string;
+  kind: 'conversation' | 'plan' | 'attempt' | 'build' | 'review' | 'agent' | 'merge' | 'deploy' | 'release' | 'live' | 'note';
+  /** What happened, in a person's words (`runTitle`). */
+  title: string;
+  /** Its run or record code (RUN-479, PL-371), drawn small and muted. */
+  code: string | null;
+  /** ISO time, or null when the record carries none (those sort last). */
+  at: string | null;
+  tone: Tone;
+  /** What it cost. Null is "not recorded". */
+  cents: number | null;
+  /** What a tap opens in the preview pane. */
+  open: { type: 'worker_run' | 'mission_run' | 'conversation' | 'object'; id: string } | null;
+  /** Where a tap goes when it is not a preview: a pull request, a deploy run. */
+  href: string | null;
+  /** Still going. */
+  live: boolean;
+  /** An attempt's own rows — its build and QA's reviews of it — newest first. */
+  children?: HistoryRow[];
+  /**
+   * The factory's own lines written at the same moment, folded under the row
+   * they stand beside rather than listed again (the side panel shows them).
+   */
+  notes?: string[];
+};
+
+/** The Timeline's foot: what the work cost in all, and where it went. */
+export type HistoryCost = {
+  /** Everything recorded, in cents. */
+  totalCents: number;
+  /** Builds, agent runs and chat, each null when nothing of that kind is costed. */
+  split: Array<{ key: 'builds' | 'agents' | 'chat'; label: string; cents: number | null }>;
 };
 
 export type FeatureReport = {
   /** Every conversation and run tied to this feature, newest first (loaded beside the report). */
   activity?: ReportActivity[];
+  /**
+   * The newest recording of each kind (Chris, 2026-10-03): QA driving the live
+   * product after release, and the engineer's own browser tests before merge.
+   * Each null when none was kept; the page draws nothing then.
+   */
+  recordings?: ReportRecordings;
+  /**
+   * Where the default mockup stands, when it is not drawn yet — "The designer
+   * is drawing the mockup", or why it drew nothing (`visuals.mockupDraw`).
+   * Shown where the mockup would be. Null once drawn, or when none was asked for.
+   */
+  mockupStatus?: { line: string; tone: 'info' | 'warn' } | null;
   requestId: number;
   /** The plan a build would carry: the newest one not rejected or superseded. Null when there is none. */
   planId: number | null;
@@ -351,6 +529,14 @@ export type FeatureReport = {
   money: MoneyLine;
   /** Where the work is and what it wants from a person — the top of the page. */
   state: ReportState;
+  /**
+   * THE NOW LINE: the one run carrying this work right now — queued, building,
+   * writing the plan, reviewing — or null when nothing is running
+   * (`libs/factory/liveStatus.ts`). The page re-reads while it is set.
+   */
+  live: LiveRun | null;
+  /** THE YOU LINE: nothing needs you, or the one move that does. */
+  you: StatusYou;
   /** Which decision this page is for right now, and therefore what leads it. */
   phase: ReportPhase;
   /** The four steps and where this has got to, in place of four empty sections. */
@@ -372,6 +558,215 @@ export type FeatureReport = {
   contradictions: string[];
   /** The picture that leads the page — the first mock or after-shot with an image — or null. */
   hero: ReportEvidence | null;
+  /** The one or two sentences under the introduction: what is known, what is not, and the one move. */
+  status: ReportStatus;
+  /** Disagreements between records, each said as what is known, whether it blocks, and the move. */
+  notices: ReportNotice[];
+  /** The plan as the page shows it: scope, a plain status, who approved it and when. */
+  planSummary: ReportPlanSummary;
+  /** Build and the change in one: the latest attempt, the earlier ones counted, and the delivery ladder. */
+  implementation: ReportImplementation;
+  /** Live with evidence, release not verified, or not released — and where to open it. */
+  release: ReportReleaseSummary;
+  /** A few events worth a glance, newest first. The whole timeline is one tap away. */
+  activityPreview: Array<TimelineEntry & { ago: string }>;
+  /** THE TIMELINE: what happened, newest first, each row titled as a person says it (`featureHistory.ts`). */
+  history: HistoryRow[];
+  /** Its foot: the total and the split. */
+  historyCost: HistoryCost;
+  /** Whether Dismiss is still an honest second way out: only before any work has started. */
+  canDismiss: boolean;
+  /** What this should change for people, as the record says it. The introduction carries it. */
+  expectedBenefit: string | null;
+  /** Where the running product shows this work, when the record says. */
+  surfaceUrl: string | null;
+  /**
+   * THE FACTS, EACH ON ITS OWN FIELD (backlog 044): QA's verdict, the merge,
+   * CI, the merge rule and the request's stage, for the current attempt — what
+   * an agent reads so a finished run is never said as a shipped feature.
+   */
+  facts: WorkFacts;
+  /**
+   * What this page is made of, as live-stream topics (backlog 050): the
+   * record, its tasks, plans and releases, the runs, cards, asks, artifacts
+   * and agent runs it draws. A page or line showing this report follows
+   * them and re-reads on a change, instead of polling.
+   */
+  follow?: string[];
+};
+
+/**
+ * THE DRAWERS. Everything the page summarises opens in full in the preview
+ * pane (`feature_section:<requestId>.<key>`) — linkable, closed by Back, one
+ * pane, never stacked. `criterion-<n>` is one acceptance criterion (0-based).
+ */
+export type FeatureDrawerKey = 'status' | 'plan' | 'implementation' | 'acceptance' | 'release' | 'timeline' | 'activity' | 'work' | 'cost' | 'details' | `criterion-${number}`;
+
+/** The one move the page offers, and how it is made. */
+export type ReportAction
+  = | {
+    kind: 'build';
+    label: string;
+    /** Why Build would be refused, when it would: drawn disabled, the reason in its tooltip. */
+    disabledReason?: string;
+    /**
+     * The pending `factory.dispatch_task` card this press approves, when one
+     * is already waiting — so the page approves THAT card (with its Undo)
+     * rather than filing a second one beside it.
+     */
+    runId?: number;
+  }
+  | { kind: 'drawer'; label: string; drawer: FeatureDrawerKey }
+  | { kind: 'link'; label: string; href: string };
+
+/**
+ * WHERE THIS IS, IN A SENTENCE (Chris, 2026-09-28). Derived from the same
+ * records as `state`; the sentence says what is known and names what is not
+ * established, and never turns "no evidence" into a "no".
+ */
+export type ReportStatus = {
+  /** `bad` only for a confirmed obstacle. */
+  tone: Tone;
+  headline: string;
+  sentence: string;
+  action: ReportAction | null;
+  /** A second, quieter way out: Dismiss before work starts, Build again beside a review. */
+  secondary: ReportAction | { kind: 'dismiss'; label: string } | { kind: 'check_live'; label: string; releaseId: number } | null;
+  /**
+   * THE NEXT LINE: what happens after the current step, said from the stage
+   * this is in — "The build starts when the plan is approved". Null when
+   * nothing follows on its own.
+   */
+  next?: string | null;
+  /**
+   * The run carrying it right now, when one is live — drawn under the state
+   * as ONE row that opens the run (Chris, 2026-09-29: "is that 'current
+   * state'?"). The row is the move, so a state with one names no other.
+   */
+  activeRun?: { attempt: ReportAttempt; of: number } | null;
+};
+
+/**
+ * A record problem, in the reader's terms. `blocking` is reserved for a
+ * confirmed obstacle; a disagreement between records is an `inconsistency`
+ * and is drawn quietly, with the raw evidence one tap away.
+ */
+export type ReportNotice = {
+  key: string;
+  severity: 'blocking' | 'inconsistency';
+  /** What is known, in one sentence. */
+  known: string;
+  /** Whether it blocks, and what cannot be established because of it. */
+  blocks: string;
+  action: { label: string; drawer: FeatureDrawerKey };
+  /** The disagreement exactly as recorded. */
+  evidence: string;
+};
+
+export type PlanStatus = 'Draft' | 'Awaiting approval' | 'Approved' | 'Superseded' | 'Rejected';
+
+export type ReportPlanSummary = {
+  planId: number | null;
+  status: PlanStatus | null;
+  /** What the plan changes, in a sentence. */
+  scope: string | null;
+  /** A person's name, or "Approver unavailable" — never a raw user id. */
+  approver: string | null;
+  approvedAt: Date | null;
+  /** The first risk the plan names, when it names one. */
+  risk: string | null;
+  steps: number;
+  /** Whether a plan was needed, in plain words — for the drawer. */
+  requirement: string | null;
+  /** Why the plan rule required one, one clause per trigger, in the rule's words. */
+  reasons: string[];
+  /** The approach, and why this one, as the plan says it. */
+  approach: string | null;
+  /** What changes, one line per component. */
+  components: string[];
+  /** Every risk the plan names. */
+  risks: string[];
+  /** The plan record's page, as the workspace links it (`libs/workspace/recordHref.ts`). */
+  href: string | null;
+  /** Said when there is no plan to summarise. */
+  absence: string | null;
+};
+
+/** One engineering attempt as a row. */
+export type ReportAttempt = {
+  runId: number;
+  /** "Completed", "Failed", "Running", "Refused — not executed". */
+  outcome: string;
+  tone: Tone;
+  at: Date;
+  cents: number | null;
+  /** False for a run the worker refused or that never started: it is not executed work. */
+  executed: boolean;
+  /** "2 days ago", against the report's own clock. */
+  ago: string;
+  /** The first line of what went wrong, when something did. */
+  why: string | null;
+  /** The pull request this attempt opened, when it opened one. */
+  prUrl: string | null;
+  /** What its checks reported. Empty when it reported none. */
+  checks: ReportCheck[];
+  /** Which attempt it was, oldest first: 1 of N. */
+  n: number;
+  /** Still queued, running or paused — the run to watch. */
+  live: boolean;
+  /** The run's own status column. */
+  status: string;
+  /** The task (attempt contract) it built, when its input names one. */
+  taskId: number | null;
+  /** The checks its failures named (`check:<name>`), for a failed run that reported no checks list. */
+  failedChecks: string[];
+};
+
+/** A delivery fact that is true, false or not established — never inferred from a neighbour. */
+export type LadderStep = { key: 'run' | 'checks' | 'merged' | 'acceptance' | 'released'; label: string; value: string; state: 'yes' | 'no' | 'unknown' };
+
+export type ReportImplementation = {
+  latest: ReportAttempt | null;
+  /** How many attempts came before the latest. */
+  earlier: number;
+  /** Every attempt, newest first. */
+  attempts: ReportAttempt[];
+  prUrl: string | null;
+  merged: boolean;
+  /** Run completed ≠ checks passed ≠ merged ≠ acceptance verified ≠ released. */
+  ladder: LadderStep[];
+  /** What was spent, when anything was. */
+  spentCents: number | null;
+  /** "Not estimated", or the estimate and its variance when a real estimate exists. */
+  costLine: string;
+  absence: string | null;
+  /**
+   * THE ATTEMPT THAT SHIPPED: the one whose pull request merged, else null.
+   * What "Did it work?" reads its pull request and checks from — never an
+   * earlier attempt's (FE-370: "Checks passed: Failed" beside "Merged: Yes").
+   */
+  shipped: ReportAttempt | null;
+  /** The checks of the attempt that counts — the shipped one, else the lead — from its run, else its task. */
+  checks: ReportCheck[];
+};
+
+export type ReportReleaseSummary = {
+  state: 'live' | 'unverified' | 'not_released';
+  label: 'Live' | 'Release not verified' | 'Not released';
+  sentence: string;
+  /**
+   * Whether QA saw it on the live product after the release (its request's
+   * `liveCheck`): seen, partly, not, or `pending` while no live check has
+   * looked. Null before it is live. Shipped is not the same as seen.
+   */
+  seen: { state: 'seen' | 'partial' | 'not_seen' | 'not_checked' | 'pending'; line: string; detail?: string | null; reached?: number; total?: number; attempts?: number } | null;
+  /** The release record's code (REL-375), when the codes were read. */
+  code?: string | null;
+  /** The release that shipped it, when one did: what "Check live again" asks QA to check. */
+  releaseId?: number;
+  at: Date | null;
+  /** Where to open it: the running product, else the release record. */
+  href: string | null;
 };
 
 // ---------------------------------------------------------------------------
@@ -429,7 +824,7 @@ function list(source: Record<string, unknown> | null | undefined, key: string): 
  * Only this reads as Blocked; "no task running" is a wait, not a block.
  * @param meta - The request's metadata.
  */
-export function blockerOf(meta: Record<string, unknown>): { what: string; owner: string | null; next: string | null } | null {
+export function blockerOf(meta: Record<string, unknown>): { what: string; owner: string | null; next: string | null; cause: string | null } | null {
   const raw = meta.blocker;
   if (raw === null || typeof raw !== 'object') {
     return null;
@@ -437,7 +832,26 @@ export function blockerOf(meta: Record<string, unknown>): { what: string; owner:
   const b = raw as Record<string, unknown>;
   const text = (k: string) => (typeof b[k] === 'string' && (b[k] as string).trim() !== '' ? (b[k] as string).trim() : null);
   const what = text('what');
-  return what === null ? null : { what, owner: text('owner'), next: text('next') };
+  return what === null ? null : { what, owner: text('owner'), next: text('next'), cause: text('cause') };
+}
+
+/**
+ * Causes a build would be refused on (`buildReadiness`): Build is drawn
+ * disabled under them, saying why, because pressing it only hits the refusal.
+ * A plan the build lacks is not one: Build plans it first.
+ */
+const REFUSED_BUILD_CAUSES: ReadonlySet<string> = new Set(['no_repo', 'no_checks']);
+
+/**
+ * What the report's own records say about everything a blocker can name.
+ * @param input - The report's inputs.
+ */
+function blockerFactsOf(input: FeatureReportInput): BlockerFacts {
+  return {
+    plans: input.plans.map(p => ({ id: p.id, status: p.meta.status, approvedAt: p.meta.approvedAt })),
+    asks: input.asks.map(a => ({ id: a.id, status: a.status, decidedAt: a.decidedAt })),
+    actions: input.actionRuns.map(r => ({ id: r.id, status: r.status, decidedAt: r.decidedAt, executedAt: r.executedAt })),
+  };
 }
 
 export function asDate(v: unknown): Date | null {
@@ -506,6 +920,121 @@ export function formatDuration(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Recordings
+// ---------------------------------------------------------------------------
+
+/** One recording the page plays. */
+export type ReportRecording = {
+  artifactId: number;
+  /** Where it plays from: Vocion's media route (`/api/media/…`). */
+  url: string;
+  contentType: string;
+  caption: string;
+  at: Date;
+  /** Its share on Slate, once uploaded there; the page prefers that player. */
+  slateShareId: string | null;
+  /** The video host's player and watch page, once published there (`services/videoHost/`). */
+  hosted: { label: string; watchUrl: string; embedUrl: string } | null;
+  /** Why it is not on the video host, when publishing it failed. */
+  hostNote: string | null;
+  /**
+   * Its second pass with the seat's avatar and voiceover, when one was made
+   * (`services/artifacts/narrate.ts`, role `<role>-narrated`, `spec.narratedFrom`
+   * naming this recording). The page offers Recording | Narrated then.
+   */
+  narrated: { artifactId: number; url: string; contentType: string; caption: string; at: Date; hosted: ReportRecording['hosted'] } | null;
+};
+export type ReportRecordings = { live: ReportRecording | null; qa: ReportRecording | null };
+
+/** The roles a recording is filed under: the live check's, and the engineer's own tests'. */
+export const RECORDING_ROLES = { live: 'qa-live-video', qa: 'qa-video' } as const;
+
+/**
+ * The newest playable recording of each kind among a feature's artifacts. A
+ * recording Vocion keeps (its media route) is preferred to a link out, which
+ * may be a presigned URL that has since expired.
+ * @param artifacts - The artifacts on the request and its tasks.
+ */
+export function recordingsOf(artifacts: readonly ReportArtifact[]): ReportRecordings {
+  const pick = (role: string): ReportRecording | null => {
+    const candidates = artifacts
+      .filter(a => a.recordRole === role)
+      .map(a => ({ a, url: evidenceUrl(a) }))
+      .filter((x): x is { a: ReportArtifact; url: string } => x.url !== null && (x.url.startsWith('/api/media/') || /^https?:\/\//i.test(x.url)))
+      .sort((x, y) => Number(y.url.startsWith('/api/media/')) - Number(x.url.startsWith('/api/media/')) || y.a.createdAt.getTime() - x.a.createdAt.getTime() || y.a.id - x.a.id);
+    const top = candidates[0];
+    if (!top) {
+      return null;
+    }
+    // The narration of THIS recording: it names the source by id (any of its
+    // filings, which share one served file) or by that file's URL.
+    const sourceIds = new Set(artifacts.filter(a => evidenceUrl(a) === top.url).map(a => a.id));
+    const narration = artifacts
+      .filter(a => a.recordRole === narratedRole(role))
+      .filter(a => sourceIds.has(Number((a.spec as Record<string, unknown> | null)?.narratedFrom)) || str(a.spec, 'narratedFromUrl') === top.url)
+      .map(a => ({ a, url: evidenceUrl(a) }))
+      .filter((x): x is { a: ReportArtifact; url: string } => x.url !== null && x.url.startsWith('/api/media/'))
+      .sort((x, y) => y.a.createdAt.getTime() - x.a.createdAt.getTime() || y.a.id - x.a.id)[0];
+    return {
+      artifactId: top.a.id,
+      url: top.url,
+      contentType: str(top.a.spec, 'contentType') ?? 'video/webm',
+      caption: str(top.a.spec, 'caption') ?? top.a.title,
+      at: top.a.createdAt,
+      slateShareId: str(top.a.spec, 'slateShareId'),
+      ...hostedOf(top.a.spec),
+      narrated: narration
+        ? { artifactId: narration.a.id, url: narration.url, contentType: str(narration.a.spec, 'contentType') ?? 'video/mp4', caption: str(narration.a.spec, 'caption') ?? narration.a.title, at: narration.a.createdAt, hosted: hostedOf(narration.a.spec).hosted }
+        : null,
+    };
+  };
+  return { live: pick(RECORDING_ROLES.live), qa: pick(RECORDING_ROLES.qa) };
+}
+
+/**
+ * A recording's place on the video host, read from `spec.hostedVideo`: its
+ * player when published, the reason when publishing failed, nothing otherwise.
+ * Only an http(s) player is offered to the page.
+ * @param spec - The artifact's spec.
+ */
+function hostedOf(spec: Record<string, unknown> | null | undefined): Pick<ReportRecording, 'hosted' | 'hostNote'> {
+  const h = spec?.hostedVideo as Record<string, unknown> | undefined;
+  if (!h || typeof h !== 'object') {
+    return { hosted: null, hostNote: null };
+  }
+  const label = str(h, 'label') ?? 'the video host';
+  const watchUrl = str(h, 'watchUrl');
+  const embedUrl = str(h, 'embedUrl');
+  if (h.state === 'published' && watchUrl && embedUrl && /^https:\/\//i.test(embedUrl) && /^https:\/\//i.test(watchUrl)) {
+    return { hosted: { label, watchUrl, embedUrl }, hostNote: null };
+  }
+  if (h.state === 'failed') {
+    return { hosted: null, hostNote: `Not on ${label}: ${str(h, 'reason') ?? 'the upload failed'}` };
+  }
+  return { hosted: null, hostNote: null };
+}
+
+/**
+ * One artifact per served file: a recording is filed on the task AND on its
+ * request (`services/artifacts/recordings.ts`), so the same file arrives
+ * twice. The newest filing is kept.
+ * @param artifacts - QA evidence.
+ */
+function oncePerFile(artifacts: readonly ReportArtifact[]): ReportArtifact[] {
+  const newest = new Map<string, ReportArtifact>();
+  for (const a of artifacts) {
+    const url = evidenceUrl(a);
+    const key = url && !url.startsWith('data:') ? `url:${url}` : `id:${a.id}`;
+    const had = newest.get(key);
+    if (!had || had.createdAt.getTime() < a.createdAt.getTime()) {
+      newest.set(key, a);
+    }
+  }
+  const kept = new Set(newest.values());
+  return artifacts.filter(a => kept.has(a));
+}
+
+// ---------------------------------------------------------------------------
 // QA evidence
 // ---------------------------------------------------------------------------
 
@@ -539,8 +1068,51 @@ function evidenceUrl(artifact: ReportArtifact): string | null {
 
 const TERMINAL_BAD = new Set(['failed', 'cancelled', 'lost']);
 
+/** What a worker says when it will not take a contract — the plan gate, most often. */
+const REFUSAL = /\brefus|\bdeclined\b|requires? an? (?:approved )?plan|plan (?:is )?required|no approved plan|without an approved plan/i;
+
+/**
+ * Did this run do any work? A run the worker refused, or one that ended
+ * before anything claimed it, is an attempt on the record and NOT executed
+ * work: it wrote nothing, so it cannot make a plan "late" or a history
+ * "complete" (Chris, 2026-09-28: "A refused worker attempt is not executed
+ * work").
+ * @param run - The run.
+ */
+export function executedRun(run: ReportWorkerRun): boolean {
+  if (!TERMINAL_BAD.has(run.status)) {
+    return true;
+  }
+  if (run.claimedAt === null) {
+    return false;
+  }
+  const flagged = run.progress.refused === true || (run.result ?? {}).refused === true;
+  return !flagged && !REFUSAL.test(`${run.error ?? ''} ${run.summary ?? ''}`);
+}
+
+/**
+ * A run that is still going — queued, claimed, running or paused.
+ * @param run - The run.
+ */
+function runIsLive(run: ReportWorkerRun): boolean {
+  return !TERMINAL_BAD.has(run.status) && run.status !== 'completed';
+}
+
+/**
+ * The newest attempt's engineering run failed and nothing is waiting on QA or
+ * a merge: the feature is stopped, and the next move is Build again.
+ * @param input - The report's records.
+ * @param input.tasks - The feature's engineering tasks.
+ * @param input.workerRuns - Their engineering runs.
+ */
+function engineeringStopped(input: Pick<FeatureReportInput, 'tasks' | 'workerRuns'>): boolean {
+  const newestTask = [...input.tasks].sort((a, b) => b.id - a.id)[0];
+  const newestRun = [...input.workerRuns].sort((a, b) => b.id - a.id)[0];
+  return Boolean(newestTask && newestRun && TERMINAL_BAD.has(newestRun.status) && ['rejected', 'dispatched', 'running'].includes(taskStatus(newestTask)));
+}
+
 /** The recommended outcome, as a verb a person reads on the decision card. */
-const OUTCOME_VERBS: Record<string, string> = { build: 'build it', answer: 'answer it', decline: 'decline it', merge: 'merge it into another request', defer: 'defer it' };
+const OUTCOME_VERBS: Record<string, string> = { build: 'build it', answer: 'answer it', decline: 'decline it', merge: 'merge it into another feature', defer: 'defer it' };
 
 /**
  * An age in a person's words — "2 days", "5 hours", "just now" — for the
@@ -595,10 +1167,11 @@ export function runChange(run: ReportWorkerRun): {
       const check = c as Record<string, unknown>;
       const passed = typeof check.passed === 'boolean' ? check.passed : str(check, 'status') === 'passed' ? true : str(check, 'status') === 'failed' ? false : null;
       const exit = num(check, 'exitCode') ?? num(check, 'exit_code');
+      const said = passed === false ? (str(check, 'summary') ?? str(check, 'tail')?.split('\n').slice(-1)[0]?.slice(0, 200) ?? null) : null;
       return {
         name: str(check, 'name') ?? str(check, 'check') ?? 'check',
         passed,
-        detail: exit === null ? null : `exit ${exit}`,
+        detail: checkDetail(exit, said),
       };
     }),
     keptBranch: kept,
@@ -642,6 +1215,7 @@ export function statusTone(status: string | null): Tone {
       return 'ok';
     case 'failed':
     case 'rejected':
+    case 'review_failed':
     case 'cancelled':
     case 'lost':
       return 'bad';
@@ -712,7 +1286,7 @@ function askSection(request: ReportObject): ReportSection {
     { label: 'Product', value: str(meta, 'product'), format: 'mono' },
   ];
   if (!body) {
-    s.flags.push('The request carries no body — only its title, which is ours, not theirs.');
+    s.flags.push('The feature carries no body — only its title, which is ours, not theirs.');
   }
   const evidence = (meta.evidence && typeof meta.evidence === 'object' ? meta.evidence : null) as Record<string, unknown> | null;
   const urls = [...list(evidence, 'urls'), ...(str(evidence, 'videoUrl') ? [str(evidence, 'videoUrl')!] : [])];
@@ -731,7 +1305,7 @@ function triageSection(request: ReportObject): ReportSection {
   const meta = request.meta;
   const state = str(meta, 'state');
   if (!state || state === 'new') {
-    s.absence = 'No one triaged this request; it is still in `new`.';
+    s.absence = 'No one triaged this feature; it is still in `new`.';
     return s;
   }
   const outcome = str(meta, 'recommendedOutcome');
@@ -753,7 +1327,7 @@ function triageSection(request: ReportObject): ReportSection {
     { label: 'Why', value: str(meta, 'priorityReason') ?? str(meta, 'decisionReason'), format: 'quote' },
   );
   if (!outcome) {
-    s.flags.push('The twenty-percent test was never run on this request — no recommendation is on the record.');
+    s.flags.push('The twenty-percent test was never run on this feature — no recommendation is on the record.');
   }
   return s;
 }
@@ -785,13 +1359,21 @@ export function planDecisionForRequest(tasks: ReportObject[]): PlanDecision | nu
  * @param decision - What the rule decided.
  */
 function planLevelSentence(decision: PlanDecision): string {
+  // "required, on 3 triggers" was the rule's own vocabulary (Chris,
+  // 2026-09-28: replace the jargon). A person reads the reason.
   if (decision.level === 'required') {
-    return `required, on ${decision.triggers.length} trigger${decision.triggers.length === 1 ? '' : 's'}`;
+    const first = decision.triggers[0]?.why;
+    // Each reason said, never "N reasons, listed below" with the list
+    // somewhere else (Chris, 2026-09-28, on #126's plan).
+    const whys = [...new Set(decision.triggers.map(t => t.why))];
+    return whys.length > 1
+      ? `Yes — ${whys.slice(0, -1).join('; ')}; and ${whys.at(-1)}`
+      : first ? `Yes — ${first}` : 'Yes';
   }
   if (decision.level === 'offered') {
-    return 'offered and skippable, with a recorded reason';
+    return 'Optional — it can be skipped with a written reason';
   }
-  return 'not required';
+  return 'No';
 }
 
 /**
@@ -826,7 +1408,41 @@ export function planRecordLine(plan: PlanRecord | null): string {
  * @param tasks - The tasks pointing at this request.
  * @param hasRuns - Whether any worker run exists, which changes what an absent plan means.
  */
-function planSection(plans: ReportObject[], tasks: ReportObject[], hasRuns: boolean): ReportSection {
+/**
+ * Does this look like a user id rather than a name? A raw id is a handle, not
+ * a person (the plan's approver read "user_2x9…" on the page).
+ * @param s - The recorded value.
+ */
+function looksLikeUserId(s: string): boolean {
+  return /^(?:user|usr)_[\w-]+$/i.test(s)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(s)
+    || /^\d+$/.test(s)
+    || (/^[\w-]{20,}$/.test(s) && /\d/.test(s));
+}
+
+/**
+ * A recorded person as a name: the directory's name for an id, the value
+ * itself when it already reads as one, and null for a bare id nobody could
+ * resolve — the caller says "Approver unavailable" rather than print it.
+ * @param raw - What the record carries (`approvedBy`, `decidedBy`).
+ * @param people - Id → display name, loaded beside the records.
+ */
+export function personName(raw: string | null, people: Record<string, string> = {}): string | null {
+  if (raw === null || raw.trim() === '') {
+    return null;
+  }
+  const known = people[raw];
+  if (known) {
+    return known;
+  }
+  const agent = /^agent:(.+)$/.exec(raw);
+  if (agent) {
+    return `an agent (${agent[1]})`;
+  }
+  return looksLikeUserId(raw) ? null : raw;
+}
+
+function planSection(plans: ReportObject[], tasks: ReportObject[], hasRuns: boolean, people: Record<string, string> = {}): ReportSection {
   const s = blank('plan', 'Plan');
   const decision = planDecisionForRequest(tasks);
   const recorded = tasks.map(task => ({ task, plan: planRecordFromTask(task.meta) }));
@@ -853,7 +1469,6 @@ function planSection(plans: ReportObject[], tasks: ReportObject[], hasRuns: bool
           ? null
           : `${fromPlan === 'required' ? 'Yes' : fromPlan === 'offered' ? 'It was offered' : 'No'} — as the plan itself recorded when it was written; no task has been contracted yet for the rule to re-read.`,
     },
-    { label: 'Plans on record', value: plans.length === 0 ? 'none' : String(plans.length) },
   ];
   if (decision === null && planTriggers.length > 0) {
     s.lists.push({ label: 'Why the plan says it was required', items: planTriggers });
@@ -913,7 +1528,7 @@ function planSection(plans: ReportObject[], tasks: ReportObject[], hasRuns: bool
       // paragraphs of it at the top of a plan is a document, not a decision.
       // It moves to `detailFacts`, behind "Why this plan".
       facts: [
-        { label: 'Approved by', value: str(meta, 'approvedBy') ?? (plan.status === 'approved' ? 'not recorded' : 'nobody yet') },
+        { label: 'Approved by', value: str(meta, 'approvedBy') === null ? (plan.status === 'approved' ? 'not recorded' : 'nobody yet') : personName(str(meta, 'approvedBy'), people) ?? 'Approver unavailable' },
         { label: 'Approved', value: asDate(meta.approvedAt) ? formatStamp(asDate(meta.approvedAt)) : null },
       ],
       steps: list(meta, 'components'),
@@ -946,7 +1561,7 @@ function planSection(plans: ReportObject[], tasks: ReportObject[], hasRuns: bool
 function contractSection(tasks: ReportObject[]): ReportSection {
   const s = blank('contract', 'The contract');
   if (tasks.length === 0) {
-    s.absence = 'No task contract was written for this request; nothing was dispatched.';
+    s.absence = 'No task was written for this feature; nothing was dispatched.';
     return s;
   }
   s.entries = tasks.map((task) => {
@@ -1068,7 +1683,7 @@ function runsSection(runs: ReportWorkerRun[], mergedPrs: Set<string>): ReportSec
   // follow, numbered and named as superseded, which is what they are.
   const s = blank('runs', 'Build');
   if (runs.length === 0) {
-    s.absence = 'Nothing has been built yet — no worker run is recorded against this work.';
+    s.absence = 'Nothing has been built yet — no run is recorded against this work.';
     return s;
   }
   const newestFirst = [...runs].reverse();
@@ -1101,8 +1716,8 @@ function runsSection(runs: ReportWorkerRun[], mergedPrs: Set<string>): ReportSec
     return {
       key: `run-${run.id}`,
       title: index === 0
-        ? `Latest attempt · run ${run.id}`
-        : `Earlier attempt ${newestFirst.length - index} of ${newestFirst.length} · run ${run.id}, superseded`,
+        ? `Latest attempt · ${nounCode('run', run.id)}`
+        : `Earlier attempt ${newestFirst.length - index} of ${newestFirst.length} · ${nounCode('run', run.id)}, superseded`,
       status: run.status,
       tone: statusTone(run.status),
       at: runAt(run),
@@ -1125,6 +1740,30 @@ function runsSection(runs: ReportWorkerRun[], mergedPrs: Set<string>): ReportSec
  * @param tasks - The tasks.
  * @param runs - The runs, for a pull request the task never recorded.
  */
+/**
+ * WHY A CHECK FAILED, not only that it did (FE-224, 2026-10-02: the page said
+ * "test · exit 2" while the reason, `sh: 1: Syntax error: "(" unexpected`, sat
+ * in the run's failures). The runner writes each check's last output line on
+ * the task's `verification`; a failed check shows it beside its exit code.
+ * @param meta - The task's metadata.
+ * @param name - The check.
+ */
+function verificationSummary(meta: Record<string, unknown>, name: string): string | null {
+  const rows = Array.isArray(meta.verification) ? (meta.verification as unknown[]) : [];
+  const row = rows.find(r => r && typeof r === 'object' && (r as Record<string, unknown>).check === name) as Record<string, unknown> | undefined;
+  return row ? str(row, 'summary') : null;
+}
+
+/**
+ * A check's detail: its exit code and, when it failed, what it said.
+ * @param exit - The exit code.
+ * @param summary - Its last output line.
+ */
+function checkDetail(exit: number | null, summary: string | null): string | null {
+  const parts = [exit === null ? null : `exit ${exit}`, summary].filter((p): p is string => Boolean(p));
+  return parts.length > 0 ? parts.join(': ') : null;
+}
+
 function changeSection(tasks: ReportObject[], runs: ReportWorkerRun[]): ReportSection {
   const s = blank('change', 'The change');
   const fromTasks = tasks.filter(t => str(t.meta, 'prUrl'));
@@ -1153,12 +1792,9 @@ function changeSection(tasks: ReportObject[], runs: ReportWorkerRun[]): ReportSe
       ],
       checks: rawChecks.map((c) => {
         const check = (c && typeof c === 'object' ? c : {}) as Record<string, unknown>;
-        const exit = num(check, 'exitCode');
-        return {
-          name: str(check, 'name') ?? 'check',
-          passed: typeof check.passed === 'boolean' ? check.passed : null,
-          detail: exit === null ? null : `exit ${exit}`,
-        };
+        const name = str(check, 'name') ?? 'check';
+        const passed = typeof check.passed === 'boolean' ? check.passed : null;
+        return { name, passed, detail: checkDetail(num(check, 'exitCode'), passed === false ? verificationSummary(meta, name) : null) };
       }),
       flags: [],
     };
@@ -1185,23 +1821,54 @@ function changeSection(tasks: ReportObject[], runs: ReportWorkerRun[]): ReportSe
  * plainly, because the absence is the finding.
  * @param artifacts - Artifacts attached to the tasks.
  * @param taskCount - How many tasks, so the sentence reads right.
+ * @param ctx - The runs and releases each picture's source line is read from.
  */
-function qaSection(artifacts: ReportArtifact[], taskCount: number): ReportSection {
+/**
+ * ONE OF EACH PICTURE (Chris, 2026-09-30, #269: "looks like some duplicate
+ * mockups"). The same artifact reached through two paths, and the same image
+ * filed twice — QA's worker filed each after-shot as two artifacts on one
+ * file, and a before and an after that are one capture — are one slide. A
+ * picture is its image; anything without one is itself. The first of each is
+ * kept, in the order given.
+ * @param items - Evidence, in the order it is drawn.
+ */
+export function oneOfEachPicture<T extends { id: number; imageUrl: string | null }>(items: readonly T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((e) => {
+    const keys = [`id:${e.id}`, ...(e.imageUrl ? [`img:${e.imageUrl.split(/[?#]/)[0]}`] : [])];
+    if (keys.some(k => seen.has(k))) {
+      return false;
+    }
+    keys.forEach(k => seen.add(k));
+    return true;
+  });
+}
+
+function qaSection(artifacts: ReportArtifact[], taskCount: number, ctx: PictureContext = NO_PICTURE_CONTEXT): ReportSection {
   const s = blank('qa', 'QA');
-  s.evidence = artifacts
+  s.evidence = oncePerFile(artifacts.filter(a => qaEvidenceRole(a) !== null))
     .map(a => ({ a, role: qaEvidenceRole(a) }))
     .filter((x): x is { a: ReportArtifact; role: QaEvidenceRole } => x.role !== null)
-    .map(({ a, role }) => ({
-      id: a.id,
-      kind: a.kind,
-      ...drawOf(a),
-      role,
-      title: a.title,
-      caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? str(a.spec, 'summary'),
-      url: evidenceUrl(a),
-      at: a.createdAt,
-    }))
+    .map(({ a, role }) => {
+      const side = shotParts(a.title).side;
+      const section = role === 'qa-screenshot' && side === 'before' ? CAROUSEL_SECTIONS.qaBefore : CAROUSEL_SECTIONS.qaAfter;
+      return {
+        id: a.id,
+        kind: a.kind,
+        ...drawOf(a),
+        role,
+        title: a.title,
+        caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? str(a.spec, 'summary'),
+        url: evidenceUrl(a),
+        at: a.createdAt,
+        section,
+        source: sourceOf({ artifact: a, section, ...ctx }),
+      };
+    })
     .sort((x, y) => x.at.getTime() - y.at.getTime());
+  // The same capture filed twice is one; the newest filing is kept, so its
+  // source line names the latest attempt that took it.
+  s.evidence = oneOfEachPicture([...s.evidence].reverse()).reverse();
   if (s.evidence.length === 0) {
     // SAY WHAT IS OWED, not what the schema expects.
     //
@@ -1260,7 +1927,7 @@ function resultSection(request: ReportObject, released: boolean): ReportSection 
     s.facts.push({ label: 'Result', value: checkedAt ? `${label} · checked ${formatStamp(checkedAt)}` : label });
     s.facts.push({ label: 'What the check showed', value: note });
     if (result === 'did_not_help') {
-      s.flags.push('Did not help: this is a new request, not a closed one.');
+      s.flags.push('Did not help: this is a new feature, not a closed one.');
     }
   }
   if (told) {
@@ -1314,14 +1981,20 @@ function releaseSection(releases: ReportObject[]): ReportSection {
 }
 
 /**
- * Estimate against actual, with both figures' sources named. The task
- * rollup and the sum of what the runs actually charged are reported
- * separately and a disagreement is flagged rather than averaged away.
+ * Estimate against actual, with both figures' sources named. The actual is
+ * ONE figure from one source (`featureSpend.ts`): what the worker runs
+ * charged, each at its own final account — the same figure each run row
+ * shows — plus the agent runs that served it and the chat turns about it.
+ * The tasks' `actualCents` is a copy written when a run ends, so it is the
+ * fallback only where no run is linked, never a second opinion.
  * @param request - The request, whose rollups are the fallback.
  * @param tasks - The tasks.
  * @param runs - The runs.
+ * @param spend - What its agent runs and chat turns cost.
+ * @param spend.agentCents - The agent runs' share.
+ * @param spend.chatCents - The chat turns' share.
  */
-export function moneyLine(request: ReportObject, tasks: ReportObject[], runs: ReportWorkerRun[]): MoneyLine {
+export function moneyLine(request: ReportObject, tasks: ReportObject[], runs: ReportWorkerRun[], spend?: { agentCents: number; chatCents: number }): MoneyLine {
   const runCents = runs.reduce((a, r) => a + (r.cents ?? 0), 0);
   const taskEstimates = tasks.map(t => num(t.meta, 'estimateCents')).filter((n): n is number => n !== null);
   const taskActuals = tasks.map(t => num(t.meta, 'actualCents')).filter((n): n is number => n !== null);
@@ -1340,9 +2013,24 @@ export function moneyLine(request: ReportObject, tasks: ReportObject[], runs: Re
   // A sum over more than one attempt is not an estimate of this work, so it
   // is reported and never divided into. A single contract is the work.
   const comparable = workEstimate !== null || taskEstimates.length === 1;
-  const actualCents = taskActuals.length > 0
-    ? taskActuals.reduce((a, b) => a + b, 0)
-    : runs.length > 0 ? runCents : num(request.meta, 'actualCents');
+  // ONE SOURCE (2026-10-02). The page said "Two cost records disagree: the
+  // tasks say $10.00, the runs charged $11.68" (FE-314) because it read the
+  // tasks' copy first and the runs second. The copy is written once, when a
+  // run ends; run 451's figure moved after that, when a heartbeat already in
+  // flight landed behind the failure and added the same usage again. The runs
+  // are what was charged, so they are the figure, and there is nothing left to
+  // disagree with.
+  const engineeringCents = runs.length > 0
+    ? runCents
+    : taskActuals.length > 0 ? taskActuals.reduce((a, b) => a + b, 0) : num(request.meta, 'actualCents');
+  const agentCents = spend?.agentCents ?? 0;
+  const chatCents = spend?.chatCents ?? 0;
+  const actualCents = engineeringCents === null && agentCents === 0 && chatCents === 0
+    ? null
+    : (engineeringCents ?? 0) + agentCents + chatCents;
+  const parts = agentCents > 0 || chatCents > 0
+    ? `: ${money(engineeringCents ?? 0)} engineering, ${money(agentCents)} agents, ${money(chatCents)} chat`
+    : '';
   return {
     estimateCents,
     actualCents,
@@ -1351,16 +2039,52 @@ export function moneyLine(request: ReportObject, tasks: ReportObject[], runs: Re
       ? null
       : Math.round(((actualCents - estimateCents) / estimateCents) * 100),
     runCents,
+    engineeringCents,
+    agentCents,
+    chatCents,
     estimateSource: workEstimate !== null
       ? 'estimated for this work before it started'
       : summed === null
-        ? 'nobody estimated this'
+        ? 'Not estimated'
         : taskEstimates.length === 1
           ? 'the one task contract written for it'
           : `added up from ${taskEstimates.length} attempt contracts — not an estimate of this work, so it is not compared against`,
-    actualSource: taskActuals.length > 0
-      ? `summed over ${taskActuals.length} task${taskActuals.length === 1 ? '' : 's'}`
-      : runs.length > 0 ? `summed over ${runs.length} worker run${runs.length === 1 ? '' : 's'}` : 'nothing has been charged',
+    actualSource: (runs.length > 0
+      ? `summed over ${runs.length} run${runs.length === 1 ? '' : 's'}`
+      : taskActuals.length > 0
+        ? `summed over ${taskActuals.length} task${taskActuals.length === 1 ? '' : 's'}`
+        : engineeringCents !== null ? 'as the request records it' : agentCents > 0 || chatCents > 0 ? 'no engineering run has charged anything' : 'nothing has been charged') + parts,
+  };
+}
+
+/**
+ * What was spent, with its split when agents or chat spent anything:
+ * "$4.10 (engineering $2.77 · agents $1.33 · chat $0.00)". Null when nothing is recorded.
+ * @param line - The money line.
+ */
+export function spentLabel(line: Pick<MoneyLine, 'actualCents' | 'engineeringCents' | 'agentCents' | 'chatCents'>): string | null {
+  if (line.actualCents === null) {
+    return null;
+  }
+  if (line.agentCents === 0 && line.chatCents === 0) {
+    return money(line.actualCents);
+  }
+  return `${money(line.actualCents)} (engineering ${money(line.engineeringCents ?? 0)} · agents ${money(line.agentCents)} · chat ${money(line.chatCents)})`;
+}
+
+/**
+ * The Timeline's foot from the money line: the same total and split the
+ * Cost section shows. A part with nothing recorded says so.
+ * @param line - The money line.
+ */
+function footOf(line: MoneyLine): HistoryCost {
+  return {
+    totalCents: line.actualCents ?? 0,
+    split: [
+      { key: 'builds', label: 'Builds', cents: line.engineeringCents },
+      { key: 'agents', label: 'Agents', cents: line.agentCents > 0 ? line.agentCents : null },
+      { key: 'chat', label: 'Chat', cents: line.chatCents > 0 ? line.chatCents : null },
+    ],
   };
 }
 
@@ -1378,42 +2102,54 @@ function moneySection(line: MoneyLine): ReportSection {
   // occupy the same visual weight as the actual product change."* So: what it
   // has cost and what it was expected to cost, in a sentence; the workings
   // one tap down.
-  const spent = line.actualCents === null ? null : money(line.actualCents);
+  const spent = spentLabel(line);
   const estimated = line.estimateCents === null ? null : money(line.estimateCents);
   s.facts = [{
     label: spent === null ? 'Estimated' : 'Spent',
     value: spent === null
-      ? estimated ?? 'nobody estimated this'
-      : estimated === null ? spent : `${spent} · estimated ${estimated}`,
+      ? estimated ?? 'Not estimated'
+      : estimated === null ? `${spent} · not estimated` : `${spent} · estimated ${estimated}`,
     format: 'money',
   }];
+  // A variance only exists against a real estimate. Without one the line says
+  // "Not estimated" and nothing is computed against nothing (2026-09-28).
   s.detailLists.push({
     label: 'How that is worked out',
     items: [
-      `Estimate: ${estimated ?? 'nobody estimated this'} — ${line.estimateSource}.`,
+      estimated === null ? 'Estimate: Not estimated.' : `Estimate: ${estimated} — ${line.estimateSource}.`,
       `Actual: ${spent ?? 'nothing has been charged'} — ${line.actualSource}.`,
-      line.varianceCents === null
-        ? 'Variance: not computable without both figures.'
-        : `Variance: ${line.varianceCents >= 0 ? '+' : ''}${money(line.varianceCents)}${line.variancePct === null ? '' : ` (${line.variancePct >= 0 ? '+' : ''}${line.variancePct}%)`}.`,
-      `Charged across the worker runs: ${money(line.runCents)}.`,
+      ...(line.varianceCents === null
+        ? []
+        : [`Variance: ${line.varianceCents >= 0 ? '+' : ''}${money(line.varianceCents)}${line.variancePct === null ? '' : ` (${line.variancePct >= 0 ? '+' : ''}${line.variancePct}%)`}.`]),
+      `Charged across the engineering runs: ${money(line.runCents)}.`,
+      ...(line.agentCents > 0 || line.chatCents > 0
+        ? [`Agent runs that served it: ${money(line.agentCents)}. Chat turns about it: ${money(line.chatCents)}. A run or turn that served several features is split evenly between them.`]
+        : []),
     ],
   });
   return s;
 }
 
 /**
- * The pull requests the records say merged — a task with both a pull request
- * and a merge commit, or a pull request a release carries. Used only to flag
- * a run that disagrees; nothing in the report is inferred from it.
- * @param tasks - The tasks.
+ * The pull requests the records say merged — a done merge for it, or a
+ * release that carries it.
  * @param releases - The releases.
+ * @param actionRuns - The request's action runs (a done `git.merge` names its pull request).
  */
-function mergedPullRequests(tasks: ReportObject[], releases: ReportObject[]): Set<string> {
+export function mergedPullRequests(releases: ReportObject[], actionRuns: readonly ReportActionRun[] = []): Set<string> {
+  // A MERGE IS WHAT MERGED IT, NOT A COMMIT ON THE TASK (#201, 2026-09-29:
+  // "Merged: Yes" beside "Ready to merge"). A task's commitSha is its PR's head
+  // — every finished attempt has one. Merged means a done git.merge for that
+  // pull request (a person's press, the trust rule, or GitHub's webhook), or a
+  // release that lists it.
   const merged = new Set<string>();
-  for (const task of tasks) {
-    const pr = str(task.meta, 'prUrl');
-    if (pr && str(task.meta, 'commitSha')) {
-      merged.add(pr);
+  for (const run of actionRuns) {
+    if (run.actionId !== 'git.merge' || run.status !== 'done') {
+      continue;
+    }
+    const url = (run.input.externalRef as { url?: unknown } | undefined)?.url;
+    if (typeof url === 'string') {
+      merged.add(url);
     }
   }
   for (const release of releases) {
@@ -1480,18 +2216,20 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
       detail: str(plan.meta, 'approach'),
       cents: null,
       tone: 'info',
-      href: `/dashboard/objects/${plan.id}`,
+      href: (input.link ?? genericRecordLinker)({ objectType: plan.type, id: plan.id }),
     });
     if (asDate(plan.meta.approvedAt)) {
       out.push({
         key: `plan-approved-${plan.id}`,
         at: asDate(plan.meta.approvedAt),
         kind: 'plan',
-        title: `Plan approved by ${str(plan.meta, 'approvedBy') ?? 'nobody named on the record'}`,
+        title: str(plan.meta, 'approvedBy') === null
+          ? 'Plan approved by nobody named on the record'
+          : `Plan approved by ${personName(str(plan.meta, 'approvedBy'), input.people) ?? 'a person whose name is unavailable'}`,
         detail: null,
         cents: null,
         tone: 'ok',
-        href: `/dashboard/objects/${plan.id}`,
+        href: (input.link ?? genericRecordLinker)({ objectType: plan.type, id: plan.id }),
       });
     }
   }
@@ -1506,7 +2244,7 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
         detail: null,
         cents: null,
         tone: 'warn',
-        href: `/dashboard/objects/${task.id}`,
+        href: (input.link ?? genericRecordLinker)({ objectType: task.type, id: task.id }),
       });
     }
   }
@@ -1533,7 +2271,7 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
       detail: str(task.meta, 'objective') ?? task.title,
       cents: num(task.meta, 'estimateCents'),
       tone: 'info',
-      href: `/dashboard/objects/${task.id}`,
+      href: (input.link ?? genericRecordLinker)({ objectType: task.type, id: task.id }),
     });
   }
 
@@ -1598,7 +2336,7 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
     }
   }
 
-  for (const artifact of input.artifacts) {
+  for (const artifact of oncePerFile(input.artifacts.filter(a => qaEvidenceRole(a) !== null))) {
     const role = qaEvidenceRole(artifact);
     if (role) {
       out.push({
@@ -1623,7 +2361,23 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
       detail: str(release.meta, 'announcement') ?? str(release.meta, 'notes'),
       cents: null,
       tone: 'ok',
-      href: `/dashboard/objects/${release.id}`,
+      href: (input.link ?? genericRecordLinker)({ objectType: release.type, id: release.id }),
+    });
+  }
+
+  // THE FACTORY'S OWN ACCOUNT (backlog 038): why it started, planned,
+  // recovered or stopped, one line each, so the reason is on the page where
+  // the work is read and not only in an automation log.
+  for (const [i, line] of readRecovery(meta).log.entries()) {
+    out.push({
+      key: `carry-${i}`,
+      at: asDate(line.at),
+      kind: line.runId ? 'run' : 'decision',
+      title: line.text,
+      detail: null,
+      cents: null,
+      tone: line.text.startsWith('Stopped') ? 'warn' : 'info',
+      href: line.runId ? `/dashboard/p/runs/${line.runId}` : null,
     });
   }
 
@@ -1651,51 +2405,103 @@ function buildTimeline(input: FeatureReportInput, mergedPrs: Set<string>): Timel
  * @param mergedPrs - Pull requests the records say merged.
  * @param line - The money line.
  */
-function findContradictions(input: FeatureReportInput, mergedPrs: Set<string>, line: MoneyLine): string[] {
-  const out: string[] = [];
+/** Task stages that say an engineer already worked on it — so a missing run is a gap, not a queue. */
+const WORKED_STAGES: ReadonlySet<string> = new Set(['running', 'awaiting_review', 'accepted', 'changes_requested', 'review_failed']);
+
+/**
+ * Everything the records disagree about, each said as what is known, whether
+ * it blocks, and the one move — with the disagreement exactly as recorded
+ * kept as its evidence. Never resolved: the report shows a person the
+ * contradiction and does not pick which table is right.
+ *
+ * Every one of these is an INCONSISTENCY, drawn quietly. The red sentence
+ * that opened the page ("Execution history is incomplete…", "approved after
+ * the first worker run…") read as an outage on work that was fine — the
+ * first "run" was the worker refusing to start without the plan, which is
+ * the gate working (Chris, 2026-09-28). Only a confirmed obstacle — the
+ * record's own blocker — is red, and that is the status line's job.
+ * @param input - The report's inputs.
+ * @param mergedPrs - Pull requests the records say merged.
+ */
+function findNotices(input: FeatureReportInput, mergedPrs: Set<string>): ReportNotice[] {
+  const out: ReportNotice[] = [];
+  const quiet = (key: string, known: string, blocks: string, action: ReportNotice['action'], evidence: string) =>
+    out.push({ key, severity: 'inconsistency', known, blocks, action, evidence });
+  const executed = input.workerRuns.filter(executedRun);
   for (const run of input.workerRuns) {
     const change = runChange(run);
     if (TERMINAL_BAD.has(run.status) && change.prUrl && mergedPrs.has(change.prUrl)) {
-      out.push(`Run ${run.id} is recorded as ${run.status}, and its pull request ${change.prUrl} merged. Both facts stand; the worker's completion call can time out after the pull request is open.`);
-    }
-  }
-  const rolledUp = input.tasks.map(t => num(t.meta, 'actualCents')).filter((n): n is number => n !== null);
-  if (rolledUp.length > 0 && input.workerRuns.length > 0) {
-    const sum = rolledUp.reduce((a, b) => a + b, 0);
-    if (sum !== line.runCents) {
-      out.push(`The tasks roll up ${money(sum)} spent and the worker runs charged ${money(line.runCents)}. One of the two is stale.`);
+      quiet(
+        `run-merged-${run.id}`,
+        `Run ${run.id} is recorded as ${run.status}, but its pull request merged.`,
+        'This does not block anything: the merged change is on the record. The run\'s own status is stale.',
+        { label: 'Review delivery status', drawer: 'status' },
+        `Run ${run.id} is recorded as ${run.status}, and its pull request ${change.prUrl} merged. Both facts stand; the worker's completion call can time out after the pull request is open.`,
+      );
     }
   }
   const planDecision = planDecisionForRequest(input.tasks);
-  if (planDecision?.level === 'required' && input.plans.length === 0 && input.workerRuns.length > 0) {
+  if (planDecision?.level === 'required' && input.plans.length === 0 && executed.length > 0) {
     const skipped = input.tasks.filter(t => planRecordFromTask(t.meta)?.skipped === true).length;
-    out.push(`The plan rule required a plan for this work and none is on the record${skipped > 0 ? `, and ${skipped} task${skipped === 1 ? '' : 's'} recorded the plan as skipped` : ''}. ${input.workerRuns.length} worker run${input.workerRuns.length === 1 ? '' : 's'} ran anyway.`);
+    quiet(
+      'plan-missing',
+      'This was built without the plan the plan rule required.',
+      'It does not block the build. The approach was not reviewed before work began.',
+      { label: 'Review plan', drawer: 'plan' },
+      `The plan rule required a plan for this work and none is on the record${skipped > 0 ? `, and ${skipped} task${skipped === 1 ? '' : 's'} recorded the plan as skipped` : ''}. ${executed.length} run${executed.length === 1 ? '' : 's'} ran anyway.`,
+    );
   }
-  const firstRunAt = input.workerRuns.map(r => runAt(r)).sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
-  for (const plan of input.plans) {
-    const approvedAt = asDate(plan.meta.approvedAt);
-    if (approvedAt && firstRunAt && approvedAt.getTime() > firstRunAt.getTime()) {
-      out.push(`Plan ${plan.id} was approved at ${formatStamp(approvedAt)}, after the first worker run started at ${formatStamp(firstRunAt)}. A plan approved after the work is a record, not a gate.`);
-    }
-  }
+  // A plan approved after the first run started is NOT a page notice
+  // (2026-10-03, FE-392, Chris: "a note that says it does not block and
+  // needs nothing from the person should not be shown"). It never blocks —
+  // the plan is approved, full stop — so it was agent-voice noise read by
+  // the person for nothing. The fact itself is not lost: the Timeline
+  // already carries "Plan written" and "Plan approved by …" as their own
+  // rows (see the plan loop below), and the plan drawer shows the approval
+  // date, so the record survives without a quiet() entry here.
   for (const task of input.tasks) {
     if (task.status === 'accepted' && !str(task.meta, 'prUrl')) {
-      out.push(`Task ${task.id} is accepted and carries no pull request.`);
+      quiet(
+        `accepted-no-pr-${task.id}`,
+        `Task ${task.id} is accepted, and no pull request is recorded for it.`,
+        'Whether the change merged is not established.',
+        { label: 'Review delivery status', drawer: 'status' },
+        `Task ${task.id} is accepted and carries no pull request.`,
+      );
     }
   }
   if (input.releases.length > 0 && input.tasks.every(t => t.status !== 'accepted')) {
-    out.push('A release carries this work and no task is accepted.');
+    quiet(
+      'release-unaccepted',
+      'A release names this work, and no task on it was accepted.',
+      'Whether the released change is this work is not established.',
+      { label: 'Review delivery status', drawer: 'release' },
+      'A release carries this work and no task is accepted.',
+    );
   }
-  // The join that quietly became a zero. Tasks were written, and not one
-  // worker run is linked to them — so every run-derived figure on this page
-  // is reading an empty set, and says so rather than reading nothing as none.
-  // The rollup and the rows disagree about whether any work was written.
+  // The join that quietly became a zero. The rollup and the rows disagree
+  // about whether any work was written.
   const written = num(input.request.meta, 'taskCount') ?? 0;
   if (written > 0 && input.tasks.length === 0) {
-    out.push(`This work records ${written} task${written === 1 ? '' : 's'} written for it, and not one is linked to it. Everything below that reads off tasks — the plan, the contract, the change, the money — is reading an empty set.`);
+    quiet(
+      'tasks-unlinked',
+      `This work records ${written} task${written === 1 ? '' : 's'} written for it, and none is linked here.`,
+      'Build history on this page is incomplete until they are linked. Delivery status cannot be established.',
+      { label: 'Review delivery status', drawer: 'status' },
+      `This work records ${written} task${written === 1 ? '' : 's'} written for it, and not one is linked to it. Everything below that reads off tasks — the plan, the contract, the change, the money — is reading an empty set.`,
+    );
   }
-  if (input.tasks.length > 0 && input.workerRuns.length === 0) {
-    out.push(`Execution history is incomplete: ${input.tasks.length} task${input.tasks.length === 1 ? ' was' : 's were'} written for this work and no worker run is linked to ${input.tasks.length === 1 ? 'it' : 'them'}. Attempts, models and per-run cost are unreadable until that join is repaired.`);
+  // A task still queued has no run BECAUSE it is queued; that is not a gap.
+  // Only a task that says an engineer worked on it and has no run is one.
+  const worked = input.tasks.filter(t => WORKED_STAGES.has(taskStatus(t)));
+  if (worked.length > 0 && input.workerRuns.length === 0) {
+    quiet(
+      'runs-unlinked',
+      `The task${worked.length === 1 ? ' says it was' : 's say they were'} worked on, and no run is linked.`,
+      'It does not block review or the merge. Attempts and per-run cost cannot be shown until the run is linked.',
+      { label: 'Review delivery status', drawer: 'status' },
+      `Execution history is incomplete: ${input.tasks.length} task${input.tasks.length === 1 ? ' was' : 's were'} written for this work and no worker run is linked to ${input.tasks.length === 1 ? 'it' : 'them'}. Attempts, models and per-run cost are unreadable until that join is repaired.`,
+    );
   }
   return out;
 }
@@ -1715,7 +2521,9 @@ function findContradictions(input: FeatureReportInput, mergedPrs: Set<string>, l
  * them, and a stored one eventually does.
  */
 export type ReportState = {
-  key: 'blocked' | 'decide' | 'approve' | 'building' | 'qa' | 'changes' | 'merge' | 'released' | 'waiting';
+  key: 'blocked' | 'decide' | 'approve' | 'building' | 'planning' | 'recovering' | 'qa' | 'changes' | 'stuck' | 'merge' | 'released' | 'waiting';
+  /** The obstacle, when the key is `blocked`: who fixes it and the move, as the record says. */
+  blocker?: { what: string; owner: string | null; next: string | null; cause: string | null } | null;
   /** "Blocked", "Building" — the badge. */
   label: string;
   /** "waiting on you", "no action needed" — the half that says whose move it is. */
@@ -1747,17 +2555,41 @@ export type ReportState = {
  * being asked something outranks everything, then a plan waiting for
  * approval, then work in flight, then work waiting to be looked at.
  * @param input - The report's inputs.
- * @param line - The money line, for nothing yet but kept for symmetry.
+ * @param live - What is running for it now (the Now line), which says whether a build is queued or building and what the planning move opens.
+ * @param mergedPrs - Pull requests the records say merged, so an approved change that merged reads Merged.
  */
-function buildState(input: FeatureReportInput): ReportState {
+/**
+ * What carries a request its workflow owns, read the way the recovery stage is.
+ * @param w - The workflow's status.
+ * @param w.stage - Its stage.
+ * @param w.line - Its sentence.
+ */
+function workflowCarrying(w: { stage: string; line: string }): ReturnType<typeof recoveryStage> {
+  if (w.stage === 'planning') {
+    return { stage: 'planning', label: 'Planning', line: w.line, tone: 'info' };
+  }
+  if (w.stage === 'starting') {
+    return { stage: 'recovering', label: 'Starting the next attempt', line: w.line, tone: 'info' };
+  }
+  if (w.stage === 'stopped') {
+    return { stage: 'stopped', label: 'Stopped', line: w.line, tone: 'bad' };
+  }
+  return null;
+}
+
+function buildState(input: FeatureReportInput, live: LiveRun | null = null, mergedPrs: ReadonlySet<string> = new Set()): ReportState {
   // AN ACTUAL OBSTACLE FIRST, and only an actual obstacle reads as Blocked
   // (review, 2026-09-24). Waiting on a decision, on QA or on a merge are
   // waits with names; each says whose move it is in a plain sentence.
+  // A blocker whose move was made is not current (#130: "approve plan 136"
+  // read as Blocked after plan 136 was approved) — `services/factory/blocker.ts`.
   const blocker = blockerOf(input.request.meta);
-  if (blocker) {
+  const stale = blocker ? blockerResolution(input.request.meta.blocker, blockerFactsOf(input)) : null;
+  if (blocker && !stale) {
     return {
       key: 'blocked',
       label: 'Blocked',
+      blocker,
       detail: blocker.owner ? `${blocker.owner} to ${blocker.next ?? 'clear it'}` : blocker.next ?? 'nobody is named to clear it',
       needsYou: true,
       question: blocker.what,
@@ -1790,7 +2622,11 @@ function buildState(input: FeatureReportInput): ReportState {
       },
     };
   }
-  const pendingAction = input.actionRuns.find(a => a.decidedAt === null && a.approvedByAgent === false);
+  // WAITING ON A PERSON is a pending run nobody has decided. `approvedByAgent`
+  // is NULL until someone decides, so reading it as `=== false` missed every
+  // card still waiting — journey 4's Build card #4945 read "Not being built"
+  // over a pending dispatch (2026-09-28).
+  const pendingAction = input.actionRuns.find(a => a.decidedAt === null && a.approvedByAgent !== true && a.status === 'pending');
   if (pendingAction) {
     return {
       key: 'approve',
@@ -1815,12 +2651,58 @@ function buildState(input: FeatureReportInput): ReportState {
     const detail = result === 'helped' ? 'live, and it helped' : result === 'did_not_help' ? 'live, and it did not help' : told === 'sent' ? 'live; the asker has been told; result not checked yet' : 'live for people; result not checked yet';
     return { key: 'released', label: 'Released', detail, needsYou: false, question: null, action: { label: 'See the release', href: '#report-release' }, decision: null };
   }
+  // THE FACTORY CARRYING IT (backlog 038): planning first, an automatic
+  // attempt out after a failure, or stopped at the limit — each says what
+  // happens next, in the factory's own sentence.
+  const carrying = input.workflow ? workflowCarrying(input.workflow) : recoveryStage(input.request.meta);
   const running = input.workerRuns.filter(r => !TERMINAL_BAD.has(r.status) && r.status !== 'completed');
   if (running.length > 0) {
+    if (carrying?.stage === 'recovering') {
+      return { key: 'recovering', label: carrying.label, detail: carrying.line.replace(/^Recovering \(attempt \d+ of \d+\):\s*/, ''), needsYou: false, question: null, action: { label: 'View progress', href: '#report-runs' }, decision: null };
+    }
+    // A RUN NOBODY HAS CLAIMED IS NOT BUILDING (Chris, 2026-09-30, #265:
+    // "Building now … started 3 min ago" over a run still queued for a
+    // worker). The Now line says which, and so does the badge.
+    if (live?.kind === 'queued') {
+      return { key: 'building', label: 'Waiting for a worker', detail: 'queued; no worker has picked it up yet', needsYou: false, question: null, action: { label: 'View progress', href: '#report-runs' }, decision: null };
+    }
     return { key: 'building', label: 'Building', detail: 'no action needed from you', needsYou: false, question: null, action: { label: 'View progress', href: '#report-runs' }, decision: null };
+  }
+  if (carrying?.stage === 'planning') {
+    // THE MOVE IS THE RUN WRITING THE PLAN while it writes it, and "See the
+    // plan" only once there is one (#265 offered "See the plan" over no plan
+    // while run 6414 wrote it, unseen).
+    const action = live?.kind === 'planning'
+      ? { label: 'Watch the plan being written', href: live.runHref }
+      : input.plans.length > 0 ? { label: 'See the plan', href: '#report-plan' } : null;
+    return { key: 'planning', label: 'Planning', detail: carrying.line.replace(/^Planning\s*—\s*/, ''), needsYou: false, question: null, action, decision: null };
   }
   const accepted = input.tasks.filter(t => taskStatus(t) === 'accepted');
   if (accepted.length > 0) {
+    // WHO MERGES IT IS THE TRUST RULE'S WORD, NOT A GUESS (backlog 044). A
+    // merged pull request is merged, whatever the task still says; a class
+    // whose rule runs within bounds merges on its own, and nobody is waited on.
+    const attempt = currentAttempt(input);
+    if (attempt.prUrl && mergedPrs.has(attempt.prUrl)) {
+      // After the merge, what carries it: the runs the merge started on
+      // GitHub, read back until they finish (`libs/factory/delivery.ts`).
+      const d = readDelivery(input.request.meta);
+      const stage = d ? deliveryStage(d) : 'unread';
+      const label = stage === 'deploying' ? 'Deploying' : stage === 'deployed' ? 'Deployed' : stage === 'failed' ? 'Deploy failed' : 'Merged';
+      // A FAILED DEPLOY THAT A PAUSE HOLDS IS BLOCKED, with Resume as the move
+      // (2026-10-01, #294: two hours of "Nothing needs you" over a failed
+      // deploy whose answering automation had been paused for ten days).
+      const failed = d && stage === 'failed' ? failedRun(d) : null;
+      const held = failed && d?.answer?.runId === failed.runId && d.answer.paused ? d.answer : null;
+      if (held) {
+        const what = pausedAnswerLine(held);
+        return { key: 'merge', label, blocker: { what, owner: held.paused?.by ?? null, next: `resume "${held.automation}"`, cause: 'automation_paused' }, detail: `${held.paused?.by ?? 'a person'} to resume "${held.automation}"`, needsYou: true, question: what, action: { label: 'Resume', href: `/dashboard/automation/${held.slug}` }, decision: null };
+      }
+      return { key: 'merge', label, detail: 'merged; the release is recorded once it is live', needsYou: false, question: null, action: { label: 'See the change', href: '#report-change' }, decision: null };
+    }
+    if (input.mergeRule?.runsItself === true) {
+      return { key: 'merge', label: 'Merging', detail: 'QA approved; it merges on its own on its trust rule', needsYou: false, question: null, action: { label: 'See the change', href: '#report-change' }, decision: null };
+    }
     return { key: 'merge', label: 'Ready to merge', detail: 'QA approved; the merge is waiting on a person', needsYou: true, question: null, action: { label: 'Review the merge', href: '#report-qa' }, decision: null };
   }
   // QA SENT IT BACK (record_verdict: changes). The verdict is the reader's
@@ -1828,10 +2710,59 @@ function buildState(input: FeatureReportInput): ReportState {
   const sentBack = [...input.tasks].filter(t => taskStatus(t) === 'changes_requested').sort((a, b) => b.id - a.id)[0];
   if (sentBack && !input.tasks.some(t => taskStatus(t) === 'awaiting_review')) {
     const v = (sentBack.meta.verdict ?? {}) as { proven?: number; total?: number; note?: string };
-    const count = typeof v.proven === 'number' && typeof v.total === 'number' ? `QA proved ${v.proven} of ${v.total}` : 'QA sent it back';
+    // The same count the acceptance section and the release read, for this attempt.
+    const proof = featureProof({ request: input.request, tasks: [sentBack] });
+    const count = proof.attempt !== null && proof.total > 0
+      ? `QA proved ${proof.proven} of ${proof.total}${risksLine(proof) ? ` (${risksLine(proof)})` : ''}`
+      : typeof v.proven === 'number' && typeof v.total === 'number' ? `QA proved ${v.proven} of ${v.total}` : 'QA sent it back';
     return { key: 'changes', label: 'Changes asked', detail: v.note ? `${count}: ${v.note}` : count, needsYou: true, question: null, action: { label: 'Build again', href: '#feature-decide' }, decision: null };
   }
+  // QA COULD NOT FINISH. A review that ended without a verdict, even after
+  // the recording pass, is said as that — never "no action needed" (#131,
+  // task 177 read that for six hours over five failed reviews).
+  // ENGINEERING STOPPED. The newest attempt's run failed and no attempt is
+  // waiting on anyone: say so, with the run's own reason, and offer Build
+  // again. #126 attempt 194 failed ("Claude produced no changes") and the page
+  // had no stage line and no Build button (2026-09-28).
+  if (engineeringStopped(input)) {
+    const newestRun = [...input.workerRuns].sort((a, b) => b.id - a.id)[0]!;
+    if (carrying?.stage === 'stopped') {
+      // Held for a seat (an incompatible contract): nobody is asked.
+      const held = waitingOnOf(input.request.meta) !== null;
+      return { key: 'stuck', label: carrying.label, detail: carrying.line.replace(/^(?:Stopped(?: after \d+ attempts?)?|Held):\s*/, ''), needsYou: !held, question: null, action: { label: held ? 'View run' : 'Build again', href: held ? '#report-runs' : '#feature-decide' }, decision: null };
+    }
+    if (carrying?.stage === 'recovering') {
+      return { key: 'recovering', label: carrying.label, detail: 'the run failed; the next attempt starts on its own', needsYou: false, question: null, action: { label: 'View run', href: '#report-runs' }, decision: null };
+    }
+    // SAID FOR A PERSON (2026-09-28, #201 read "Engineering stopped:
+    // contract refused: 1 problem: plan is required: … without a plan.."):
+    // the failure in a sentence, and what happens next. The worker's own text
+    // stays on the run page and in the Status drawer.
+    const failure = classifyFailure({ status: newestRun.status, error: newestRun.error, failures: newestRun.failures ?? [], result: newestRun.result });
+    const handled = readRecovery(input.request.meta).handledRunIds.includes(newestRun.id);
+    const next = handled ? 'Build again starts a fresh attempt' : `next, ${nextAfter(failure)} — or Build again starts a fresh attempt now`;
+    return { key: 'stuck', label: 'Engineering stopped', detail: `the last run failed: ${failure.sentence}; ${next}`, needsYou: handled, question: null, action: { label: 'Build again', href: '#feature-decide' }, decision: null };
+  }
+  const failedReview = [...input.tasks].filter(t => taskStatus(t) === 'review_failed').sort((a, b) => b.id - a.id)[0];
+  if (failedReview && !input.tasks.some(t => taskStatus(t) === 'awaiting_review')) {
+    return { key: 'stuck', label: 'QA could not finish', detail: 'QA ended without a verdict; Build again starts a fresh attempt', needsYou: true, question: null, action: { label: 'Build again', href: '#feature-decide' }, decision: null };
+  }
   const awaitingReview = input.tasks.filter(t => taskStatus(t) === 'awaiting_review');
+  // QA STARTS ONLY ON A GREEN CI (#269, 2026-09-30: "Stuck?" answered "QA is
+  // checking it" while CI had failed and no review ran). The stage says what
+  // CI said about this attempt's commit, and a review is said only while one runs.
+  // Only when the pull requests' signals were read: absent, nothing is known.
+  const waitingOn = input.pulls && awaitingReview.length > 0 && live?.kind !== 'reviewing' ? currentAttempt(input) : null;
+  if (waitingOn?.prUrl && waitingOn.stage === 'awaiting_review') {
+    const ciFailure = waitingOn.task?.meta.ciFailure;
+    const ci = ciFact(waitingOn.signals, { commit: waitingOn.task ? str(waitingOn.task.meta, 'commitSha') : null, ciFailure: ciFailure && typeof ciFailure === 'object' ? ciFailure as Record<string, unknown> : null }, prLabel(waitingOn.prUrl));
+    if (ci.state === 'failed') {
+      return { key: 'qa', label: 'CI failed', detail: `${ci.line}; QA starts only on a green CI, so the engineer builds it again with what failed`, needsYou: false, question: null, action: { label: 'See the change', href: '#report-change' }, decision: null };
+    }
+    if (ci.state === 'not_reported') {
+      return { key: 'qa', label: 'Waiting for CI', detail: `${ci.line}; QA starts when it is green`, needsYou: false, question: null, action: { label: 'See the change', href: '#report-change' }, decision: null };
+    }
+  }
   if (awaitingReview.length > 0) {
     const last = input.workerRuns.map(r => r.completedAt ?? r.createdAt).filter((d): d is Date => d instanceof Date).sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
     return { key: 'qa', label: 'Awaiting QA', detail: last ? `engineering finished ${formatStamp(last)}; no action needed from you` : 'engineering finished; no action needed from you', needsYou: false, question: null, action: { label: 'See the change', href: '#report-change' }, decision: null };
@@ -1929,35 +2860,94 @@ function goalOf(request: ReportObject): string | null {
  *
  * Read off the request rather than the tasks: the contract belongs to the
  * work, not to whichever attempt happened to carry it — which is also why five
- * attempts used to render five copies of it.
+ * attempts used to render five copies of it. Whether each line holds is read
+ * off the attempt that shipped (else the newest judged), through the one count
+ * every surface shares (`libs/workspace/featureProof.ts`).
  */
+/**
+ * A criterion's state as a person reads it. `passed` needs evidence: a `met`
+ * with nothing to open is a claim, and it reads Unverified until something
+ * backs it (Chris, 2026-09-28: "no checkmark unless verified by evidence").
+ */
+export type CriterionState = 'unverified' | 'passed' | 'failed';
+
+export type ReportCriterion = {
+  statement: string;
+  /** `met` null means nobody checked, which is not false. */
+  met: boolean | null;
+  /** What proves it, as QA or a person wrote it. */
+  evidence: string | null;
+  evidenceUrl: string | null;
+  state: CriterionState;
+  note: string | null;
+  /** Where the state came from: the counted attempt's QA verdict, or a mark on the request. */
+  from: 'verdict' | 'request' | 'live' | null;
+};
+
 export type ReportAcceptance = {
-  /** Each criterion and whether it holds. `met` null means nobody checked, which is not false. */
-  items: Array<{ statement: string; met: boolean | null; evidenceUrl: string | null }>;
+  /** The work's own acceptance lines. */
+  items: ReportCriterion[];
+  /** The lines the plan's risks added to the contract, as their own group. */
+  risks: ReportCriterion[];
   met: number;
+  /** Acceptance lines that passed WITH evidence — the "N of M verified" figure. */
+  verified: number;
   total: number;
+  risksHandled: number;
+  risksTotal: number;
+  /** "2 plan risks handled", or null when the contract carried none. */
+  risksLine: string | null;
+  /** The attempt whose judgement is read: the one that shipped, else the newest judged. */
+  attempt: { taskId: number; why: 'shipped' | 'judged'; verdict?: string | null } | null;
   /** When the contract stopped being a draft. Null while it still is. */
   frozenAt: Date | null;
+  /** Where the criteria were read: the work's own contract, or the newest task's when the work carries none. */
+  source: 'request' | 'task' | null;
+  /** How a reviewer checks it, when the plan or the record says. */
+  procedure: string | null;
 };
 
 /**
- * The contract as the page reads it.
- * @param request - The request record.
+ * The acceptance figure in one phrase: "6 of 6 · 2 plan risks handled".
+ * @param a - The acceptance.
  */
-function buildAcceptance(request: ReportObject): ReportAcceptance {
-  const raw = Array.isArray(request.meta.acceptance) ? request.meta.acceptance : [];
-  const items = raw
-    .filter((c): c is Record<string, unknown> => typeof c === 'object' && c !== null)
-    .map(c => ({
-      statement: str(c, 'statement') ?? 'an unnamed criterion',
-      met: typeof c.met === 'boolean' ? c.met : null,
-      evidenceUrl: str(c, 'evidenceUrl'),
-    }));
+export function acceptanceCount(a: Pick<ReportAcceptance, 'verified' | 'total' | 'risksLine'>): string {
+  return `${a.verified} of ${a.total}${a.risksLine ? ` · ${a.risksLine}` : ''}`;
+}
+
+/**
+ * The contract as the page reads it: {@link featureProof}, the one count the
+ * Releases row and page read too, so the two cannot disagree.
+ * @param request - The request record.
+ * @param tasks - Its tasks: the attempt that shipped (or the newest judged) is read.
+ * @param plans - Its plans, for the review procedure.
+ * @param releases - The releases naming this work, for which attempt shipped.
+ */
+function buildAcceptance(request: ReportObject, tasks: ReportObject[] = [], plans: ReportObject[] = [], releases: ReportObject[] = []): ReportAcceptance {
+  const proof = featureProof({ request, tasks, shippedTaskIds: shippedTaskIdsOf(releases) });
+  const toItem = (c: ProofCriterion): ReportCriterion => ({
+    statement: c.statement,
+    met: c.state === 'passed' ? true : c.state === 'failed' ? false : null,
+    evidence: c.evidence,
+    evidenceUrl: c.evidenceUrl,
+    state: c.state,
+    note: c.note,
+    from: c.from,
+  });
+  const plan = [...plans].sort((a, b) => b.id - a.id).find(p => str(p.meta, 'verification') !== null);
   return {
-    items,
-    met: items.filter(i => i.met === true).length,
-    total: items.length,
+    items: proof.acceptance.map(toItem),
+    risks: proof.risks.map(toItem),
+    met: proof.proven,
+    verified: proof.proven,
+    total: proof.total,
+    risksHandled: proof.risksHandled,
+    risksTotal: proof.risksTotal,
+    risksLine: risksLine(proof),
+    attempt: proof.attempt ? { taskId: proof.attempt.taskId, why: proof.attempt.why, verdict: proof.attempt.verdict } : null,
     frozenAt: asDate(request.meta.acceptanceFrozenAt),
+    source: proof.source,
+    procedure: (plan ? str(plan.meta, 'verification') : null) ?? str(request.meta, 'howWeCheck'),
   };
 }
 
@@ -2076,25 +3066,52 @@ function buildLifecycle(phase: ReportPhase): LifecycleStep[] {
  * it against the running product is decoration (principle 10).
  * @param request - The request.
  * @param artifacts - Every artifact gathered for this work.
+ * @param liveBases - Where the product runs, for the live link.
+ * @param ctx - The runs and releases each picture's source line is read from.
  */
-function todaySection(request: ReportObject, artifacts: ReportArtifact[]): ReportSection {
+function todaySection(request: ReportObject, artifacts: ReportArtifact[], liveBases: readonly string[] = [], ctx: PictureContext = NO_PICTURE_CONTEXT): ReportSection {
   const s = blank('today', 'How it works today');
   const visuals = (request.meta.visuals ?? {}) as Record<string, unknown>;
-  const surfaceUrl = str(visuals, 'surfaceUrl');
-  const shots = artifacts.filter(a => a.recordRole === 'before-shot');
+  const surfaceUrl = resolveLiveUrl(str(visuals, 'surfaceUrl'), liveBases);
+  // The screen as it is: a before-shot filed on the request, and the
+  // screenshot a mockup was drawn on (`beforeArtifactIds` beside
+  // `mockupArtifactIds`) — one picture of today, however it arrived.
+  const drawnOn = Array.isArray(visuals.mockupArtifactIds) && visuals.mockupArtifactIds.length > 0 && Array.isArray(visuals.beforeArtifactIds)
+    ? new Set(visuals.beforeArtifactIds.map(String))
+    : new Set<string>();
+  const shots = artifacts.filter(a => a.recordRole === 'before-shot' || drawnOn.has(String(a.id)));
+  // WHAT THE PERSON SAW (Chris, 2026-09-30, #268): a picture they sent in the
+  // chat it was filed from is the screen before, said as theirs.
+  const reported = artifacts.filter(a => a.recordRole === 'reported' && a.recordId === String(request.id) && !shots.includes(a) && drawOf(a).imageUrl !== null);
   s.facts = surfaceUrl === null
     ? []
     : [{ label: 'See it live', value: surfaceUrl, href: surfaceUrl }];
-  s.evidence = shots.map(a => ({
-    id: a.id,
-    kind: a.kind,
-    ...drawOf(a),
-    role: 'today',
-    title: a.title,
-    caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? null,
-    url: `/dashboard/artifacts/${a.id}`,
-    at: a.createdAt,
-  }));
+  s.evidence = [
+    ...shots.map(a => ({
+      id: a.id,
+      kind: a.kind,
+      ...drawOf(a),
+      role: 'today',
+      title: a.title,
+      caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? null,
+      url: `/dashboard/artifacts/${a.id}`,
+      at: a.createdAt,
+      section: CAROUSEL_SECTIONS.today,
+      source: sourceOf({ artifact: a, section: CAROUSEL_SECTIONS.today, ...ctx }),
+    })),
+    ...reported.map(a => ({
+      id: a.id,
+      kind: a.kind,
+      ...drawOf(a),
+      role: 'reported',
+      title: 'Screenshot from chat',
+      caption: a.title,
+      url: `/dashboard/artifacts/${a.id}`,
+      at: a.createdAt,
+      section: CAROUSEL_SECTIONS.reported,
+      source: sourceOf({ artifact: a, section: CAROUSEL_SECTIONS.reported, ...ctx }),
+    })),
+  ];
   if (s.evidence.length === 0 && surfaceUrl === null) {
     s.absence = 'Nothing says where this lives on the running product, so there is no way to go and see what it does today.';
   }
@@ -2135,6 +3152,46 @@ function buildContext(request: ReportObject, summary: FeatureReportSummary, now:
   return out;
 }
 
+/**
+ * THE DEFAULT MOCKUP, WHILE IT IS NOT THERE (`libs/factory/mockupDefault.ts`):
+ * drawing, with when it started, or why it drew nothing, with when — read off
+ * `visuals.mockupDraw`, never guessed. Null once the mockups are on the record.
+ *
+ * Two things a person is never shown (Chris, 2026-09-30, #269): "the mockup
+ * was not drawn" over a carousel that already has pictures of the change —
+ * the page is not missing a picture, it has several — and an infrastructure
+ * reason ("the renderer is not available…"). A failure the drawing tool typed
+ * as the installation's (`mockupDraw.cause`) reads only that it could not be
+ * drawn and is in hand; its detail went to the operator.
+ * @param request - The request.
+ * @param now - The clock.
+ * @param pictured - Whether the page already shows pictures of the change.
+ */
+export function mockupStatusOf(request: ReportObject, now: Date, pictured = false): { line: string; tone: 'info' | 'warn' } | null {
+  if (hasMockups(request.meta)) {
+    return null;
+  }
+  const draw = readMockupDraw(request.meta);
+  if (!draw) {
+    return null;
+  }
+  const infrastructure = draw.cause === 'infrastructure';
+  if (draw.state === 'drawing') {
+    const age = formatAge(now.getTime() - new Date(draw.at).getTime());
+    return { line: `The mockup is being drawn${draw.attempt > 1 ? ' again' : ''} — started ${age}.${draw.reason && draw.attempt > 1 && !infrastructure ? ` The first attempt drew nothing: ${draw.reason}.` : ''}`, tone: 'info' };
+  }
+  if (pictured) {
+    return null;
+  }
+  if (infrastructure) {
+    return { line: 'The mockup could not be drawn right now. The operator has been told, and it is drawn on its own once that is fixed.', tone: 'info' };
+  }
+  return { line: `The mockup was not drawn${draw.attempt > 1 ? ` after ${draw.attempt} attempts` : ''} (${formatStamp(new Date(draw.at))}): ${draw.reason ?? 'no reason was recorded'}. Asking for a mockup in chat draws it again.`, tone: 'warn' };
+}
+
+/** The sections whose pictures show the change itself, as the carousel draws them. */
+const PICTURE_SECTIONS: ReadonlySet<string> = new Set(['visuals', 'today', 'qa']);
+
 /** Surfaces a person can see, and therefore owes a picture of. */
 const VISIBLE_SURFACES: ReadonlySet<string> = new Set(['ui', 'flow']);
 
@@ -2154,8 +3211,9 @@ const DONE_LIKE: ReadonlySet<string> = new Set(['shipped', 'accepted', 'released
  * be cited. They are separated by ROLE, not by type.
  * @param request - The request record.
  * @param artifacts - Every artifact gathered for this work.
+ * @param ctx - The runs and releases each picture's source line is read from.
  */
-function visualsSection(request: ReportObject, artifacts: ReportArtifact[]): ReportSection {
+function visualsSection(request: ReportObject, artifacts: ReportArtifact[], ctx: PictureContext = NO_PICTURE_CONTEXT): ReportSection {
   const s = blank('visuals', 'Preview');
   const visuals = (request.meta.visuals ?? {}) as Record<string, unknown>;
   const surface = str(request.meta, 'surface');
@@ -2164,23 +3222,39 @@ function visualsSection(request: ReportObject, artifacts: ReportArtifact[]): Rep
     const raw = visuals[key];
     return new Set(Array.isArray(raw) ? raw.map(String) : []);
   };
-  const before = ids('beforeArtifactIds');
+  // THE PROPOSED DESIGN is `mockupArtifactIds`: the real screen with the
+  // change drawn in (`draw_mockup`). Where a record has it, `beforeArtifactIds`
+  // is the screenshot that mockup was drawn on — the screen today — and is
+  // shown under How it works today. A record written before the split kept
+  // its mockups on `beforeArtifactIds`, so without mockups that list is still
+  // read as the proposal.
+  const mockups = ids('mockupArtifactIds');
+  const before = mockups.size > 0 ? mockups : ids('beforeArtifactIds');
   const after = ids('afterArtifactIds');
   // An artifact filed against the REQUEST is about the outcome; one filed
   // against a task is about the change and belongs to QA.
   const onRequest = artifacts.filter(a => a.recordType === 'object' && a.recordId === String(request.id));
   const pick = (want: Set<string>, role: string): ReportEvidence[] => artifacts
     .filter(a => want.has(String(a.id)) || (want.size === 0 && role === 'proposed' && onRequest.includes(a) && a.recordRole === 'proposal-visual'))
-    .map(a => ({
-      id: a.id,
-      kind: a.kind,
-      ...drawOf(a),
-      role,
-      title: a.title,
-      caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? null,
-      url: `/dashboard/artifacts/${a.id}`,
-      at: a.createdAt,
-    }))
+    .map((a) => {
+      // The platform's own drawing of the record is the shape of the change —
+      // a plan picture, not a mockup (`visuals.drawnArtifactId`).
+      const section = role === 'shipped'
+        ? (a.recordRole === 'qa-screenshot' ? CAROUSEL_SECTIONS.qaAfter : CAROUSEL_SECTIONS.live)
+        : a.recordRole === 'proposal-visual' ? CAROUSEL_SECTIONS.plan : CAROUSEL_SECTIONS.mockup;
+      return {
+        id: a.id,
+        kind: a.kind,
+        ...drawOf(a),
+        role,
+        title: a.title,
+        caption: str(a.spec, 'caption') ?? str(a.spec, 'description') ?? (section === CAROUSEL_SECTIONS.mockup ? captionOf(a) : null),
+        url: `/dashboard/artifacts/${a.id}`,
+        at: a.createdAt,
+        section,
+        source: sourceOf({ artifact: a, section, ...ctx }),
+      };
+    })
     .sort((x, y) => x.at.getTime() - y.at.getTime());
 
   // Preview is the MOCK — what we propose it will look like. What it looks
@@ -2198,7 +3272,9 @@ function visualsSection(request: ReportObject, artifacts: ReportArtifact[]): Rep
   s.evidence = all.filter(e => !isCurrent(e)).sort((a, b) => drawable(a) - drawable(b));
 
   if (s.evidence.length === 0) {
-    if (noVisualReason !== null) {
+    // A reason written while the installation could not draw is about the
+    // installation, not the work: it went to the operator (`mockupDraw.cause`).
+    if (noVisualReason !== null && readMockupDraw(request.meta)?.cause !== 'infrastructure') {
       s.absence = `Nothing to show, on purpose: ${noVisualReason}`;
       return s;
     }
@@ -2260,6 +3336,638 @@ function buildSummary(input: FeatureReportInput, line: MoneyLine): FeatureReport
   };
 }
 
+// ---------------------------------------------------------------------------
+// The overview — what the page leads with (Chris, 2026-09-28)
+//
+// The reader is a product owner. The page says where the work is in a
+// sentence, then the plan, the implementation, the acceptance and the release
+// each as a few lines, and opens the full record of any of them in the
+// preview pane. Everything below is derived from the same records the
+// sections read; nothing is stored, and nothing is inferred across a stage.
+// ---------------------------------------------------------------------------
+
+/**
+ * The plan's status in plain words, with contradictions resolved: a plan
+ * whose column still says `candidate` and whose metadata carries an approval
+ * IS approved — the approval is the later, more specific fact.
+ * @param plan - The plan record.
+ */
+export function planStatusOf(plan: ReportObject): PlanStatus {
+  // THE PLAN'S OWN STATUS WINS over the row's (backlog 038): a plan the
+  // factory asked for is filed done for you, which marks the ROW approved (the
+  // candidate was accepted as a record) while the plan itself is in review.
+  const own = String(str(plan.meta, 'status') ?? '').toLowerCase();
+  const raw = ['draft', 'in_review', 'approved', 'rejected', 'superseded'].includes(own) ? [own] : [plan.status, own].map(s => String(s ?? '').toLowerCase());
+  if (plan.meta.supersededBy || raw.includes('superseded')) {
+    return 'Superseded';
+  }
+  if (raw.includes('rejected')) {
+    return 'Rejected';
+  }
+  if (asDate(plan.meta.approvedAt) || str(plan.meta, 'approvedBy') || raw.includes('approved')) {
+    return 'Approved';
+  }
+  if (raw.includes('draft')) {
+    return 'Draft';
+  }
+  return 'Awaiting approval';
+}
+
+/**
+ * The first sentence of a passage, for a one-line summary.
+ * @param text - The passage.
+ */
+function firstSentence(text: string | null): string | null {
+  if (text === null) {
+    return null;
+  }
+  const one = text.replace(/\s+/g, ' ').trim();
+  const cut = one.search(/[.!?]\s+[A-Z0-9]/);
+  const s = cut === -1 ? one : one.slice(0, cut + 1);
+  return s.length > 220 ? `${s.slice(0, 217).trimEnd()}…` : s;
+}
+
+/**
+ * The plan, as the page shows it.
+ * @param input - The records.
+ * @param planId - The plan a build would carry.
+ */
+function buildPlanSummary(input: FeatureReportInput, planId: number | null): ReportPlanSummary {
+  const decision = planDecisionForRequest(input.tasks);
+  const fromPlan = input.plans.map(p => str(p.meta, 'ruleLevel')).find(l => l !== null) ?? null;
+  const requirement = decision !== null
+    ? planLevelSentence(decision)
+    : fromPlan === 'required' ? 'Yes — the plan rule asked for one' : fromPlan === 'offered' ? 'Optional' : fromPlan === 'none' ? 'No' : null;
+  // The reasons themselves, so nothing says "listed below" and lists nothing:
+  // the rule's triggers off the tasks, else what the plan recorded when written.
+  const reasons = decision !== null && decision.triggers.length > 0
+    ? [...new Set(decision.triggers.map(t => t.why))]
+    : [...new Set(input.plans.flatMap(p => list(p.meta, 'ruleTriggers')))];
+  const newest = [...input.plans].sort((a, b) => b.id - a.id);
+  const current = newest.find(p => p.id === planId) ?? newest[0] ?? null;
+  if (current === null) {
+    return {
+      planId: null,
+      status: null,
+      scope: null,
+      approver: null,
+      approvedAt: null,
+      risk: null,
+      steps: 0,
+      requirement,
+      reasons,
+      approach: null,
+      components: [],
+      risks: [],
+      href: null,
+      absence: decision?.level === 'required'
+        ? 'A plan was required and none is on the record.'
+        : input.tasks.length > 0 ? 'No plan was written; the plan rule did not require one.' : 'No plan yet.',
+    };
+  }
+  const status = planStatusOf(current);
+  const recorded = str(current.meta, 'approvedBy');
+  return {
+    planId: current.id,
+    status,
+    scope: str(current.meta, 'scope') ?? str(current.meta, 'summary') ?? firstSentence(str(current.meta, 'approach')) ?? str(current.meta, 'title') ?? current.title,
+    approver: status === 'Approved' ? (personName(recorded, input.people) ?? 'Approver unavailable') : null,
+    approvedAt: asDate(current.meta.approvedAt),
+    risk: list(current.meta, 'risks')[0] ?? null,
+    steps: list(current.meta, 'components').length,
+    requirement,
+    reasons,
+    approach: str(current.meta, 'approach'),
+    components: list(current.meta, 'components'),
+    risks: list(current.meta, 'risks'),
+    href: (input.link ?? genericRecordLinker)({ objectType: current.type, id: current.id }),
+    absence: null,
+  };
+}
+
+/**
+ * One run as an attempt row.
+ * @param run - The run.
+ * @param now
+ * @param n
+ */
+function attemptOf(run: ReportWorkerRun, now: Date, n = 1): ReportAttempt {
+  const executed = executedRun(run);
+  const outcome = !executed
+    ? run.claimedAt === null ? 'Ended before it started — not executed' : 'Refused — not executed'
+    : run.status === 'completed'
+      ? 'Completed'
+      : runIsLive(run)
+        ? (run.status === 'paused' ? 'Paused' : run.claimedAt ? 'Running' : 'Queued')
+        : run.status === 'cancelled' ? 'Cancelled' : 'Failed';
+  const why = String(run.error ?? '').replace(/^verification failed: /, '').split('\n')[0]!.trim();
+  const change = runChange(run);
+  return {
+    runId: run.id,
+    outcome,
+    tone: !executed ? 'muted' : statusTone(run.status),
+    at: runAt(run),
+    cents: run.cents,
+    executed,
+    ago: formatAge(now.getTime() - runAt(run).getTime()),
+    why: why ? (why.length > 160 ? `${why.slice(0, 157).trimEnd()}…` : why) : null,
+    prUrl: change.prUrl,
+    checks: change.checks,
+    n,
+    live: executed ? runIsLive(run) : run.claimedAt === null && runIsLive(run),
+    status: run.status,
+    taskId: runTaskId(run),
+    failedChecks: (run.failures ?? []).map(f => (typeof f?.scope === 'string' && f.scope.startsWith('check:') ? f.scope.slice('check:'.length) : null)).filter((x): x is string => x !== null && x !== ''),
+  };
+}
+
+/**
+ * The task a run built, when its input names one.
+ * @param run - The run.
+ */
+function runTaskId(run: ReportWorkerRun): number | null {
+  const id = Number((run.input?.record as { id?: unknown } | undefined)?.id);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+/**
+ * The state, with the run carrying it as its row. A state whose one move was
+ * "View progress" into the implementation gives that move to the row, which
+ * opens the run itself; every other state keeps its own action.
+ * @param status - The state as `buildStatus` said it.
+ * @param impl - The implementation, for the live run.
+ */
+function withActiveRun(status: ReportStatus, impl: ReportImplementation): ReportStatus {
+  const live = impl.attempts.find(a => a.live) ?? null;
+  if (!live) {
+    return { ...status, activeRun: null };
+  }
+  const viewProgress = status.action?.kind === 'drawer' && status.action.drawer === 'implementation';
+  return { ...status, activeRun: { attempt: live, of: impl.attempts.length }, ...(viewProgress ? { action: null } : {}) };
+}
+
+/**
+ * Build and the change, as one section.
+ * @param input - The records (runs sorted oldest first).
+ * @param mergedPrs - What the records say merged.
+ * @param acceptance - The contract, for the ladder.
+ * @param release - The release reading, for the ladder.
+ * @param line - The money line.
+ */
+function buildImplementation(input: FeatureReportInput, mergedPrs: Set<string>, acceptance: ReportAcceptance, release: ReportReleaseSummary, line: MoneyLine): ReportImplementation {
+  const runs = input.workerRuns;
+  // The LATEST RELEVANT attempt leads: the newest run that did something,
+  // else the newest run. A refusal after a real attempt does not bury it.
+  const newestFirst = [...runs].reverse();
+  const lead = newestFirst.find(r => runIsLive(r)) ?? newestFirst.find(executedRun) ?? newestFirst[0] ?? null;
+  const taskPr = [...input.tasks].sort((a, b) => b.id - a.id).map(t => str(t.meta, 'prUrl')).find(p => p !== null) ?? null;
+  const runPr = newestFirst.map(r => runChange(r).prUrl).find(p => p !== null) ?? null;
+  const prUrl = taskPr ?? runPr;
+  const merged = prUrl !== null && mergedPrs.has(prUrl);
+  // THE CHECKS ARE THE SHIPPED ATTEMPT'S (FE-370, 2026-10-02): every task's
+  // checks were pooled, so attempt 1's failed `test` read "Checks passed:
+  // Failed" beside "Merged: Yes · Released: Live". The attempt whose pull
+  // request merged is the one that counts; before a merge, the lead.
+  const shippedRun = newestFirst.find(r => executedRun(r) && runChange(r).prUrl !== null && mergedPrs.has(runChange(r).prUrl!)) ?? null;
+  const checksRun = shippedRun ?? lead;
+  const leadChange = checksRun ? runChange(checksRun) : null;
+  const checksTask = checksRun ? input.tasks.find(t => t.id === runTaskId(checksRun)) ?? null : null;
+  const taskChecks: ReportCheck[] = (checksTask && Array.isArray(checksTask.meta.checks) ? checksTask.meta.checks as Array<Record<string, unknown>> : [])
+    .map(c => ({ name: str(c, 'name') ?? 'check', passed: typeof c?.passed === 'boolean' ? c.passed : null, detail: null }));
+  const checkList = leadChange && leadChange.checks.length > 0 ? leadChange.checks : taskChecks;
+  const checks = checkList.map(c => c.passed);
+  const spent = line.actualCents ?? (line.runCents > 0 ? line.runCents : null);
+  const ladder: LadderStep[] = [
+    {
+      key: 'run',
+      label: 'Run completed',
+      ...(lead === null
+        ? { value: 'No run yet', state: 'unknown' as const }
+        : lead.status === 'completed'
+          ? { value: 'Yes', state: 'yes' as const }
+          : runIsLive(lead) ? { value: 'Running', state: 'unknown' as const } : { value: 'No', state: 'no' as const }),
+    },
+    {
+      key: 'checks',
+      label: 'Checks passed',
+      ...(checks.length === 0 || checks.every(c => c === null)
+        ? { value: 'Not reported', state: 'unknown' as const }
+        : checks.includes(false) ? { value: 'Failed', state: 'no' as const } : { value: 'Passed', state: 'yes' as const }),
+    },
+    {
+      key: 'merged',
+      label: 'Merged',
+      ...(prUrl === null
+        ? { value: 'No pull request', state: 'unknown' as const }
+        : merged ? { value: 'Yes', state: 'yes' as const } : { value: 'Not recorded as merged', state: 'unknown' as const }),
+    },
+    {
+      key: 'acceptance',
+      label: 'Acceptance verified',
+      ...(acceptance.total === 0
+        ? { value: 'No criteria', state: 'unknown' as const }
+        : [...acceptance.items, ...acceptance.risks].some(i => i.state === 'failed')
+            ? { value: acceptanceCount(acceptance), state: 'no' as const }
+            : { value: acceptanceCount(acceptance), state: acceptance.verified === acceptance.total && acceptance.risksHandled === acceptance.risksTotal ? 'yes' as const : 'unknown' as const }),
+    },
+    {
+      key: 'released',
+      label: 'Released',
+      value: release.label === 'Live' ? 'Live' : release.label === 'Not released' ? 'No' : 'Not verified',
+      state: release.state === 'live' ? 'yes' : release.state === 'not_released' ? 'no' : 'unknown',
+    },
+  ];
+  // No estimate is not a $0.00 estimate (FE-370: "estimated $0.00, +$2.77").
+  const estimate = line.estimateCents === null || line.estimateCents <= 0 ? null : money(line.estimateCents);
+  const variance = line.varianceCents === null || estimate === null
+    ? null
+    : `${line.varianceCents >= 0 ? '+' : '−'}${money(Math.abs(line.varianceCents))}${line.variancePct === null ? '' : ` (${line.variancePct >= 0 ? '+' : ''}${line.variancePct}%)`}`;
+  const costLine = [
+    spent === null ? 'Nothing spent yet' : `${spentLabel({ ...line, actualCents: spent })} spent`,
+    estimate === null ? 'Not estimated' : variance === null ? `estimated ${estimate}` : `estimated ${estimate}, ${variance}`,
+  ].join(' · ');
+  return {
+    latest: lead ? attemptOf(lead, input.now, runs.indexOf(lead) + 1) : null,
+    shipped: shippedRun ? attemptOf(shippedRun, input.now, runs.indexOf(shippedRun) + 1) : null,
+    checks: checkList,
+    earlier: Math.max(0, runs.length - (lead ? 1 : 0)),
+    attempts: newestFirst.map((r, i) => attemptOf(r, input.now, runs.length - i)),
+    prUrl,
+    merged,
+    ladder,
+    spentCents: spent,
+    costLine,
+    absence: runs.length === 0
+      ? input.tasks.length > 0 ? 'Queued for the engineer — no run has started yet.' : 'Nothing has been built yet.'
+      : null,
+  };
+}
+
+/**
+ * How many of this feature's live states the release's check reached, from
+ * the release's own evidence rows — "seen live 4 of 4". Empty when the
+ * release records no rows for it.
+ * @param meta - The release's metadata.
+ * @param requestId - The feature.
+ */
+function liveCounts(meta: Record<string, unknown>, requestId: number): { reached?: number; total?: number } {
+  const rows = (Array.isArray(meta.liveEvidence) ? meta.liveEvidence : [])
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+    .filter(r => r.requestId === null || r.requestId === undefined || Number(r.requestId) === requestId);
+  return rows.length === 0 ? {} : { reached: rows.filter(r => r.status === 'reached').length, total: rows.length };
+}
+
+/**
+ * Live, release not verified, or not released — never "not released" when
+ * the truth is that nothing records a release (2026-09-28).
+ * @param input - The records.
+ * @param mergedPrs - What the records say merged.
+ */
+function buildReleaseSummary(input: FeatureReportInput, mergedPrs: Set<string>): ReportReleaseSummary {
+  const surfaceUrl = resolveLiveUrl(str((input.request.meta.visuals ?? {}) as Record<string, unknown>, 'surfaceUrl'), input.liveBases ?? []);
+  const shipped = input.releases
+    .map(r => ({ r, at: asDate(r.meta.releasedAt) }))
+    .filter((x): x is { r: ReportObject; at: Date } => x.at !== null)
+    .sort((a, b) => a.at.getTime() - b.at.getTime())[0];
+  if (shipped) {
+    const name = [str(shipped.r.meta, 'product'), str(shipped.r.meta, 'version')].filter(Boolean).join(' ') || shipped.r.title;
+    const live = readRequestLive(input.request.meta);
+    const counts = liveCounts(shipped.r.meta, input.request.id);
+    const seen = live ? { state: live.state, line: live.line, detail: live.detail, ...counts, ...(live.state === 'not_checked' ? { attempts: live.attempts } : {}) } : { state: 'pending' as const, line: 'Not yet seen live' };
+    return {
+      state: 'live',
+      code: input.codes?.get(shipped.r.id) ?? null,
+      label: 'Live',
+      // No baked date here: the page renders "Live since" itself, in the
+      // reader's own calendar via `LocalDate` — the same component the
+      // Timeline uses — off `at` below. A formatted-here date would be UTC
+      // (`formatStamp`'s job) and could read a different calendar day than
+      // the Timeline for the same instant (2026-10-03, FE-392: "Live since
+      // 03 Oct 2026, 01:27 UTC" beside a Timeline reading "2 Oct").
+      sentence: `in ${name}. ${seen.line}${/[.!?]$/.test(seen.line) ? '' : '.'}`,
+      seen,
+      releaseId: shipped.r.id,
+      at: shipped.at,
+      href: surfaceUrl ?? (input.link ?? genericRecordLinker)({ objectType: shipped.r.type, id: shipped.r.id }),
+    };
+  }
+  if (input.releases.length > 0) {
+    return { state: 'unverified', label: 'Release not verified', sentence: 'A release record names this work and carries no shipped time.', seen: null, at: null, href: (input.link ?? genericRecordLinker)({ objectType: input.releases[0]!.type, id: input.releases[0]!.id }) };
+  }
+  const mergedSomething = input.tasks.some(t => str(t.meta, 'commitSha') !== null || taskStatus(t) === 'accepted') || [...mergedPrs].length > 0;
+  if (mergedSomething || str(input.request.meta, 'state') === 'shipped') {
+    return { state: 'unverified', label: 'Release not verified', sentence: 'Nothing records this change reaching people.', seen: null, at: null, href: surfaceUrl };
+  }
+  return { state: 'not_released', label: 'Not released', sentence: 'Nothing has merged yet, so nothing can be live.', seen: null, at: null, href: null };
+}
+
+/**
+ * The verdict's count and note as the tail of a sentence: "; it proved 0 of
+ * 8. One screenshot cannot show five states."
+ * @param detail - The state's detail ("QA proved 0 of 8: …" or "QA sent it back").
+ */
+/**
+ * A clause as the start of a sentence.
+ * @param text - The clause.
+ */
+function capitalise(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function changesDetail(detail: string): string {
+  const m = /^QA proved (\d+) of (\d+)(?::(.*))?$/.exec(detail);
+  if (!m) {
+    return '.';
+  }
+  const note = m[3]?.trim();
+  return `; it proved ${m[1]} of ${m[2]}.${note ? ` ${note.replace(/([^.!?])$/, '$1.')}` : ''}`;
+}
+
+/**
+ * MERGED, AND WHAT IS CARRYING IT NOW (Chris, 2026-09-30, #269: "Something
+ * should be watching and go to prod … I'm kind of stuck here, not knowing if
+ * it is going, or what's watching it"). Who merged it and when, the run the
+ * merge started on GitHub and where it stands, and who is watching until the
+ * release lands — each read off the request's own `delivery`, never guessed.
+ * @param input - The records.
+ * @param impl - The implementation, for the pull request.
+ * @param verifiedLine - "N of M acceptance criteria verified."
+ */
+function afterMergeStatus(input: FeatureReportInput, impl: ReportImplementation, verifiedLine: string): ReportStatus {
+  const d = readDelivery(input.request.meta);
+  const change: ReportAction = impl.prUrl ? { kind: 'link', label: 'See the change', href: impl.prUrl } : { kind: 'drawer', label: 'See the change', drawer: 'implementation' };
+  const watcher = input.watcher?.trim() || null;
+  const watching = watcher ? ` ${watcher} is watching it until the release lands.` : '';
+  if (!d) {
+    return { tone: 'ok', headline: 'Merged', sentence: `QA approved it and it merged. Whether it is live is not established until a release records it. ${verifiedLine}`, action: change, secondary: null, next: 'The release is recorded once it is live.' };
+  }
+  const merged = `Merged ${formatStamp(new Date(d.mergedAt))}${d.mergedBy ? ` by ${d.mergedBy}` : ''}${d.pr ? ` (${d.pr})` : ''}.`;
+  const going = runningRun(d);
+  const failed = failedRun(d);
+  switch (deliveryStage(d)) {
+    case 'deploying':
+      return {
+        tone: 'info',
+        headline: 'Deploying',
+        sentence: `${merged} ${going ? `${runName(going)} is running on GitHub${going.startedAt ? `, started ${formatStamp(new Date(going.startedAt))}` : ''}.` : ''}${watching}`.replace(/\s+/g, ' ').trim(),
+        action: going ? { kind: 'link', label: 'Watch the deploy', href: going.url } : change,
+        secondary: null,
+        next: 'When the deploy finishes, the release is recorded and checked live.',
+      };
+    case 'deployed':
+      return { tone: 'ok', headline: 'Deployed', sentence: `${merged} Every run the merge started finished on GitHub; the release is recorded once the product reports it live.${watching} ${verifiedLine}`.replace(/\s+/g, ' ').trim(), action: change, secondary: null, next: 'The release is recorded, then checked live.' };
+    case 'failed': {
+      // WHICH STEP, AND WHO IS ON IT — or the pause that stops anyone being
+      // on it (2026-10-01, #294). `delivery.answer` is the reconcile's read of
+      // the automation runs that answer the failed run (`deployFailures.ts`).
+      const what = failed ? `${runName(failed)} failed on GitHub${failed.failedStep ? ` (step ${failed.failedStep})` : ''}.` : 'A run the merge started failed on GitHub.';
+      const answer = failed && d.answer?.runId === failed.runId ? d.answer : null;
+      const open: ReportAction = failed ? { kind: 'link', label: 'Open the failed run', href: failed.url } : change;
+      if (answer?.paused) {
+        return { tone: 'bad', headline: 'Deploy failed', sentence: `${merged} ${what} ${pausedAnswerLine(answer)}: nothing re-runs or fixes it until it is resumed.`.replace(/\s+/g, ' ').trim(), action: { kind: 'link', label: 'Resume', href: `/dashboard/automation/${answer.slug}` }, secondary: open, next: `Once "${answer.automation}" is resumed, the failure is read within five minutes: a flaky run is re-run, anything else is fixed or escalated, and the release follows the deploy.` };
+      }
+      const onIt = answer ? ` ${answer.by ?? `"${answer.automation}"`} is on it${answer.automationRunId ? ` (${nounCode('automation', answer.automationRunId)})` : ''}.` : watching;
+      return { tone: 'warn', headline: 'Deploy failed', sentence: `${merged} ${what}${onIt}`.replace(/\s+/g, ' ').trim(), action: open, secondary: null, next: 'A flaky or infrastructure failure is re-run; anything else is fixed or escalated. The release follows the deploy.' };
+    }
+    default:
+      return { tone: 'ok', headline: 'Merged', sentence: `${merged} The runs it started on GitHub have not been read yet.${watching} ${verifiedLine}`.replace(/\s+/g, ' ').trim(), action: change, secondary: null, next: 'The deploy the merge started is read next; the release follows it.' };
+  }
+}
+
+/**
+ * WHERE THIS IS, IN A SENTENCE, AND THE ONE MOVE.
+ *
+ * The state (`buildState`) decides the case; this says it for a product owner:
+ * what is known, what is not established, and an action that follows the
+ * state — Build it before anything has started, View progress while it runs,
+ * Review requested changes when QA sent it back, Review the merge when it is
+ * ready, Open feature when it is live, Review delivery status when the
+ * records disagree. Nothing here offers Build once a build is live.
+ * @param input - The records.
+ * @param state - The derived state.
+ * @param ctx - The other derived parts.
+ * @param ctx.canBuild - Whether Build is the next move.
+ * @param ctx.canDismiss - Whether nothing has started yet.
+ * @param ctx.plan - The plan summary.
+ * @param ctx.impl - The implementation summary.
+ * @param ctx.release - The release reading.
+ * @param ctx.acceptance - The contract.
+ * @param ctx.surfaceUrl - Where the running product shows it.
+ * @param ctx.live - What is running for it now (the Now line).
+ */
+function buildStatus(input: FeatureReportInput, state: ReportState, ctx: { canBuild: boolean; canDismiss: boolean; plan: ReportPlanSummary; impl: ReportImplementation; release: ReportReleaseSummary; acceptance: ReportAcceptance; surfaceUrl: string | null; live?: LiveRun | null }): ReportStatus {
+  const { canBuild, canDismiss, plan, impl, release, acceptance } = ctx;
+  const live = ctx.live ?? null;
+  const ago = (d: Date) => formatAge(input.now.getTime() - d.getTime());
+  const verifiedLine = acceptance.total === 0 ? 'No acceptance criteria are written yet.' : `${acceptance.verified} of ${acceptance.total} acceptance criteria verified${acceptance.risksLine ? `; ${acceptance.risksLine}` : ''}.`;
+  const buildLabel = input.workerRuns.some(executedRun) || input.tasks.length > 0 ? 'Build again' : plan.status === 'Awaiting approval' ? 'Approve build' : 'Build it';
+  const inbox = state.decision ? inboxHref(state.decision.kind === 'ask' ? 'ask' : 'proposal', state.decision.id) : null;
+  switch (state.key) {
+    case 'blocked': {
+      // A BUILD THAT WOULD BE REFUSED IS NOT OFFERED AS ONE (2026-10-01, #294:
+      // Build sat under "Proposed" and hit the same refusal intake had). Under
+      // a cause the dispatch refuses on, Build is drawn disabled with why; a
+      // build that only lacks its plan plans first, so Build stays.
+      const cause = state.blocker?.cause ?? null;
+      const refused = cause !== null && REFUSED_BUILD_CAUSES.has(cause);
+      const sentence = `${state.question ?? 'Something is blocking this work'}. ${state.detail.charAt(0).toUpperCase()}${state.detail.slice(1)}.`;
+      const build = canBuild && cause !== null
+        ? { kind: 'build' as const, label: buildLabel, ...(refused ? { disabledReason: `${state.question ?? 'It cannot be built yet'}. ${state.detail.charAt(0).toUpperCase()}${state.detail.slice(1)}.` } : {}) }
+        : null;
+      const next = cause !== null
+        ? `Once ${state.blocker?.owner ?? 'someone'} does, it moves on by itself: the factory reads the records again every hour.`
+        : 'It moves again once the blocker is cleared.';
+      return build && !refused
+        ? { tone: 'bad', headline: 'Blocked', sentence, action: build, secondary: null, next }
+        : { tone: 'bad', headline: 'Blocked', sentence, action: { kind: 'drawer', label: 'See what is blocking it', drawer: 'status' }, secondary: build, next };
+    }
+    case 'decide':
+      return { tone: 'warn', headline: 'Needs your decision', sentence: `A decision is waiting on you: ${state.question ?? 'an open question'}.`, action: inbox ? { kind: 'link', label: 'Review decision', href: inbox } : null, secondary: null, next: 'It moves on as soon as it is decided.' };
+    case 'approve': {
+      const merge = state.decision?.actionId === 'git.merge';
+      const dispatch = state.decision?.actionId === 'factory.dispatch_task';
+      return {
+        tone: 'warn',
+        headline: merge ? 'Ready to merge' : dispatch ? 'Build proposed' : 'Needs approval',
+        sentence: merge
+          ? `QA approved the change and it is waiting for you to merge. It is not live until it merges. ${verifiedLine}`
+          : dispatch ? `A build card is waiting for your approval (${nounCode('action', state.decision!.id)}). Building it approves that card; nothing has run yet.` : `${state.question ?? 'An action'} is waiting for your approval.`,
+        // The build card is approved HERE, not one page away: the press
+        // approves the pending dispatch itself, with Undo (journey 4).
+        action: dispatch
+          ? { kind: 'build', label: 'Build it', runId: state.decision!.id }
+          : inbox ? { kind: 'link', label: merge ? 'Review the merge' : 'Review & approve', href: inbox } : null,
+        secondary: dispatch && inbox ? { kind: 'link', label: 'Open the card', href: inbox } : null,
+        next: merge ? 'Merging it deploys it.' : dispatch ? 'Once it is approved, a worker picks it up and the engineer builds it.' : 'Once it is approved, the next step starts on its own.',
+      };
+    }
+    case 'released':
+      return release.state === 'live'
+        ? {
+            // Shipped is not seen: until QA has seen it on the live product
+            // it reads Live with "Not yet seen live", in amber.
+            tone: release.seen?.state === 'seen' ? 'ok' : 'warn',
+            headline: 'Live',
+            sentence: `${release.sentence} ${state.detail.includes('helped') ? `It ${state.detail.replace(/^live, and it /, '')}.` : 'Whether it helped has not been checked yet.'}`,
+            action: ctx.surfaceUrl ? { kind: 'link', label: 'Open feature', href: ctx.surfaceUrl } : { kind: 'drawer', label: 'Open feature', drawer: 'release' },
+            // A live check that did not see it, once its attempts are spent, is checked again
+            // when a person asks (`factory.check_live_again`), not by hand. One that never looked
+            // is rechecked by Vocion itself, and asks the person only once those rechecks are spent.
+            secondary: release.releaseId !== undefined && (release.seen?.state === 'not_seen' || release.seen?.state === 'partial' || (release.seen?.state === 'not_checked' && (release.seen.attempts ?? 0) >= LIVE_RECHECKS))
+              ? { kind: 'check_live', label: 'Check live again', releaseId: release.releaseId }
+              : null,
+            next: state.detail.includes('helped') ? null : 'Next, whether it helped is checked.',
+          }
+        : { tone: 'warn', headline: 'Release not verified', sentence: `${release.sentence} Whether it is live is not established.`, action: { kind: 'drawer', label: 'Review delivery status', drawer: 'release' }, secondary: null, next: null };
+    case 'planning': {
+      // The run writing the plan is the move while it writes; the plan is,
+      // once one exists; before either, there is nothing to open.
+      const action: ReportAction | null = live?.kind === 'planning'
+        ? { kind: 'link', label: 'Watch the plan being written', href: live.runHref }
+        : input.plans.length > 0 ? { kind: 'drawer', label: 'See the plan', drawer: 'plan' } : null;
+      return { tone: 'info', headline: 'Planning', sentence: `A plan comes first because ${bare(state.detail)}. The build starts on its own once the plan is approved.`, action, secondary: null, next: 'The build starts when the plan is approved.' };
+    }
+    case 'recovering': {
+      const started = impl.latest ? ` The latest run started ${ago(impl.latest.at)}.` : '';
+      return { tone: 'info', headline: state.label, sentence: `${capitalise(bare(state.detail))}.${started} Nothing needs you; after three automatic attempts the factory stops and asks.`, action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: 'If this attempt passes, QA checks it; after three failed attempts the factory stops and asks.' };
+    }
+    case 'building': {
+      // Queued is not building: no worker has taken it, so nothing "started".
+      if (live?.kind === 'queued') {
+        return { tone: 'info', headline: 'Waiting for a worker', sentence: `Queued for a worker ${ago(new Date(live.startedAt))}; no worker has picked it up yet. Nothing needs you.`, action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: 'A worker picks it up, then the engineer builds it and QA checks it.' };
+      }
+      const started = impl.latest ? `The latest run started ${ago(impl.latest.at)}.` : '';
+      return { tone: 'info', headline: 'Building', sentence: `Building now. ${started} Nothing needs you; checks, the merge and acceptance are not established until it finishes.`.replace(/\s+/g, ' ').trim(), action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: 'QA checks it, then it merges and deploys.' };
+    }
+    case 'qa':
+      if (state.label === 'CI failed' || state.label === 'Waiting for CI') {
+        return { tone: state.label === 'CI failed' ? 'warn' : 'info', headline: state.label, sentence: `Engineering finished. ${capitalise(state.detail)}. Nothing needs you. ${verifiedLine}`, action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: state.label === 'CI failed' ? 'The next attempt builds with what CI found; QA checks it once CI is green.' : 'QA checks it once CI is green.' };
+      }
+      return { tone: 'info', headline: 'In QA', sentence: `Engineering finished and QA is checking the change. Nothing needs you. ${verifiedLine}`, action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: 'Once QA passes it, it merges and deploys.' };
+    case 'merge':
+      if (['Merged', 'Deploying', 'Deployed', 'Deploy failed'].includes(state.label)) {
+        return afterMergeStatus(input, impl, verifiedLine);
+      }
+      if (!state.needsYou) {
+        return { tone: 'info', headline: 'Merging', sentence: `QA approved it; it merges on its own on its trust rule. Nothing needs you. ${verifiedLine}`, action: impl.prUrl ? { kind: 'link', label: 'See the change', href: impl.prUrl } : { kind: 'drawer', label: 'See the change', drawer: 'implementation' }, secondary: null, next: 'It merges on its own, and the merge deploys it.' };
+      }
+      return { tone: 'warn', headline: 'Ready to merge', sentence: `QA accepted the change; it is waiting for a person to merge it. It is not live until it merges. ${verifiedLine}`, action: impl.prUrl ? { kind: 'link', label: 'Review the merge', href: impl.prUrl } : { kind: 'drawer', label: 'Review the merge', drawer: 'implementation' }, secondary: null, next: 'Merging it deploys it.' };
+    case 'changes':
+      return { tone: 'warn', headline: 'Changes requested', sentence: `QA found problems and sent it back${changesDetail(state.detail)} Nothing from this attempt has merged.`, action: { kind: 'drawer', label: 'Review requested changes', drawer: 'acceptance' }, secondary: canBuild ? { kind: 'build', label: 'Build again' } : null, next: 'Build again starts the next attempt with what QA found.' };
+    case 'stuck':
+      if (!state.needsYou && state.label.startsWith('Waiting on')) {
+        return { tone: 'info', headline: state.label, sentence: `${capitalise(bare(state.detail))}.`, action: { kind: 'drawer', label: 'View run', drawer: 'implementation' }, secondary: canBuild ? { kind: 'build', label: 'Build again' } : null, next: 'It builds again on its own once the worker is rebuilt or Vocion is deployed.' };
+      }
+      return { tone: 'warn', headline: state.label, sentence: state.label.startsWith('Stopped after') ? `${capitalise(bare(state.detail))}. A person decides what happens next; nothing from these attempts has merged.` : `${capitalise(bare(state.detail))}. Nothing from this attempt has merged.`, action: canBuild ? { kind: 'build', label: 'Build again' } : { kind: 'drawer', label: 'View run', drawer: 'implementation' }, secondary: canBuild ? { kind: 'drawer', label: 'View run', drawer: 'implementation' } : null, next: canBuild ? 'Nothing moves until someone builds it again.' : null };
+    default:
+      break;
+  }
+  // WAITING: not started, queued, or the records disagree.
+  if (state.label === 'Unreadable') {
+    return { tone: 'warn', headline: 'Records disagree', sentence: `${state.question ?? 'The records disagree.'} Whether it was built is not established.`, action: { kind: 'drawer', label: 'Review delivery status', drawer: 'status' }, secondary: null, next: null };
+  }
+  if (input.tasks.length > 0 && !canBuild) {
+    return { tone: 'info', headline: 'Queued', sentence: 'Queued for the engineer; no run has started yet. Nothing needs you.', action: { kind: 'drawer', label: 'View progress', drawer: 'implementation' }, secondary: null, next: 'A worker picks it up, then the engineer builds it.' };
+  }
+  const reqState = str(input.request.meta, 'state');
+  if (!canBuild) {
+    const why = reqState === 'out_of_scope' ? 'It was dismissed' : reqState === 'deferred' ? 'It was deferred' : reqState === 'answered' ? 'It was answered without a build' : reqState === 'shipped' ? 'The record says shipped' : 'It is not open for a build';
+    return { tone: 'muted', headline: 'Not being built', sentence: `${why}. ${str(input.request.meta, 'decisionReason') ?? ''}`.trim(), action: null, secondary: null, next: null };
+  }
+  const planLine = plan.status === 'Awaiting approval'
+    ? ' Building it approves the plan.'
+    : plan.status === 'Approved' ? ' The plan is approved.' : plan.status === null && plan.absence ? ` ${plan.absence}` : '';
+  return {
+    tone: 'muted',
+    headline: 'Proposed',
+    sentence: `Proposed and not built yet.${planLine}`,
+    action: { kind: 'build', label: buildLabel },
+    secondary: canDismiss ? { kind: 'dismiss', label: 'Dismiss' } : null,
+    next: 'Nothing starts until someone builds it.',
+  };
+}
+
+/** The current attempt: the newest task, its stage and the pull request it carries. */
+type CurrentAttempt = { task: ReportObject | null; stage: string | null; prUrl: string | null; signals: PullSignals };
+
+/**
+ * The attempt the facts are about — the newest task — and what GitHub
+ * recorded about its pull request.
+ * @param input - The records.
+ */
+function currentAttempt(input: FeatureReportInput): CurrentAttempt {
+  const task = [...input.tasks].sort((a, b) => b.id - a.id)[0] ?? null;
+  if (!task) {
+    return { task: null, stage: null, prUrl: null, signals: NO_PULL_SIGNALS };
+  }
+  const own = input.workerRuns.filter(r => Number((r.input?.record as { id?: unknown } | undefined)?.id) === task.id);
+  const written = str(task.meta, 'prUrl') ?? [...own].reverse().map(r => runChange(r).prUrl).find(p => p !== null) ?? null;
+  const prUrl = written ? normalisePullUrl(written) : null;
+  return { task, stage: taskStatus(task), prUrl, signals: (prUrl && input.pulls?.get(prUrl)) || NO_PULL_SIGNALS };
+}
+
+/**
+ * THE FACTS, EACH ON ITS OWN FIELD (backlog 044). A run that completed is the
+ * engineer's attempt, not the feature: QA's verdict, the merge, CI and the
+ * release are each read from the record that holds them and said as that.
+ * @param input - The records.
+ * @param ctx - What the report already derived.
+ * @param ctx.mergedPrs - Pull requests the records say merged.
+ * @param ctx.state - The report's state.
+ * @param ctx.release - The release reading.
+ * @param ctx.status - The report's status, for the request's line.
+ */
+function workFactsOf(input: FeatureReportInput, ctx: { mergedPrs: Set<string>; state: ReportState; release: ReportReleaseSummary; status: ReportStatus }): WorkFacts {
+  const attempt = currentAttempt(input);
+  const verdict = verdictFact(attempt.task ? { status: attempt.stage, meta: attempt.task.meta } : null);
+  const pullRequest = pullFact(attempt.prUrl, attempt.signals, attempt.prUrl !== null && ctx.mergedPrs.has(attempt.prUrl));
+  const ciFailure = attempt.task?.meta.ciFailure;
+  const ci = ciFact(attempt.signals, { commit: attempt.task ? str(attempt.task.meta, 'commitSha') : null, ciFailure: ciFailure && typeof ciFailure === 'object' ? ciFailure as Record<string, unknown> : null }, pullRequest.label);
+  const mergeRule = mergeRuleFact(input.mergeRule?.runsItself ?? null, input.mergeRule?.riskClass ?? null);
+  const shipped = ctx.release.state === 'live';
+  const recordState = str(input.request.meta, 'state');
+  const stage = requestStageOf(ctx.state.key, {
+    merged: pullRequest.merge === 'merged',
+    shipped,
+    closed: recordState !== null && recordState !== 'shipped' && ['deferred', 'answered', 'out_of_scope'].includes(recordState),
+    decidingMerge: ctx.state.decision?.actionId === MERGE_ACTION_ID,
+  });
+  return {
+    request: { id: input.request.id, stage, recordState, line: `${REQUEST_STAGE_LINE[stage]}. ${ctx.status.sentence}`.replace(/\s+/g, ' ').trim() },
+    taskId: attempt.task?.id ?? null,
+    verdict,
+    pullRequest,
+    ci,
+    mergeRule,
+    shipped,
+    next: nextForAttempt({ verdict, pullRequest, ci, mergeRule, shipped, taskStage: attempt.stage }),
+  };
+}
+
+/**
+ * THE NOW LINE, from the records: the engineering runs this report already
+ * read, and the agent runs working on the record. What an agent run is doing
+ * is read from the stage — planning, or the change waiting on QA — never from
+ * which automation started it (`libs/factory/liveStatus.ts`).
+ * @param input - The records (runs sorted oldest first).
+ * @param impl - The implementation, for each run's attempt number and the PR.
+ */
+function liveRunOf(input: FeatureReportInput, impl: ReportImplementation): LiveRun | null {
+  const reviewing = input.tasks.some(t => taskStatus(t) === 'awaiting_review');
+  return pickLive({
+    workerRuns: input.workerRuns.map(r => ({ id: r.id, status: r.status, createdAt: r.createdAt, claimedAt: r.claimedAt, progress: r.progress, n: impl.attempts.find(a => a.runId === r.id)?.n ?? 1 })),
+    missionRuns: input.missionRuns ?? [],
+    delivery: input.releases.length > 0 ? null : readDelivery(input.request.meta),
+    context: {
+      planning: recoveryStage(input.request.meta)?.stage === 'planning',
+      reviewing: reviewing ? { pr: prLabel(impl.prUrl) } : null,
+    },
+  });
+}
+
+/** Timeline kinds a product owner reads; contracts and triage stay in the full log. */
+const MEANINGFUL: ReadonlySet<TimelineEntry['kind']> = new Set(['asked', 'plan', 'decision', 'run', 'change', 'qa', 'release']);
+
 /**
  * Assemble one request's whole story: the ten sections in reading order,
  * the timeline oldest first, the money line and whatever the records
@@ -2269,52 +3977,192 @@ function buildSummary(input: FeatureReportInput, line: MoneyLine): FeatureReport
 export function assembleFeatureReport(input: FeatureReportInput): FeatureReport {
   const runs = [...input.workerRuns].sort((a, b) => runAt(a).getTime() - runAt(b).getTime());
   const normalised: FeatureReportInput = { ...input, workerRuns: runs };
-  const mergedPrs = mergedPullRequests(input.tasks, input.releases);
-  const line = moneyLine(input.request, input.tasks, runs);
+  const mergedPrs = mergedPullRequests(input.releases, input.actionRuns);
+  // GitHub's own word counts too: a pull request `pr.merged` names merged.
+  for (const [url, signals] of input.pulls ?? []) {
+    if (signals.merged) {
+      mergedPrs.add(url);
+    }
+  }
+  // And the merge the request itself recorded (`delivery`, written on `pr.merged`).
+  const delivered = readDelivery(input.request.meta);
+  if (delivered) {
+    mergedPrs.add(delivered.prUrl);
+  }
+  const line = moneyLine(input.request, input.tasks, runs, input.spend);
+  // What every picture's source line is read from (`carouselSource.ts`).
+  const pictures: PictureContext = { runs, releases: input.releases };
+  // BUILD IS NEVER OFFERED OVER A LIVE BUILD (2026-09-28). A run still going,
+  // or a dispatch still waiting to execute, means the work has started.
+  const liveWork = runs.some(runIsLive)
+    || input.actionRuns.some(a => a.actionId === 'factory.dispatch_task' && ['pending', 'approved', 'executing'].includes(a.status));
+  const canBuild = !['shipped', 'answered', 'deferred', 'out_of_scope'].includes(String(input.request.meta.state ?? ''))
+    && !liveWork
+    // A task QA sent back (changes_requested) does not hold the build: the
+    // next attempt is exactly what it asked for.
+    // The task's stage is its status column first (taskStatus): a failed run
+    // wrote "rejected" there and left the metadata copy at "dispatched",
+    // which hid Build on #126 for good (2026-09-28).
+    && (engineeringStopped(input) || !input.tasks.some(t => ['dispatched', 'running', 'awaiting_review', 'accepted'].includes(taskStatus(t))));
+  // Dismiss is a way out of a PROPOSAL. Once any work started, the second
+  // action is never "Dismiss" — throwing away an attempt is not what it says.
+  const canDismiss = canBuild && input.tasks.length === 0 && runs.length === 0;
+  const planId = [...input.plans].filter(p => !['rejected', 'superseded'].includes(String(p.meta.status ?? '')) && !p.meta.supersededBy).sort((a, b) => b.id - a.id)[0]?.id ?? null;
+  const acceptance = buildAcceptance(input.request, input.tasks, input.plans, input.releases);
+  const release = buildReleaseSummary(normalised, mergedPrs);
+  const implementation = buildImplementation(normalised, mergedPrs, acceptance, release, line);
+  const planSummary = buildPlanSummary(normalised, planId);
+  const live = liveRunOf(normalised, implementation);
+  const state = buildState(normalised, live, mergedPrs);
+  const surfaceUrl = resolveLiveUrl(str((input.request.meta.visuals ?? {}) as Record<string, unknown>, 'surfaceUrl'), input.liveBases ?? []);
+  const timeline = buildTimeline(normalised, mergedPrs);
+  const history = buildHistory(normalised, { implementation, release, mergedPrs });
+  const notices = findNotices(normalised, mergedPrs);
+  const read = withActiveRun(buildStatus(normalised, state, { canBuild, canDismiss, plan: planSummary, impl: implementation, release, acceptance, surfaceUrl, live }), implementation);
+  const status = input.place ? { ...read, headline: input.place.label, tone: input.place.tone } : read;
+  const facts = workFactsOf(normalised, { mergedPrs, state, release, status });
+  const sections: ReportSection[] = [
+    askSection(input.request),
+    triageSection(input.request),
+    visualsSection(input.request, input.artifacts, pictures),
+    todaySection(input.request, input.artifacts, input.liveBases, pictures),
+    planSection(input.plans, input.tasks, runs.length > 0, input.people),
+    contractSection(input.tasks),
+    approvalsSection(input.asks, input.actionRuns, runs.length > 0),
+    runsSection(runs, mergedPrs),
+    changeSection(input.tasks, runs),
+    qaSection(input.artifacts, input.tasks.length, pictures),
+    releaseSection(input.releases),
+    resultSection(normalised.request, normalised.releases.length > 0),
+    moneySection(line),
+  ];
   return {
+    facts,
     requestId: input.request.id,
-    canBuild: !['shipped', 'answered', 'deferred', 'out_of_scope'].includes(String(input.request.meta.state ?? ''))
-      // A task QA sent back (changes_requested) does not hold the build: the
-      // next attempt is exactly what it asked for.
-      && !input.tasks.some(t => [String(t.meta.status ?? ''), String((t as { status?: string }).status ?? '')].some(st => ['dispatched', 'running', 'awaiting_review', 'accepted'].includes(st))),
-    planId: [...input.plans].filter(p => !['rejected', 'superseded'].includes(String(p.meta.status ?? '')) && !p.meta.supersededBy).sort((a, b) => b.id - a.id)[0]?.id ?? null,
+    canBuild,
+    canDismiss,
+    planId,
+    status,
+    live,
+    you: state.blocker && (state.key === 'blocked' || state.needsYou)
+      ? blockedYou(state.blocker.what, state.blocker.owner, state.blocker.next)
+      : youOf(state.needsYou, state.needsYou ? status.action?.label ?? null : null, state.question ?? state.detail),
+    notices,
+    planSummary,
+    implementation,
+    release,
+    activityPreview: timeline
+      .filter(e => MEANINGFUL.has(e.kind) && e.at !== null)
+      .reverse()
+      .slice(0, 4)
+      // A run reads as an attempt, not as "Run 501 · task-engineer · …".
+      .map(e => ({ ...e, title: e.kind === 'run' ? e.title.replace(/^Run \d+ · .+ · attempt (\S+) · (\w+)$/, 'Engineering attempt $1 $2') : e.title, ago: formatAge(input.now.getTime() - e.at!.getTime()) })),
+    history: history.rows,
+    // ONE TOTAL: the Timeline's foot says the money line's figures, so the
+    // page never shows two sums of the same spend (`featureSpend.ts`).
+    historyCost: input.spend ? footOf(line) : history.cost,
+    expectedBenefit: str(input.request.meta, 'expectedResult'),
+    surfaceUrl,
     // THE PAGE LEADS WITH THE OUTCOME. The request title is the asker's
     // words and is evidence (`naming-the-work`), so it is never rewritten —
     // which meant every surface led with a situation. The outcome line says
     // what a person can do afterwards; the ask is kept underneath, verbatim.
     // The short name leads; the outcome sentence is the subtitle under it
     // (`goalOf`). A page titled with a sentence read like a ticket (Chris,
-    // 2026-09-25: "Short title: Share a document").
-    title: input.request.title,
+    // 2026-09-25: "Short title: Share a document"). A request filed with the
+    // whole ask as its title is read by its stored name (`recordName`).
+    title: recordName(input.request.title, input.request.meta),
     asked: input.request.title,
     story: str(input.request.meta, 'story'),
-    state: buildState(normalised),
+    state,
     phase: buildPhase(normalised),
     lifecycle: buildLifecycle(buildPhase(normalised)),
     // The ask's own body, trimmed to a sentence or two — not the whole prompt,
     // which belongs behind "the original request" in the ask section.
     goal: goalOf(input.request),
-    acceptance: buildAcceptance(input.request),
+    acceptance,
     summary: buildSummary(normalised, line),
     context: buildContext(input.request, buildSummary(normalised, line), input.now),
     money: line,
-    sections: [
-      askSection(input.request),
-      triageSection(input.request),
-      visualsSection(input.request, input.artifacts),
-      todaySection(input.request, input.artifacts),
-      planSection(input.plans, input.tasks, runs.length > 0),
-      contractSection(input.tasks),
-      approvalsSection(input.asks, input.actionRuns, runs.length > 0),
-      runsSection(runs, mergedPrs),
-      changeSection(input.tasks, runs),
-      qaSection(input.artifacts, input.tasks.length),
-      releaseSection(input.releases),
-      resultSection(normalised.request, normalised.releases.length > 0),
-      moneySection(line),
-    ],
-    timeline: buildTimeline(normalised, mergedPrs),
-    contradictions: findContradictions(normalised, mergedPrs, line),
-    hero: visualsSection(input.request, input.artifacts).evidence.find(e => e.imageUrl !== null) ?? null,
+    sections,
+    timeline,
+    contradictions: notices.map(n => n.evidence),
+    hero: visualsSection(input.request, input.artifacts, pictures).evidence.find(e => e.imageUrl !== null) ?? null,
+    mockupStatus: mockupStatusOf(input.request, input.now, sections.some(x => PICTURE_SECTIONS.has(x.key) && x.evidence.some(e => e.imageUrl !== null && e.role !== 'proposed'))),
+    follow: followOf(input),
+    recordings: recordingsOf(input.artifacts),
+  };
+}
+
+/** The most topics the feature page follows for one report. */
+const FEATURE_FOLLOW_CAP = 100;
+/**
+ * The most a status line follows: the records and the newest runs. A chat
+ * can hold many microcards, and they share the tab's one stream.
+ */
+const STATUS_FOLLOW_CAP = 24;
+
+/**
+ * The live topics a report is made of — the records first (a task's runs
+ * publish on the task's own topic too), then the runs, agent runs, asks,
+ * cards and artifacts it draws, newest first, capped. Anything new under the
+ * record moves the record itself (a rollup, a status), so a thing born after
+ * this read is still heard.
+ * @param input - The report's inputs.
+ * @param cap - The most to follow.
+ */
+export function followOf(input: FeatureReportInput, cap = FEATURE_FOLLOW_CAP): string[] {
+  const newest = <T extends { id: number }>(xs: readonly T[]) => [...xs].sort((a, b) => b.id - a.id);
+  const topics = [
+    liveTopic.record(input.request.id),
+    ...[...input.tasks, ...input.plans, ...input.releases].map(r => liveTopic.record(r.id)),
+    ...newest(input.workerRuns).map(r => liveTopic.run(r.id)),
+    ...newest(input.missionRuns ?? []).map(m => liveTopic.mission(m.id)),
+    ...newest(input.asks).map(a => liveTopic.ask(a.id)),
+    ...newest(input.actionRuns).map(a => liveTopic.card(a.id)),
+    ...newest(input.artifacts).map(a => liveTopic.artifact(a.id)),
+  ];
+  return [...new Set(topics)].slice(0, cap);
+}
+
+/**
+ * A move as a surface OFF the record's page can follow it: a link as itself,
+ * a drawer as the page with that drawer open in its pane, Build as the page's
+ * decide block (a button on a page is not something a chat line can press).
+ * @param action - The move.
+ * @param href - The record's page.
+ * @param requestId - The record, for the drawer's ref.
+ */
+function moveOf(action: ReportAction, href: string, requestId: number): StatusMove {
+  if (action.kind === 'link') {
+    return { label: action.label, href: action.href };
+  }
+  if (action.kind === 'drawer') {
+    return { label: action.label, href: `${href}?preview=${encodeURIComponent(`feature_section:${requestId}.${action.drawer}`)}` };
+  }
+  return { label: action.label, href: `${href}#feature-decide` };
+}
+
+/**
+ * THE THREE LINES, PORTABLE — the report's You, Now and Next as the API
+ * returns them, the chat line polls them and the preview pane draws them.
+ * @param report - The assembled report.
+ * @param record - The record's type and its page.
+ * @param record.objectType - Its type slug, as the record says.
+ * @param record.href - Where it opens (`recordHref`).
+ * @param record.code
+ * @param now - When this was read.
+ */
+export function featureStatusOf(report: FeatureReport, record: { objectType: string; href: string; code?: string }, now: Date): RecordStatus {
+  const action = report.status.action;
+  return {
+    record: { id: report.requestId, objectType: record.objectType, title: report.title, href: record.href, ...(record.code ? { code: record.code } : {}) },
+    stage: { key: report.state.key, label: report.status.headline, tone: report.status.tone },
+    you: { ...report.you, move: report.you.needsYou && action ? moveOf(action, record.href, report.requestId) : null },
+    live: report.live,
+    next: report.status.next ?? null,
+    facts: report.facts,
+    readAt: now.toISOString(),
+    ...(report.follow ? { follow: report.follow.slice(0, STATUS_FOLLOW_CAP) } : {}),
   };
 }

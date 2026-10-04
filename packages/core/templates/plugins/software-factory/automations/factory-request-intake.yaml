@@ -1,5 +1,7 @@
 slug: factory-request-intake
 name: A request arrived
+label: Triaged it
+doing: Triaging it
 description: >-
   The intake shape for the request noun: something outside posted a
   `request.created` event — a form on a product site, a store-review poller,
@@ -7,7 +9,9 @@ description: >-
   asker's words are fresh, rather than waiting for the afternoon tick. Core
   ships no intake adapter; the event is one an outside caller posts to
   `/api/v1/events` with the new record's id, and a workspace overrides this
-  file by slug to name its own event and filter.
+  file by slug to name its own event and filter. A request written inside
+  Vocion raises `object.created`, which `factory-request-filed` answers in
+  code; this pass is the triage for what arrives from outside.
 status: active
 agent: product-manager
 when:

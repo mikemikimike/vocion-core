@@ -49,8 +49,19 @@ export function resolveTimeZone(...candidates: Array<string | null | undefined>)
 
 type Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
 
+// Keyed by the spelling a caller passed, which a browser controls, so it is capped.
+const wallClocks = new Map<string, Intl.DateTimeFormat>();
+const wallClocksCap = 64;
+
 function wallClock(d: Date, tz: string): Parts {
-  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  let f = wallClocks.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+    if (wallClocks.size >= wallClocksCap) {
+      wallClocks.clear();
+    }
+    wallClocks.set(tz, f);
+  }
   const out: Record<string, number> = {};
   for (const p of f.formatToParts(d)) {
     if (p.type !== 'literal') {
@@ -58,6 +69,17 @@ function wallClock(d: Date, tz: string): Parts {
     }
   }
   return { year: out.year!, month: out.month!, day: out.day!, hour: out.hour! % 24, minute: out.minute!, second: out.second! };
+}
+
+/**
+ * A calendar day N days after another; negative moves back.
+ * @param day - The starting day, `YYYY-MM-DD`.
+ * @param days - Days to add.
+ */
+export function dayPlus(day: string, days: number): string {
+  const at = new Date(`${day}T00:00:00Z`);
+  at.setUTCDate(at.getUTCDate() + days);
+  return at.toISOString().slice(0, 10);
 }
 
 /**
@@ -104,6 +126,21 @@ export function zoneOffsetMinutes(d: Date, tz: string): number {
 }
 
 /**
+ * An instant as ISO 8601 on a zone's wall clock, with that zone's offset and
+ * whole seconds: `2026-10-02T12:00:00-04:00`.
+ * @param d - The instant.
+ * @param tz - The zone.
+ */
+export function isoInZone(d: Date, tz: string): string {
+  const p = wallClock(d, tz);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const minutes = zoneOffsetMinutes(d, tz);
+  const abs = Math.abs(minutes);
+  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}`
+    + `${minutes < 0 ? '-' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
+/**
  * The instant a calendar day begins in a zone — local midnight as UTC. Two
  * passes so a day that starts inside a DST change still lands on midnight.
  * @param day - `YYYY-MM-DD`.
@@ -112,6 +149,43 @@ export function zoneOffsetMinutes(d: Date, tz: string): number {
 export function startOfDay(day: string, tz: string): Date {
   const [y, m, d] = day.split('-').map(n => Number.parseInt(n, 10)) as [number, number, number];
   const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const first = new Date(guess - zoneOffsetMinutes(new Date(guess), tz) * 60_000);
+  return new Date(guess - zoneOffsetMinutes(first, tz) * 60_000);
+}
+
+/**
+ * The last instant of a calendar day in a zone.
+ * @param day - `YYYY-MM-DD`.
+ * @param tz - The zone.
+ */
+export function endOfDay(day: string, tz: string): Date {
+  return new Date(startOfDay(dayPlus(day, 1), tz).getTime() - 1);
+}
+
+/**
+ * Whole days from one calendar day to another, the inverse of dayPlus.
+ * @param from - The starting day, `YYYY-MM-DD`.
+ * @param to - The day counted to, `YYYY-MM-DD`.
+ */
+export function daysBetween(from: string, to: string): number {
+  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+}
+
+/**
+ * The instant a zone's wall clock names, as UTC. Two passes so a time inside
+ * a clock change still lands on the offset in force. A time the clocks skip
+ * resolves to the offset after the jump; a time they show twice, to the first.
+ * A string in that form that names no time (month 13, February 31, 24:00) is
+ * an invalid date, never one rolled over into the next day or month, and so is
+ * a year before 1000, which `Date.UTC` would read as a 19xx one.
+ * @param local - `YYYY-MM-DDTHH:MM:SS` on the zone's clock.
+ * @param tz - The zone.
+ */
+export function instantInZone(local: string, tz: string): Date {
+  const guess = Date.parse(`${local}Z`);
+  if (local < '1000' || Number.isNaN(guess) || new Date(guess).toISOString().slice(0, 19) !== local) {
+    return new Date(Number.NaN);
+  }
   const first = new Date(guess - zoneOffsetMinutes(new Date(guess), tz) * 60_000);
   return new Date(guess - zoneOffsetMinutes(first, tz) * 60_000);
 }

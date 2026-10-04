@@ -1,6 +1,4 @@
 import type { PageField, PageManifest, PageRow, PageView, PageWindow } from '@/libs/workspace/pages';
-// Aliased at build time: the workspace's own pages/components/registry.tsx
-// when it ships one, the in-repo empty stub otherwise (see next.config.ts).
 import { components as wsxComponents } from '@wsx/registry';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { setRequestLocale } from 'next-intl/server';
@@ -8,19 +6,27 @@ import { notFound, redirect } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { StatusPill } from '@/components/ui/status-pill';
+import { ConfigurePage } from '@/features/dashboard/configure/ConfigurePage';
 import { LiveRefresh } from '@/features/dashboard/LiveRefresh';
 import { PageBlocks } from '@/features/dashboard/pages/PageBlocks';
+import { PageFeed } from '@/features/dashboard/pages/PageFeed';
 import { PageGroupTabs } from '@/features/dashboard/pages/PageGroupTabs';
+import { PageMonitorBlocks } from '@/features/dashboard/pages/PageMonitorBlocks';
 import { PagePrompts } from '@/features/dashboard/pages/PagePrompts';
 import { PageTable } from '@/features/dashboard/pages/PageTable';
+import { WatchEmpty } from '@/features/dashboard/pages/WatchEmpty';
 import { PluginPanel } from '@/features/dashboard/plugins/PluginPanel';
 import { ReviewQueue } from '@/features/dashboard/ReviewQueue';
 import { TitleBar } from '@/features/dashboard/TitleBar';
 import { WikiView } from '@/features/dashboard/wiki/WikiView';
 import { clerkAuth as auth } from '@/libs/Auth';
+// Aliased at build time: the workspace's own pages/components/registry.tsx
+// when it ships one, the in-repo empty stub otherwise (see next.config.ts).
+import { nounCode } from '@/libs/codes';
 import { db } from '@/libs/DB';
 import { Link } from '@/libs/I18nNavigation';
-import { activeQueryFilters, applyQueryFilters } from '@/libs/workspace/pageFields';
+import { workspaceTimeZone } from '@/libs/time/workspaceTimeZone';
+import { activeQueryFilters, applyQueryFilters, groupTabKey, LIVE_FALLBACK_EVERY_S, orderGroups } from '@/libs/workspace/pageFields';
 import {
   applyFilter,
   applyWindow,
@@ -30,12 +36,16 @@ import {
   computeStatChange,
   groupRows,
   isZeroFigure,
+  pageHrefKeeping,
   pagePlugin,
+  paginateRows,
   readWorkspacePageContent,
   readWorkspacePageMethodology,
   resolveField,
+  sortRowsByField,
 } from '@/libs/workspace/pages';
 import { deriveProductBoard } from '@/libs/workspace/productBoard';
+import { deriveReleaseFeed } from '@/libs/workspace/releaseFeed';
 import { deriveReleaseOutcome } from '@/libs/workspace/releaseOutcome';
 import { deriveWorkQueue } from '@/libs/workspace/workQueue';
 import {
@@ -46,13 +56,19 @@ import {
   knowledgeSourceSchema,
   toolCallSchema,
 } from '@/models/Schema';
+import { loadWorkLive } from '@/services/factory/liveStatusData';
+import { loadPendingBuilds } from '@/services/factory/pendingBuilds';
+import { loadReleaseLinked } from '@/services/factory/releaseData';
 import { inboxHref } from '@/services/inbox/inboxRef';
 import { resolveRecordLinks } from '@/services/objects/recordLinks';
+import { loadStatusModel } from '@/services/objects/statusField';
 import { readPageForOrg } from '@/services/PluginService';
 import { listPending } from '@/services/ReviewService';
 import { firstParagraph } from '@/services/wiki/WikiService';
 import { listWorkflowRuns } from '@/services/WorkflowService';
+import { loadObjectRows } from '@/services/workspace/objectRows';
 import { resolveRowImages } from '@/services/workspace/pageImages';
+import { loadWatchState } from '@/services/workspace/watchState';
 
 /**
  * Workspace page renderer — `/dashboard/p/<slug>`.
@@ -66,6 +82,12 @@ import { resolveRowImages } from '@/services/workspace/pageImages';
  * registry via the `@wsx/registry` alias.
  */
 
+/**
+ * How many rows a plain, ungrouped list page shows before "Load more" —
+ * Chris, 2026-09-28: "reverse sort the runs page, paginate or load more."
+ */
+const LIST_PAGE_SIZE = 50;
+
 async function loadRows(manifest: PageManifest, orgId: string): Promise<PageRow[]> {
   const src = manifest.source;
   if (!src) {
@@ -73,22 +95,7 @@ async function loadRows(manifest: PageManifest, orgId: string): Promise<PageRow[
   }
 
   if (src.kind === 'objects') {
-    const objType = await db.query.businessObjectTypeSchema.findFirst({
-      where: and(eq(businessObjectTypeSchema.slug, src.objectType), eq(businessObjectTypeSchema.orgId, orgId)),
-    });
-    if (!objType) {
-      return [];
-    }
-    const rows = await db.query.businessObjectSchema.findMany({
-      where: eq(businessObjectSchema.typeId, objType.id),
-    });
-    return rows.map(r => ({
-      id: r.id,
-      title: r.title,
-      status: r.status ?? null,
-      createdAt: r.createdAt ?? null,
-      meta: (r.metadata ?? {}) as Record<string, unknown>,
-    }));
+    return loadObjectRows(orgId, src.objectType);
   }
 
   if (src.kind === 'skillRuns') {
@@ -185,11 +192,12 @@ async function loadRows(manifest: PageManifest, orgId: string): Promise<PageRow[
     }
     // The four concepts `status` was carrying, read once here so every field,
     // stat and group on every page sees the same answer (libs/factory/runFacts.ts).
-    return withRunRecovery(kept)
+    const engineering = withRunRecovery(kept)
       .map((r) => {
         const taskId = taskRecordId(r);
         return {
           id: r.id,
+          code: nounCode('run', r.id),
           title: r.facts.headline,
           status: r.status,
           createdAt: r.createdAt ?? null,
@@ -217,8 +225,11 @@ async function loadRows(manifest: PageManifest, orgId: string): Promise<PageRow[
               : null,
             agentSlug: r.agentSlug,
             kind: r.kind,
+            runRef: String(r.id),
             status: r.status,
             model: r.model,
+            // Which of the installation's runner targets claimed it (backlog 052).
+            target: r.workerTarget,
             attempt: r.attempt,
             cents: r.cents,
             tokens: r.tokens,
@@ -241,6 +252,45 @@ async function loadRows(manifest: PageManifest, orgId: string): Promise<PageRow[
           },
         };
       });
+    if (!src.agentRuns) {
+      return engineering;
+    }
+    // AGENT RUNS IN THE SAME LOG (Chris, 2026-09-28: "should we also see Agent
+    // runs … QA and Product work? anything long running?"). A mission run
+    // reads in the same facts a worker run does, so every field, view and stat
+    // on the page applies to both; `runRef` opens each on its own page.
+    const { missionRunSchema } = await import('@/models/Schema');
+    const { desc } = await import('drizzle-orm');
+    const missions = await db
+      .select({ id: missionRunSchema.id, title: missionRunSchema.title, status: missionRunSchema.status, error: missionRunSchema.error, team: missionRunSchema.team, createdAt: missionRunSchema.createdAt, updatedAt: missionRunSchema.updatedAt })
+      .from(missionRunSchema)
+      .where(eq(missionRunSchema.orgId, orgId))
+      .orderBy(desc(missionRunSchema.id))
+      .limit(src.limit);
+    const EXECUTION: Record<string, string> = { planning: 'queued', running: 'running', paused: 'running', completed: 'completed', failed: 'failed', cancelled: 'cancelled' };
+    const agent = missions.map(m => ({
+      id: -m.id,
+      title: m.title,
+      status: m.status,
+      createdAt: m.createdAt ?? null,
+      meta: {
+        headline: m.title,
+        execution: EXECUTION[m.status] ?? m.status,
+        failureClass: m.status === 'failed' ? 'worker' : null,
+        recovery: m.status === 'failed' ? 'unresolved' : 'none',
+        recoveryNote: m.status === 'failed' ? (m.error ?? 'failed').split('\n')[0]!.slice(0, 160) : null,
+        kind: 'agent',
+        runRef: `agent-${m.id}`,
+        agentSlug: (m.team as { lead?: string } | null)?.lead ?? null,
+        durationSeconds: m.createdAt && m.updatedAt && ['completed', 'failed', 'cancelled'].includes(m.status) ? Math.max(0, Math.round((m.updatedAt.getTime() - m.createdAt.getTime()) / 1000)) : null,
+        error: m.error,
+        createdAt: m.createdAt,
+      },
+    }));
+    // `sortRowsByField` compares by instant, not by `String(date)` — see its
+    // doc comment for the exact bug ("Sun" sorting ahead of "Thu") this once
+    // was.
+    return sortRowsByField([...engineering, ...agent], 'createdAt', 'desc').slice(0, src.limit);
   }
 
   if (src.kind === 'artifacts') {
@@ -351,13 +401,18 @@ function SeriesStrip({ series }: { series: ReturnType<typeof computeSeries> }) {
  * @param root0.views - The declared views.
  * @param root0.active - The view in force.
  * @param root0.slug - The page, for the `?view=` links.
+ * @param root0.keep - The URL filters in force, carried onto every view link.
  */
-function ViewSwitcher({ views, active, slug }: { views: PageView[]; active: PageView; slug: string }) {
+function ViewSwitcher({ views, active, slug, keep = [] }: { views: PageView[]; active: PageView; slug: string; keep?: Array<[string, string]> }) {
   return (
     <nav className="mb-4 flex flex-wrap items-center gap-1" aria-label="Views" data-testid="page-views">
       {views.map((v) => {
         const on = v.key === active.key;
-        const href = v.href ?? (v.key === views[0]!.key ? `/dashboard/p/${slug}` : `/dashboard/p/${slug}?view=${v.key}`);
+        // A view keeps the URL's filters: switching to "Needs attention" while
+        // looking at one product stays on that product.
+        const params = new URLSearchParams(v.key === views[0]!.key ? keep : [['view', v.key], ...keep]);
+        const qs = params.toString();
+        const href = v.href ?? `/dashboard/p/${slug}${qs ? `?${qs}` : ''}`;
         return (
           <Link
             key={v.key}
@@ -508,6 +563,15 @@ export default async function WorkspacePage(props: {
     );
   }
 
+  // WHAT DRIVES A PLUGIN, on one page: its seats, skills, automations, trust
+  // rules, what it learned and its measures as tabs, with how it is doing,
+  // what needs attention and what changed beside them. Declared by the
+  // plugin's page, drawn by core's generic blocks (Chris, 2026-09-30: "main
+  // block with sidebar blocks. or tabs.").
+  if (manifest.archetype === 'configure') {
+    return <ConfigurePage orgId={orgId} manifest={manifest} searchParams={searchParams} now={await currentTime()} />;
+  }
+
   const content = readWorkspacePageContent(manifest);
   const methodology = readWorkspacePageMethodology(manifest);
   const now = await currentTime();
@@ -522,6 +586,9 @@ export default async function WorkspacePage(props: {
   const activeView = views ? (views.find(v => v.key === asked && v.href === undefined) ?? views[0]!) : null;
 
   let rows: PageRow[] = [];
+  // The values a `picker` filter offers, read off every row before the URL
+  // narrowed them, so choosing one product still shows the others to pick.
+  let pickers: Array<{ param: string; label: string; options: Array<{ value: string; label: string }> }> = [];
   if (manifest.archetype !== 'markdown' && manifest.archetype !== 'report' && manifest.source) {
     // A named derivation runs FIRST, over every row: it is what turns stored
     // states into the lanes and sentences the page is declared in, and it
@@ -529,38 +596,85 @@ export default async function WorkspacePage(props: {
     // A URL filter narrows the rows BEFORE the derivation counts them, so a
     // lane note under "Send only" counts Send, not the whole factory (Chris,
     // 2026-09-24: "3 to decide · 5 more queued" over four rows).
-    const loaded = applyQueryFilters(await loadRows(manifest, orgId), queryFilters);
+    const all = await loadRows(manifest, orgId);
+    const loaded = applyQueryFilters(all, queryFilters);
+    // The release feed reads what each release names — its tasks, requests
+    // and product — and states times in the workspace's zone.
+    const releaseFeed = manifest.derive === 'releaseFeed'
+      ? { linked: await loadReleaseLinked(orgId, all), now: new Date(now), timeZone: await workspaceTimeZone(orgId) }
+      : null;
     const derived = manifest.derive === 'workQueue'
-      ? deriveWorkQueue(loaded, { now: new Date(now) })
+      // Each row's acceptance count is its feature page's (featureProof), so
+      // the queue reads the attempts and the releases that name them.
+      ? await (async () => {
+          const tasks = await loadObjectRows(orgId, 'engineering_task');
+          // Each row's lane and badge are its status, as the type declares them.
+          const statuses = manifest.source?.kind === 'objects' ? await loadStatusModel(orgId, manifest.source.objectType).catch(() => null) : null;
+          return deriveWorkQueue(loaded, {
+            statuses,
+            now: new Date(now),
+            tasks,
+            releases: await loadObjectRows(orgId, 'release'),
+            // A Build card already up is the row's decision (journey 4, #214).
+            pendingBuilds: await loadPendingBuilds(orgId),
+            // What is running for each row right now, in one read for the
+            // page (the Now line); the page re-reads on its `live` interval.
+            live: await loadWorkLive(orgId, loaded, tasks, new Date(now), statuses),
+          });
+        })()
       : manifest.derive === 'releaseOutcome'
         ? deriveReleaseOutcome(loaded, { now: new Date(now) })
-        : manifest.derive === 'productBoard'
-          ? deriveProductBoard(loaded, { now: new Date(now) })
-          : loaded;
+        : releaseFeed
+          ? deriveReleaseFeed(loaded, releaseFeed)
+          : manifest.derive === 'productBoard'
+            // A card says what needs a person, what is underway and what last
+            // shipped BY NAME, so it reads the requests and releases themselves
+            // rather than only the counters rolled up onto the product.
+            ? deriveProductBoard(loaded, {
+                now: new Date(now),
+                requests: await loadObjectRows(orgId, 'request'),
+                releases: await loadObjectRows(orgId, 'release'),
+                statuses: await loadStatusModel(orgId, 'request').catch(() => null),
+              })
+            : loaded;
+    const pickable = (manifest.queryFilters ?? []).filter(q => q.picker);
+    if (pickable.length > 0) {
+      const source = releaseFeed ? deriveReleaseFeed(all, releaseFeed) : all;
+      pickers = pickable.map((q) => {
+        const seen = new Map<string, string>();
+        for (const r of source) {
+          const v = resolveField(r, q.field);
+          if (typeof v === 'string' && v !== '' && !seen.has(v)) {
+            const label = q.picker?.labelFrom ? resolveField(r, q.picker.labelFrom) : undefined;
+            seen.set(v, typeof label === 'string' && label !== '' ? label : v);
+          }
+        }
+        return { param: q.param, label: q.label ?? q.param, options: [...seen].map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label)) };
+      }).filter(p => p.options.length > 1);
+    }
     // A picture a row names by id becomes a picture the page can draw. One
     // query for the whole page, after the derivation has chosen WHICH visual
     // each row shows (`services/workspace/pageImages.ts`).
     const drawn = await resolveRowImages(orgId, derived, manifest.fields ?? []);
+    // The chat each record started in, for the card's chat link (Chris,
+    // 2026-09-30, #269), in one read for the page (`recordOrigins`).
+    if (manifest.source?.kind === 'objects' && manifest.layout === 'block') {
+      const { recordOrigins } = await import('@/services/objects/related');
+      const origins = await recordOrigins(orgId, drawn).catch(() => new Map());
+      for (const r of drawn) {
+        const o = origins.get(Number(r.id));
+        if (o) {
+          r.meta = { ...r.meta, originChat: o };
+        }
+      }
+    }
     rows = applyFilter(drawn, [...(manifest.filters ?? []), ...(activeView?.filters ?? [])], new Date(now));
     if (manifest.sort) {
-      const { field, dir } = manifest.sort;
-      rows.sort((a, b) => {
-        const av = resolveField(a, field);
-        const bv = resolveField(b, field);
-        // A row the field is missing from sorts last whichever way the page
-        // sorts. Comparing it as the string "undefined" put the rows with no
-        // figure at the top of a page sorted by cost, which is the opposite
-        // of naming the most expensive work.
-        const ae = av === undefined || av === null || av === '';
-        const be = bv === undefined || bv === null || bv === '';
-        if (ae || be) {
-          return ae && be ? 0 : ae ? 1 : -1;
-        }
-        const cmp = typeof av === 'number' && typeof bv === 'number'
-          ? av - bv
-          : String(av).localeCompare(String(bv));
-        return dir === 'asc' ? cmp : -cmp;
-      });
+      // `sortRowsByField` compares a Date field by instant — see its doc
+      // comment for why comparing `String(date)` instead put a four-day-old
+      // run above one from 22 hours ago on /dashboard/p/runs (Chris,
+      // 2026-09-28: "reverse sort the runs page").
+      rows = sortRowsByField(rows, manifest.sort.field, manifest.sort.dir);
     }
   }
 
@@ -615,9 +729,33 @@ export default async function WorkspacePage(props: {
   }
   const series = (manifest.series ?? []).map(sr => computeSeries(windowed, sr, new Date(now)));
 
+  // A declared order puts the groups a person reads first first (open
+  // incidents above resolved ones), each under its label and limit.
   const groups: Array<{ label: string | null; rows: PageRow[] }> = manifest.groupBy
-    ? groupRows(windowed, manifest.groupBy)
+    ? orderGroups(groupRows(windowed, manifest.groupBy), manifest.groupOrder)
     : [{ label: null, rows: windowed }];
+  // A page with nothing to show says what is watching for it, and when it
+  // last read, rather than "Nothing here yet" (`empty.watch`).
+  const emptyState = manifest.empty && windowed.length === 0
+    ? { text: manifest.empty.text, watch: manifest.empty.watch ? await loadWatchState(orgId, manifest.empty.watch).catch(() => null) : null }
+    : null;
+
+  // "Load more" pagination — the plain, ungrouped list only: a page with
+  // lanes or tabs already shows each lane's own rows in full, and a cursor
+  // across several lanes at once is a separate problem for a separate day.
+  // Every stat, series and group count above was computed from `rows` /
+  // `windowed` — the WHOLE matching set — before this slices what is
+  // actually drawn, so paginating the display never changes what a stat
+  // counts (Chris, 2026-09-28: the stats strip counts the whole set, not the
+  // page).
+  const cursorParam = typeof searchParams.cursor === 'string' ? searchParams.cursor : undefined;
+  const pagination = !manifest.groupBy && manifest.archetype === 'list' && manifest.sort && groups[0]!.rows.length > LIST_PAGE_SIZE
+    ? paginateRows(groups[0]!.rows, manifest.sort.field, cursorParam, LIST_PAGE_SIZE)
+    : null;
+  const totalMatched = groups[0]?.rows.length ?? 0;
+  if (pagination) {
+    groups[0] = { label: null, rows: pagination.page };
+  }
 
   // Which plugin shipped this page, if any — the panel's slug.
   const ownedBy = pagePlugin(manifest);
@@ -648,7 +786,9 @@ export default async function WorkspacePage(props: {
   // they move underneath it, and the prose goes behind "About this data":
   // the method is evidence about the rows, and evidence is level three.
   const rowsLead = manifest.archetype === 'list' || manifest.archetype === 'queue';
-  const pluginPanel = ownedBy ? <PluginPanel orgId={orgId} slug={ownedBy} /> : null;
+  // Chris, 2026-09-28: "doesn't need to be on every page. Maybe give it its
+  // own Configure page" — a page opts out with `pluginPanel: false`.
+  const pluginPanel = ownedBy && manifest.pluginPanel !== false ? <PluginPanel orgId={orgId} slug={ownedBy} /> : null;
   const about = content && manifest.archetype !== 'markdown'
     ? (
         rowsLead
@@ -677,12 +817,15 @@ export default async function WorkspacePage(props: {
       <TitleBar
         title={manifest.title}
         description={manifest.description}
-        actions={manifest.live ? <LiveRefresh everyMs={manifest.live.every * 1000} /> : undefined}
+        actions={manifest.live ? <LiveRefresh everyMs={(manifest.live.every ?? LIVE_FALLBACK_EVERY_S) * 1000} follow={manifest.live.follow} /> : undefined}
       />
 
       {/* A page a plugin shipped carries that plugin's outcome panel — the
           same one the Proposals and Data rooms surfaces carry, decided by
           where the YAML came from rather than by the page's slug. */}
+      {/* No paused-automations banner over the list (Chris, 2026-10-02): a
+          paused automation that holds a feature says so in that feature's own
+          status line (#294); the rest live on Manage › Automations. */}
       {!rowsLead && pluginPanel}
 
       {content && manifest.archetype === 'markdown' && (
@@ -692,11 +835,37 @@ export default async function WorkspacePage(props: {
       )}
       {!rowsLead && about}
 
-      {views && activeView && <ViewSwitcher views={views} active={activeView} slug={manifest.slug} />}
+      {views && activeView && <ViewSwitcher views={views} active={activeView} slug={manifest.slug} keep={queryFilters.map(f => [f.param, f.value] as [string, string])} />}
       {manifest.prompts && manifest.prompts.length > 0 && <PagePrompts prompts={manifest.prompts} page={manifest.title} />}
-      {queryFilters.length > 0 && (
+      {pickers.map(p => (
+        <nav key={p.param} className="mb-4 flex flex-wrap items-center gap-1 text-xs" aria-label={p.label} data-testid="page-query-picker">
+          <span className="mr-1 text-muted-foreground">{p.label}</span>
+          {[{ value: null as string | null, label: 'All' }, ...p.options].map((o) => {
+            const on = (queryFilters.find(f => f.param === p.param)?.value ?? null)?.toLowerCase() === o.value?.toLowerCase();
+            const params = new URLSearchParams();
+            if (activeView && views && activeView.key !== views[0]!.key) {
+              params.set('view', activeView.key);
+            }
+            if (o.value !== null) {
+              params.set(p.param, o.value);
+            }
+            const qs = params.toString();
+            return (
+              <Link
+                key={o.value ?? '__all'}
+                href={`/dashboard/p/${manifest.slug}${qs ? `?${qs}` : ''}`}
+                aria-current={on ? 'true' : undefined}
+                className={on ? 'rounded-full border border-foreground px-2 py-0.5 font-medium' : 'rounded-full border border-border px-2 py-0.5 text-muted-foreground hover:text-foreground'}
+              >
+                {o.label}
+              </Link>
+            );
+          })}
+        </nav>
+      ))}
+      {queryFilters.some(f => !pickers.some(p => p.param === f.param)) && (
         <p className="mb-4 flex flex-wrap items-center gap-2 text-sm" data-testid="page-query-filters">
-          {queryFilters.map(f => (
+          {queryFilters.filter(f => !pickers.some(p => p.param === f.param)).map(f => (
             <span key={f.param} className="inline-flex items-center gap-1 rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
               <span className="text-foreground">{f.value.charAt(0).toUpperCase() + f.value.slice(1)}</span>
               {' '}
@@ -778,6 +947,9 @@ export default async function WorkspacePage(props: {
       )}
 
       <Widgets manifest={manifest} position="above" rows={windowed} stats={stats} />
+      {/* What is watched, above the rows; what each check saw, below them. */}
+      <PageMonitorBlocks orgId={orgId} blocks={manifest.blocks} position="above" plugin={ownedBy} now={now} />
+      {manifest.rowsTitle && <h2 className="mb-2 text-sm font-semibold" data-testid="page-rows-title">{manifest.rowsTitle}</h2>}
 
       {manifest.archetype === 'report' && (
         <p className="max-w-2xl text-sm text-muted-foreground">
@@ -796,8 +968,39 @@ export default async function WorkspacePage(props: {
         </p>
       )}
 
-      {manifest.showRows && manifest.archetype !== 'markdown' && manifest.archetype !== 'report' && (() => {
+      {pagination && (
+        <p className="mb-3 text-xs text-muted-foreground" data-testid="page-pagination-count">
+          Showing
+          {' '}
+          {groups[0]!.rows.length}
+          {' '}
+          of
+          {' '}
+          {totalMatched.toLocaleString()}
+        </p>
+      )}
+
+      {emptyState && <WatchEmpty text={emptyState.text} watch={emptyState.watch} now={now} />}
+
+      {!emptyState && manifest.showRows && manifest.archetype !== 'markdown' && manifest.archetype !== 'report' && (() => {
         const Rows = manifest.layout === 'block' ? PageBlocks : PageTable;
+        // A feed is the Ledger pattern: its own shape, so its own props.
+        if (manifest.layout === 'feed') {
+          return groups.map((g, gi) => (
+            <PageFeed
+              key={g.label ?? '__all'}
+              id={gi === 0 ? 'wsx-table' : undefined}
+              rows={g.rows}
+              fields={fields}
+              primary={manifest.primary}
+              feed={manifest.feed}
+              rowLink={manifest.rowLink}
+              now={now}
+              links={links}
+              groupLabel={g.label}
+            />
+          ));
+        }
         // Tabs are the groups, so the panel never draws the group's heading
         // again inside itself, and the lane's note rides on the panel rather
         // than growing the tab into a sentence.
@@ -824,15 +1027,28 @@ export default async function WorkspacePage(props: {
         return (
           <PageGroupTabs
             groups={groups.map((g, gi) => ({
-              key: (g.label ?? `group-${gi}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `group-${gi}`,
+              key: groupTabKey(g.label, gi),
               label: g.label ?? '',
-              count: g.rows.length,
+              // A source that caps its rows says how many the group holds.
+              count: typeof g.rows[0]?.meta?.laneTotal === 'number' ? g.rows[0].meta.laneTotal : g.rows.length,
               note: typeof g.rows[0]?.meta?.laneNote === 'string' ? g.rows[0].meta.laneNote : null,
               children: panel(g, gi, null),
             }))}
           />
         );
       })()}
+
+      {pagination?.nextCursor && (
+        <div className="mt-3">
+          <Link
+            href={pageHrefKeeping(manifest.slug, searchParams, { cursor: pagination.nextCursor })}
+            className="inline-flex items-center rounded-md border border-border px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-muted"
+            data-testid="page-load-more"
+          >
+            Load more
+          </Link>
+        </div>
+      )}
 
       {reviewCfg && (
         <section id="wsx-review" className="mt-8">
@@ -864,6 +1080,7 @@ export default async function WorkspacePage(props: {
       )}
 
       <Widgets manifest={manifest} position="below" rows={windowed} stats={stats} />
+      <PageMonitorBlocks orgId={orgId} blocks={manifest.blocks} position="below" plugin={ownedBy} now={now} />
 
       {rowsLead && pluginPanel}
       {rowsLead && about}

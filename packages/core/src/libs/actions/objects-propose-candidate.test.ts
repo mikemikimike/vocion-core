@@ -16,7 +16,7 @@ vi.mock('@/libs/DB');
 
 const { db } = await import('@/libs/DB');
 const { actionRunSchema, businessObjectSchema, businessObjectTypeSchema, trustRuleSchema } = await import('@/models/Schema');
-const { forgetCachedObjectTypes, objectProposeCandidateAction } = await import('./objects-propose-candidate');
+const { candidateDedupKey, forgetCachedObjectTypes, objectProposeCandidateAction, pageKey } = await import('./objects-propose-candidate');
 const { listActions } = await import('./registry');
 const { proposeAction, executeAction, rejectAction } = await import('@/services/ActionService');
 const { and, eq } = await import('drizzle-orm');
@@ -502,15 +502,15 @@ describe('a refresh from another page', () => {
     expect((await stored(first.runId)).input.summary).toBe('Open mic.');
   });
 
-  it('replaces a card whose identity rests on a blank field, since another record may share its key', async () => {
+  it('leaves a card whose identity rests on a blank field alone: another record may share its key, so the next is its own card', async () => {
     const blankVenue = { ...IDENTITY, venue: '' };
     const first = await propose(fromItsOwnPage({ fields: { ...blankVenue, ticketUrl: 'https://tickets.example.org/open-mic' } }));
-    await propose(fromTheListing({ fields: blankVenue }));
+    const second = await propose(fromTheListing({ fields: blankVenue }));
 
     const { input } = await stored(first.runId);
 
-    expect(input.summary).toBe('Open mic.');
-    expect(input.fields).not.toHaveProperty('ticketUrl');
+    expect(second.runId).not.toBe(first.runId);
+    expect(input.fields).toHaveProperty('ticketUrl', 'https://tickets.example.org/open-mic');
   });
 });
 
@@ -874,6 +874,24 @@ describe('deciding a candidate', () => {
     });
   }
 
+  it('a record filed from a conversation carries where it came from, in the same write (Chris, 2026-09-30, #269)', async () => {
+    const proposed = await proposeAction({
+      orgId: ORG,
+      actionId: 'objects.propose_candidate',
+      principal: ingestionAgent(),
+      input: candidate(),
+      origin: { conversationId: 812, userId: 'user_dana', byPerson: true },
+      proposal: { confidence: 0.4, suggestedDecision: 'approve', suggestedDecisionReason: 'Filed from the thread.' },
+    } as never);
+
+    await executeAction(proposed.runId, ORG, { reviewedBy: 'user_moderator' });
+
+    const [object] = await objectsFor();
+
+    expect(object!.metadata).toMatchObject({ origin: { conversationId: 812, userId: 'user_dana' } });
+    expect(typeof (object!.metadata as { origin: { at: unknown } }).origin.at).toBe('string');
+  });
+
   it('approving marks the row approved and writes nowhere', async () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
@@ -991,5 +1009,63 @@ describe('deciding a candidate', () => {
       .where(and(eq(businessObjectSchema.orgId, OTHER_ORG), eq(businessObjectSchema.title, 'Open Mic Night')));
 
     expect(theirs!.status).toBe('candidate');
+  });
+});
+
+describe('an internal record files itself (Chris, 2026-09-28: "it should probably auto file")', () => {
+  it('files a candidate of a type that declares x-moderation none under its own trust key, and still holds an extracted one', async () => {
+    forgetCachedObjectTypes();
+    await db.insert(businessObjectTypeSchema).values({ orgId: ORG, slug: 'request', label: 'Request', schema: { 'type': 'object', 'x-moderation': 'none', 'properties': { title: { type: 'string' } } } });
+    await db.insert(trustRuleSchema).values([
+      { orgId: ORG, actionId: 'objects.propose_candidate.request', threshold: 0.5, enabled: 'true' },
+      { orgId: ORG, actionId: `objects.propose_candidate.${TYPE_SLUG}`, threshold: 0.5, enabled: 'true' },
+    ] as never);
+    const agent = ingestionAgent();
+
+    const filed = await proposeAction({ orgId: ORG, actionId: 'objects.propose_candidate', principal: agent, input: { objectType: 'request', title: 'Document page not scoped to org', fields: { title: 'Document page not scoped to org' }, dedupOn: ['title'] }, proposal: { confidence: 0.9, rationale: 'P1 bug from chat', agentSlug: 'product-manager', suggestedDecision: 'approve', suggestedDecisionReason: 'file it' } } as never);
+    const held = await proposeAction({ orgId: ORG, actionId: 'objects.propose_candidate', principal: agent, input: candidate(), proposal: { confidence: 0.9, rationale: 'extracted', agentSlug: 'ingestion-lead', suggestedDecision: 'approve', suggestedDecisionReason: 'looks right' } } as never);
+
+    expect(filed.status).toBe('done');
+    expect(held.status).toBe('pending');
+  });
+
+  it('says it exists, with the conversation it was asked for in, so filing starts the work (backlog 038)', async () => {
+    const { eventLogSchema } = await import('@/models/Schema');
+    forgetCachedObjectTypes();
+    await db.insert(businessObjectTypeSchema).values({ orgId: ORG, slug: 'request', label: 'Request', schema: { 'type': 'object', 'x-moderation': 'none', 'properties': { title: { type: 'string' } } } });
+    await db.insert(trustRuleSchema).values({ orgId: ORG, actionId: 'objects.propose_candidate.request', threshold: 0.5, enabled: 'true' });
+    const filed = await proposeAction({ orgId: ORG, actionId: 'objects.propose_candidate', principal: ingestionAgent(), origin: { conversationId: 12, userId: 'user_1', byPerson: true }, input: { objectType: 'request', title: 'Invite link opens the wrong room', fields: { title: 'Invite link opens the wrong room' }, dedupOn: ['title'] }, proposal: { confidence: 0.9, rationale: 'P1 bug from chat', agentSlug: 'product-manager', suggestedDecision: 'approve', suggestedDecisionReason: 'file it' } } as never);
+    const objectId = (filed.result as { objectId: number }).objectId;
+    const [event] = await db.select().from(eventLogSchema).where(and(eq(eventLogSchema.orgId, ORG), eq(eventLogSchema.dedupeKey, `object.created:${objectId}`)));
+
+    expect(event?.payload).toMatchObject({ objectType: 'request', source: 'proposal', conversationId: 12, actor: 'user_1', byPerson: true });
+  });
+});
+
+describe('pageKey', () => {
+  it('reads two spellings of one page as the same key', () => {
+    expect(pageKey('https://bellwaterhall.example/events/open-mic/')).toBe('https://bellwaterhall.example/events/open-mic');
+    expect(pageKey('https://bellwaterhall.example/events/open-mic#tickets')).toBe('https://bellwaterhall.example/events/open-mic');
+    expect(pageKey('https://bellwaterhall.example/events/open-mic?x=1')).toBe('https://bellwaterhall.example/events/open-mic?x=1');
+  });
+
+  it('is null for anything that is not a URL', () => {
+    expect(pageKey('/events/open-mic')).toBeNull();
+    expect(pageKey('')).toBeNull();
+    expect(pageKey(42)).toBeNull();
+  });
+});
+
+describe('candidateDedupKey reads a record\'s own title', () => {
+  it('keys on the input\'s title when dedupOn names title and fields carry none (#124)', () => {
+    const a = candidateDedupKey({ objectType: 'request', title: 'Open alerts', fields: { product: 'kestrel' }, dedupOn: ['title'] });
+    const b = candidateDedupKey({ objectType: 'request', title: 'Show when a document was last opened', fields: { product: 'kestrel' }, dedupOn: ['title'] });
+
+    expect(a).toBe('objects.propose_candidate:request|open-alerts');
+    expect(b).not.toBe(a);
+  });
+
+  it('prefers a title written in fields, as before', () => {
+    expect(candidateDedupKey({ objectType: 'request', title: 'Top level', fields: { title: 'In fields' }, dedupOn: ['title'] })).toBe('objects.propose_candidate:request|in-fields');
   });
 });

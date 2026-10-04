@@ -38,6 +38,12 @@ export const markdownSpecSchema = z.object({
   /** One line the log and an index show under the title — a wiki page's summary. */
   summary: z.string().max(200).optional(),
   /**
+   * A QA test run's every test that ran, each with the id a verdict cites
+   * (`recordVerdict.latestTestRun`). Walk 11 (2026-10-02, task 389): the
+   * runner sent it and this schema dropped it, so QA's citations were refused.
+   */
+  tests: z.array(z.object({ id: z.string(), file: z.string(), name: z.string(), status: z.string() })).max(5000).optional(),
+  /**
    * Where a page came from when a workspace repo seeded it (`wiki/<slug>.md`,
    * `libs/workspace/wiki-pages.ts`). `sha` is the file's content hash as last
    * applied and `version` the artifact version that apply wrote, so the next
@@ -55,6 +61,24 @@ export const markdownSpecSchema = z.object({
     order: z.number().optional(),
     tags: z.array(z.string()).optional(),
     orphanedAt: z.string().optional(),
+  }).optional(),
+  /**
+   * Set when this page is a RECORD'S BODY (`services/objects/recordBody.ts`,
+   * backlog 035): the typed fields the version was written from, so History
+   * diffs and Restore read values rather than parsing prose back out of
+   * `md`. `md` is the same fields rendered — headmatter plus sections — and
+   * is regenerated from `fields` on every version. `written` names the keys
+   * the write that made this version touched, so a restore reverts what
+   * people and agents changed and never a figure a rollup recomputed.
+   */
+  record: z.object({
+    objectType: z.string().min(1),
+    objectId: z.number().int().positive(),
+    fields: z.record(z.string(), z.unknown()),
+    written: z.array(z.string()).optional(),
+    actionRunId: z.number().int().positive().optional(),
+    invokedBy: z.string().optional(),
+    reviewedBy: z.string().optional(),
   }).optional(),
 });
 export type MarkdownSpec = z.infer<typeof markdownSpecSchema>;
@@ -99,6 +123,12 @@ export const linkSpecSchema = z.object({
   href: z.string().min(1),
   title: z.string().min(1),
   description: z.string().optional(),
+  /**
+   * For a link to one of Vocion's own public pages: the parts of that page
+   * its sharer chose to leave out (`asker` — who asked, on a shared feature).
+   * The page reads it on every request, so changing it changes every copy.
+   */
+  hidden: z.array(z.string().max(40)).max(20).optional(),
 });
 export type LinkSpec = z.infer<typeof linkSpecSchema>;
 
@@ -108,6 +138,66 @@ export const fileSpecSchema = z.object({
   contentType: z.string(),
   bytes: z.number().int().nonnegative(),
   url: z.string(),
+  /** An image's pixel size, when the platform drew it. */
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  /** What a drawn image was drawn FROM (a mockup's HTML, CSS and look), so a redraw starts there. */
+  source: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * The one line a person reads under the picture — what it shows. Written
+   * when the image is filed (a mockup's state, a capture's flow), so the
+   * feature page's carousel reads it rather than making one up.
+   */
+  caption: z.string().max(300).optional(),
+  /** Who or what made it, and where: `{by, drawnFrom, missionRunId, conversationId, workerRunId}`. */
+  provenance: z.record(z.string(), z.unknown()).optional(),
+  /** For a capture of the running product: the page it was taken from. */
+  capturedFrom: z.string().max(2000).optional(),
+  /**
+   * A recording's share on Slate, once it is uploaded there (a later phase):
+   * the page prefers that player to the stored file when it is set.
+   */
+  slateShareId: z.string().max(200).optional(),
+  /**
+   * The recording on a video host (`services/videoHost/`): being published,
+   * published (its share, watch page and player), or why it could not be.
+   * Absent when no host is connected.
+   */
+  hostedVideo: z.object({
+    state: z.enum(['publishing', 'published', 'failed']),
+    host: z.string().max(40),
+    label: z.string().max(80).optional(),
+    shareId: z.string().max(200).optional(),
+    hostRef: z.string().max(200).optional(),
+    watchUrl: z.string().max(2000).optional(),
+    embedUrl: z.string().max(2000).optional(),
+    visibility: z.string().max(40).optional(),
+    /** Why the last change of who may watch did not take (the host was down, refused); cleared when one does. */
+    visibilityError: z.string().max(500).optional(),
+    reason: z.string().max(500).optional(),
+    attempts: z.number().int().nonnegative().optional(),
+    at: z.string().max(40),
+  }).optional(),
+  /**
+   * A recording's moments, when its maker logged them: what was done and when,
+   * in ms from the recording's start (`services/artifacts/recordings.ts`). A
+   * narration is timed to them.
+   */
+  timeline: z.array(z.object({
+    atMs: z.number().int().nonnegative(),
+    what: z.string().max(200),
+    ok: z.boolean().optional(),
+    detail: z.string().max(300).nullable().optional(),
+    url: z.string().max(2000).nullable().optional(),
+    evidenceId: z.string().max(80).optional(),
+  })).max(120).optional(),
+  /** A narrated recording's source: the recording it narrates, by artifact id and served URL. */
+  narratedFrom: z.number().int().positive().optional(),
+  narratedFromUrl: z.string().max(2000).optional(),
+  /** A narrated recording's script, as spoken: when each line starts and ends, what it says. */
+  script: z.array(z.object({ atMs: z.number().int().nonnegative(), endMs: z.number().int().nonnegative(), text: z.string().max(400) })).max(20).optional(),
+  /** Who speaks in a narrated recording. */
+  speaker: z.object({ name: z.string().max(120), slug: z.string().max(80).optional() }).optional(),
 });
 export type FileSpec = z.infer<typeof fileSpecSchema>;
 

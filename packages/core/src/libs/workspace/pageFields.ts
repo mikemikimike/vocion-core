@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { parseTopic } from '@/libs/live/topics';
+import { recordName } from './recordName';
 
 /**
  * Workspace pages, the part that runs anywhere — the page manifest schema,
@@ -52,7 +54,7 @@ const FieldSchema = z.object({
   /** Column key; also the default accessor when `from` is omitted. */
   key: z.string(),
   label: z.string().optional(),
-  /** Accessor: `title` | `status` | `createdAt` | `meta.<dot.path>` */
+  /** Accessor: `title` | `name` (the short name, else the title) | `status` | `createdAt` | `meta.<dot.path>` */
   from: z.string().optional(),
   /**
    * `image` renders the value (a URL) as a thumbnail; `money` reads an
@@ -65,9 +67,12 @@ const FieldSchema = z.object({
    * `{phase, note}` object as "phase · note" (any other object as its
    * primitive entries), so coarse progress reads as a sentence, not JSON.
    * `duration` reads an integer number of seconds as "18m 25s", because a
-   * run's length is the thing being compared and `1105` is not.
+   * run's length is the thing being compared and `1105` is not. `live`
+   * reads a `{line, live}` object — what is running for the row right now
+   * (`libs/factory/liveStatus.ts`) — as that line behind a status dot that
+   * breathes while something runs.
    */
-  format: z.enum(['text', 'badge', 'score', 'date', 'mono', 'image', 'icon', 'money', 'link', 'relative', 'progress', 'steps', 'duration', 'compare', 'workload']).default('text'),
+  format: z.enum(['text', 'badge', 'score', 'date', 'mono', 'image', 'icon', 'money', 'link', 'relative', 'progress', 'steps', 'duration', 'compare', 'workload', 'live']).default('text'),
   /**
    * For `format: compare`, the figure ours is read against and who it
    * belongs to. Our price beside the incumbent's is one fact, not four
@@ -223,19 +228,72 @@ const FieldSchema = z.object({
    * digits when nobody is.
    */
   detail: z.boolean().default(false),
+  /**
+   * Where this one fact opens, as a row-link template (`{id}`, `{meta.slug}`)
+   * or an ordered list of fallbacks — the same grammar as `rowLink` and a row
+   * action's `href`. A block whose facts carry their own destinations is no
+   * longer one big link: its title opens the row and each linked fact opens
+   * its own place, so "Review 2 decisions" goes to the decisions and "1 change
+   * in progress" goes to the work, from the card, without the ⋯ menu
+   * (products red team, 2026-09-28). A template this row cannot fill draws
+   * the fact as plain text rather than as a link to a 404.
+   */
+  href: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+  /**
+   * In a block's subtitle, start a new line with this field. A card that
+   * reads name → what needs you → what is underway → what last shipped →
+   * stage and health is five questions, and running them together on one
+   * dotted line made the one that needs a person as quiet as the stage.
+   */
+  breakBefore: z.boolean().optional(),
+  /**
+   * `strong` draws the value in the foreground at normal size — the line a
+   * card leads with after its name — where the rest of a subtitle is muted.
+   */
+  emphasis: z.enum(['strong']).optional(),
+  /**
+   * An accessor holding a tone (`ok`, `warn`, `bad`, `info`, `muted`). On a
+   * sentence that carries a state without being a badge ("Issue detected",
+   * "Current checks passed") it is drawn as a small dot before the value. On
+   * a `format: badge` field it is the pill's tone wherever `tones` names
+   * none, so a row whose state carries its own tone (the Work page's
+   * `meta.stateTone`) needs no hand-kept list and a manifest names only the
+   * tones it changes.
+   */
+  toneFrom: z.string().optional(),
+  /**
+   * For `format: link` with no `to` — the accessor the anchor reads as, so a
+   * URL is drawn under the name a person knows it by (the tracker's `NW-API-3`)
+   * rather than as its host and path. Absent, or empty on a row, the URL's
+   * short form is drawn as before.
+   */
+  labelFrom: z.string().optional(),
 });
 
 /**
- * A page that stays current while someone is looking at it. The rendered
- * page re-reads its rows and stats every `every` seconds while the tab is
- * visible, and says so ("live · 12s ago"). Bounded: under 5s a page would
- * hammer the database for no reading a person could follow; over 120s it
- * is not live, it is a page you reload. One request per interval per open
- * tab is the whole cost.
+ * A page that stays current while someone is looking at it, and says so
+ * ("live · 12s ago").
+ *
+ * `follow` names what the page is made of on the workspace live stream
+ * (backlog 050): `list:<type>` for records of a type, and the feeds `runs`,
+ * `cards`, `asks`, `events`. The page re-reads the moment one of them
+ * changes, wherever it was written, and makes no polling request while the
+ * stream is up. `every` is the interval it re-reads on otherwise — alone, it
+ * is the whole mechanism; beside `follow`, it is the fallback while the
+ * stream is down (15s when omitted). Bounded: under 5s a page would hammer
+ * the database for no reading a person could follow; over 120s it is not
+ * live, it is a page you reload.
  */
 const LiveSchema = z.object({
-  every: z.number().int().min(5).max(120),
-});
+  every: z.number().int().min(5).max(120).optional(),
+  follow: z.array(z.string().refine((t) => {
+    const topic = parseTopic(t);
+    return topic !== null && (topic.kind === 'list' || topic.kind === 'feed');
+  }, { message: 'follow takes list:<type> or a feed — runs, cards, asks, events' })).min(1).max(20).optional(),
+}).refine(l => l.every !== undefined || l.follow !== undefined, { message: 'live needs every (seconds between re-reads), follow (what the page is made of), or both' });
+
+/** How often a followed page re-reads while the live stream is down, when it names no interval. */
+export const LIVE_FALLBACK_EVERY_S = 15;
 
 /**
  * `since` keeps the rows whose date field is on or after the start of a
@@ -389,6 +447,33 @@ const WidgetSchema = z.object({
   data: z.array(z.enum(['rows', 'stats'])).default([]),
 });
 
+/**
+ * A page's generic blocks — reads core owns, drawn above or below the rows
+ * (Chris, 2026-10-02, of the Incidents page: "How can I see what
+ * monitors/tests are configured and enabled? Log of checks with results?").
+ *
+ *   monitors   each scheduled automation named, with what it checked, how
+ *              often, whether it is on (Pause / Resume), and its last check.
+ *   checkLog   the recent runs of those automations, newest first, each as
+ *              what it checked and what it saw (`libs/automations/checkResult.ts`),
+ *              with the detail one tap away.
+ *
+ * `automations` names them by slug; absent, the page's plugin's scheduled
+ * automations. A slug this workspace does not have is left out, so a page
+ * can name a monitor another plugin ships. A closed set, like the configure
+ * tabs: each is a read core owns, and a page only chooses which and where.
+ */
+export const PAGE_BLOCK_KINDS = ['monitors', 'checkLog'] as const;
+export const PageBlockSchema = z.object({
+  kind: z.enum(PAGE_BLOCK_KINDS),
+  title: z.string().min(1).max(60).optional(),
+  position: z.enum(['above', 'below']).default('above'),
+  automations: z.array(SlugSchema).min(1).optional(),
+  /** checkLog: how many runs it lists. */
+  limit: z.number().int().positive().max(200).default(30),
+});
+export type PageBlock = z.infer<typeof PageBlockSchema>;
+
 const ListSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('objects'), objectType: SlugSchema }),
   // What agents DID — tool_call rows (the operations layer is gone in
@@ -413,6 +498,12 @@ const ListSourceSchema = z.discriminatedUnion('kind', [
     status: z.array(z.string()).optional(),
     kinds: z.array(z.string()).optional(),
     limit: z.number().int().positive().max(500).default(100),
+    /**
+     * Agent runs too (`mission_run`: QA reviews, the product manager's checks),
+     * in the same rows (meta.kind `agent`), so one log shows everything that ran
+     * long (Chris, 2026-09-28). Each row's `meta.runRef` opens its own page.
+     */
+    agentRuns: z.boolean().default(false),
   }),
   // What agents and people MADE — the artifact log, scoped by folder and/or
   // kind. A wiki is a folder of markdown artifacts; a proposal log is the
@@ -503,6 +594,53 @@ const ReportSchema = z.object({
   subject: z.enum(['request']),
 });
 
+/**
+ * What the `configure` archetype's tabs can hold — one relation of the page's
+ * plugin each: its agents as seats, its skills and playbooks, its
+ * automations, its trust rules, what it learned from use, and its team's
+ * measures. A closed set because each is a read core owns; a plugin chooses
+ * which it shows and in what order, never what they mean.
+ */
+export const CONFIGURE_TAB_KINDS = ['seats', 'skills', 'automations', 'trust', 'learned', 'measures'] as const;
+export type ConfigureTabKind = typeof CONFIGURE_TAB_KINDS[number];
+
+/**
+ * The `configure` archetype's sidebar blocks: how it is doing (the measures,
+ * each with its direction), what needs attention (links only, absent when
+ * nothing does) and what changed recently.
+ */
+export const CONFIGURE_ASIDE_KINDS = ['health', 'attention', 'changes'] as const;
+export type ConfigureAsideKind = typeof CONFIGURE_ASIDE_KINDS[number];
+
+/**
+ * The `configure` archetype — what drives a plugin, on one page: a main
+ * block of tabs, each a hairline list with its count, and a sidebar that
+ * stacks under the tabs on a phone. Declared by the plugin's page, drawn by
+ * core's generic blocks (`features/dashboard/configure`), so a second
+ * plugin's Configure page is this descriptor and nothing else.
+ */
+export const ConfigureBlocksSchema = z.object({
+  tabs: z.array(z.object({
+    kind: z.enum(CONFIGURE_TAB_KINDS),
+    /** The tab's name, when the plugin's word for it differs ("Seats" → "Agents"). */
+    label: z.string().min(1).max(40).optional(),
+  })).min(1).default(CONFIGURE_TAB_KINDS.map(kind => ({ kind }))),
+  aside: z.array(z.object({
+    kind: z.enum(CONFIGURE_ASIDE_KINDS),
+    label: z.string().min(1).max(40).optional(),
+  })).default(CONFIGURE_ASIDE_KINDS.map(kind => ({ kind }))),
+});
+export type ConfigureBlocks = z.infer<typeof ConfigureBlocksSchema>;
+
+/**
+ * A product overview's sections (`recordPage.kind: product`), in the order a
+ * product manager asks: how it is doing, what needs me, what is moving, what
+ * shipped, what is proposed, what it looks like, what is written about it,
+ * what it is, how it ships, what happened, and what it is connected to.
+ */
+export const PRODUCT_SECTIONS = ['doing', 'needs', 'moving', 'shipped', 'proposed', 'look', 'wiki', 'about', 'engineering', 'activity', 'related'] as const;
+export type ProductSection = typeof PRODUCT_SECTIONS[number];
+
 export const PageManifestSchema = z.object({
   slug: SlugSchema,
   title: z.string(),
@@ -533,9 +671,19 @@ export const PageManifestSchema = z.object({
    * redirects to `href`. It exists so a plugin can seat a core surface (the
    * team report) beside its own pages without duplicating it.
    */
-  archetype: z.enum(['list', 'queue', 'markdown', 'link', 'report', 'wiki']),
+  archetype: z.enum(['list', 'queue', 'markdown', 'link', 'report', 'wiki', 'configure']),
+  /**
+   * Whether this page carries its plugin's "How <plugin> is doing" panel.
+   * On by default; a plugin with many pages keeps it on one of them (the
+   * software factory's Configure page) rather than under every list.
+   */
+  pluginPanel: z.boolean().default(true),
   /** Required by `link`: the route the row opens. */
   href: z.string().min(1).optional(),
+
+  // ---- configure config ----
+  /** The `configure` archetype's tabs and sidebar — see {@link ConfigureBlocksSchema}. Omitted, every block in its default order. */
+  configure: ConfigureBlocksSchema.optional(),
 
   // ---- report config ----
   /** Required by `report` — see {@link ReportSchema}. */
@@ -590,7 +738,27 @@ export const PageManifestSchema = z.object({
    * and a label travels with its value instead of living in a header the
    * reader has to look back up at.
    */
-  layout: z.enum(['table', 'block']).default('table'),
+  layout: z.enum(['table', 'block', 'feed']).default('table'),
+  /**
+   * How a `feed` layout reads its rows — the Ledger pattern
+   * (`components/patterns/Ledger`): day headings from `groupBy`, one entry per
+   * row, newest first. The entry's title is `primary.field`, its detail line
+   * the non-badge `primary.subtitle` fields, its state the badge ones.
+   *
+   * A feed is for rows a person reads as a log of what happened — releases,
+   * one day at a time — where a table would put a sha, a URL and a cost in
+   * every row and a block would put each one in a card.
+   */
+  feed: z.object({
+    /** Fields drawn muted beside the title — a short version. */
+    aside: z.array(z.string()).default([]),
+    /** The field holding the one sentence under the title. */
+    summary: z.string().optional(),
+    /** Fields drawn as one muted line under the summary. */
+    lines: z.array(z.string()).default([]),
+    /** The field holding what needs a person — drawn only when the row has one. */
+    note: z.string().optional(),
+  }).optional(),
   /**
    * A named derivation run over the rows BEFORE filters, sort, grouping and
    * stats, so the page can be declared in the words a person reads rather
@@ -606,7 +774,34 @@ export const PageManifestSchema = z.object({
    * knows what these records MEAN and is not a general expression language
    * on a page. A second one gets declared here when it exists.
    */
-  derive: z.enum(['workQueue', 'releaseOutcome', 'productBoard']).optional(),
+  derive: z.enum(['workQueue', 'releaseOutcome', 'releaseFeed', 'productBoard']).optional(),
+  /**
+   * The page a row opens, when it is this page's own: `/dashboard/p/<slug>/<id>`
+   * draws the record through a dedicated assembly rather than the generic
+   * object page. A closed set, like the report's `subject` — `release` is the
+   * software factory's release page (`services/factory/releaseReport.ts`).
+   *
+   * `actions` are the page's asks on that record, in the workspace's words:
+   * each opens a new chat with the record as context and its prompt sent.
+   * `draft`, `review` and `publish` are offered by the announcement's state;
+   * none is offered where its words are not declared.
+   */
+  recordPage: z.object({
+    kind: z.enum(['release', 'product']),
+    /**
+     * `product`: the overview's sections, in the order they are drawn. A
+     * section not named is not drawn; absent, every section in the order
+     * {@link PRODUCT_SECTIONS} lists. `folded` sections are drawn closed, one
+     * line saying what is inside (the Release engineer's `engineering`).
+     */
+    sections: z.array(z.enum(PRODUCT_SECTIONS)).min(1).optional(),
+    folded: z.array(z.enum(PRODUCT_SECTIONS)).optional(),
+    actions: z.object({
+      draft: z.object({ label: z.string().min(1).max(40), prompt: z.string().min(1), agent: z.string().optional() }).optional(),
+      review: z.object({ label: z.string().min(1).max(40), prompt: z.string().min(1), agent: z.string().optional() }).optional(),
+      publish: z.object({ label: z.string().min(1).max(40), prompt: z.string().min(1), agent: z.string().optional() }).optional(),
+    }).default({}),
+  }).optional(),
   filters: z.array(FilterSchema).optional(),
   /**
    * Named ways of looking at the same rows, chosen with `?view=<key>` and
@@ -637,6 +832,40 @@ export const PageManifestSchema = z.object({
    * reach it.
    */
   groupsAs: z.enum(['sections', 'tabs']).default('sections'),
+  /**
+   * The order {@link groupBy}'s groups are drawn in, each under its own
+   * label, and how many rows each keeps. Without it a group comes where its
+   * first row falls in the sort, so a resolved incident seen a minute ago
+   * would head the page above an open one. A group named here comes first,
+   * in this order; a value not named follows, as before. `limit` keeps the
+   * first rows of a group in the page's sort — "the twenty most recent".
+   */
+  groupOrder: z.array(z.object({
+    value: z.string().min(1),
+    label: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(500).optional(),
+  })).min(1).optional(),
+  /**
+   * What the page says when it has no rows, in the workspace's words, and —
+   * when an automation fills it — what that automation watches and when it
+   * last read. A page fed by a watch that says only "Nothing here yet" cannot
+   * tell a quiet production from a watch pointed at nothing, or one that has
+   * not read since yesterday; this says which (`services/workspace/watchState.ts`).
+   *
+   * `watch.automation` is the automation's slug; `watch.items` the list in its
+   * `do.input` naming what it watches, each read by `watch.itemLabel` (a key
+   * of an object item, or the item itself when it is a string).
+   */
+  empty: z.object({
+    text: z.string().min(1),
+    watch: z.object({
+      automation: SlugSchema,
+      items: z.string().min(1).optional(),
+      itemLabel: z.string().min(1).optional(),
+      /** Where it reads, in the workspace's words ("Sentry"): "Watching a and b in Sentry". */
+      in: z.string().min(1).max(40).optional(),
+    }).optional(),
+  }).optional(),
   sort: z.object({ field: z.string(), dir: z.enum(['asc', 'desc']).default('desc') }).optional(),
   stats: z.array(StatSchema).optional(),
   /**
@@ -684,7 +913,19 @@ export const PageManifestSchema = z.object({
    * sent (to `agent` when named). The words are the workspace's to manage.
    */
   prompts: z.array(z.object({ label: z.string().min(1).max(40), prompt: z.string().min(1), agent: z.string().optional() })).optional(),
-  queryFilters: z.array(z.object({ param: z.string().min(1), field: z.string().min(1), label: z.string().optional(), default: z.string().min(1).optional() })).optional(),
+  queryFilters: z.array(z.object({
+    param: z.string().min(1),
+    field: z.string().min(1),
+    label: z.string().optional(),
+    default: z.string().min(1).optional(),
+    /**
+     * Draw the values this filter can take as links above the rows — one per
+     * distinct value the rows carry — so a person can narrow the page without
+     * knowing the URL. `labelFrom` names the field each value is read as
+     * (`meta.productName` for a product slug).
+     */
+    picker: z.object({ labelFrom: z.string().optional() }).optional(),
+  })).optional(),
   /** Re-read the page on an interval while it is open — see {@link LiveSchema}. */
   live: LiveSchema.optional(),
 
@@ -707,16 +948,32 @@ export const PageManifestSchema = z.object({
   contentFile: z.string().optional(),
 
   widgets: z.array(WidgetSchema).default([]),
+  /** Core's generic blocks above or below the rows — see {@link PageBlockSchema}. */
+  blocks: z.array(PageBlockSchema).default([]),
+  /**
+   * A heading over the rows, for a page whose blocks ask other questions
+   * above and below them ("What is watched", then "Incidents", then "Checks").
+   */
+  rowsTitle: z.string().min(1).max(60).optional(),
 })
   .refine(m => m.archetype !== 'link' || m.href !== undefined, { message: 'a link page needs href — the route it opens', path: ['href'] })
+  .refine(m => m.configure === undefined || m.archetype === 'configure', { message: 'configure declares the blocks of a configure page', path: ['configure'] })
   .refine(m => m.archetype !== 'report' || m.report !== undefined, { message: 'a report page needs report.subject — the record whose story it tells', path: ['report'] })
   // A wiki is a folder of markdown pages read as pages: the source names the folder, nothing else is declared.
   .refine(m => m.archetype !== 'wiki' || (m.source !== undefined && m.source.kind === 'artifacts' && typeof m.source.folder === 'string'), { message: 'a wiki page needs source: {kind: artifacts, folder: <name>} — the folder its pages live in', path: ['source'] })
   .refine(m => m.live === undefined || m.archetype === 'list' || m.archetype === 'queue', { message: 'live is for list and queue pages — the ones with rows to re-read', path: ['live'] })
   .refine(m => m.layout === 'table' || m.archetype === 'list', { message: 'layout: block is for list pages, the ones with rows to draw', path: ['layout'] })
   .refine(m => m.groupsAs !== 'tabs' || !!m.groupBy, { message: 'groupsAs: tabs needs groupBy — tabs are the groups', path: ['groupsAs'] })
+  .refine(m => m.groupOrder === undefined || !!m.groupBy, { message: 'groupOrder orders groupBy\'s groups — it needs groupBy', path: ['groupOrder'] })
   .refine(m => m.layout === 'table' || m.fields === undefined || m.fields.every(f => !f.total), { message: 'a block layout has no column to total under', path: ['layout'] })
   .refine(m => m.derive === undefined || m.archetype === 'list', { message: 'derive is for list pages, the ones with rows to derive from', path: ['derive'] })
+  .refine(
+    m => m.feed === undefined
+      || [...m.feed.aside, ...m.feed.lines, m.feed.summary, m.feed.note].filter((k): k is string => k !== undefined).every(k => (m.fields ?? []).some(f => f.key === k)),
+    { message: 'feed names a field this page does not declare', path: ['feed'] },
+  )
+  .refine(m => m.feed === undefined || m.layout === 'feed', { message: 'feed configures layout: feed', path: ['feed'] })
+  .refine(m => m.recordPage === undefined || (m.archetype === 'list' && m.source?.kind === 'objects'), { message: 'recordPage is for a list of records, the page its rows open', path: ['recordPage'] })
   .refine(
     m => m.primary === undefined
       || [m.primary.field, ...m.primary.subtitle].every(k => (m.fields ?? []).some(f => f.key === k)),
@@ -746,6 +1003,8 @@ export type PageSeries = z.infer<typeof SeriesSchema>;
 export type PageWidget = z.infer<typeof WidgetSchema>;
 export type PageRowAction = z.infer<typeof RowActionSchema>;
 export type PageReport = z.infer<typeof ReportSchema>;
+export type PageFeed = NonNullable<z.infer<typeof PageManifestSchema>['feed']>;
+export type PageRecordPage = NonNullable<z.infer<typeof PageManifestSchema>['recordPage']>;
 
 // ---------------------------------------------------------------------------
 // Accessors + computation shared by the renderer
@@ -753,6 +1012,8 @@ export type PageReport = z.infer<typeof ReportSchema>;
 
 export type PageRow = {
   id: string | number;
+  /** What a person reads the record by — FE-294 (`libs/codes.ts`); set for object rows. */
+  code?: string;
   title: string;
   status: string | null;
   createdAt: Date | null;
@@ -763,6 +1024,11 @@ export function resolveField(row: PageRow, from: string): unknown {
   if (from === 'title') {
     return row.title;
   }
+  // What a person reads the record by: its short name, else its title
+  // (`libs/workspace/recordName.ts`).
+  if (from === 'name') {
+    return recordName(row.title, row.meta);
+  }
   if (from === 'status') {
     return row.status;
   }
@@ -771,6 +1037,9 @@ export function resolveField(row: PageRow, from: string): unknown {
   }
   if (from === 'id') {
     return row.id;
+  }
+  if (from === 'code') {
+    return row.code;
   }
   const path = from.startsWith('meta.') ? from.slice(5) : from;
   let cur: unknown = row.meta;
@@ -781,6 +1050,17 @@ export function resolveField(row: PageRow, from: string): unknown {
     cur = (cur as Record<string, unknown>)[part];
   }
   return cur;
+}
+
+/**
+ * The key a group's tab is addressed by — `#in-progress` for "In progress" —
+ * so a link from another page can open a grouped page on the right tab. One
+ * definition, used where the tabs are drawn and where links to them are made.
+ * @param label - The group's label.
+ * @param index - Its position, for a group with no usable label.
+ */
+export function groupTabKey(label: string | null, index = 0): string {
+  return (label ?? `group-${index}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `group-${index}`;
 }
 
 /**
@@ -868,6 +1148,154 @@ export function toDate(raw: unknown): Date | null {
     return Number.isNaN(d.getTime()) ? null : d;
   }
   return null;
+}
+
+/**
+ * Compare two rows by `field` — what every declared `manifest.sort` and every
+ * merged run log (worker runs + agent runs in one list) sorts with. A Date
+ * value compares by instant, never by `String(date)`: `Date#toString()`
+ * starts with the weekday name ("Sun Sep 28 2026 …", "Thu Sep 24 2026 …"),
+ * so comparing those strings sorts "Sun" ahead of "Thu" and put a four-day-old
+ * row above one from 22 hours ago — the /dashboard/p/runs "not newest first"
+ * bug (Chris, 2026-09-28). Ties break on `id` so two rows created in the same
+ * instant keep one fixed order across renders — `Array#sort` needs that for
+ * stability, and cursor pagination needs it so a boundary never lands inside
+ * a tie.
+ * @param a - One row.
+ * @param b - The other row.
+ * @param field - The `resolveField` accessor to compare on.
+ * @param dir - `asc` or `desc` (default `desc`).
+ */
+export function compareRowsByField(a: PageRow, b: PageRow, field: string, dir: 'asc' | 'desc' = 'desc'): number {
+  const av = resolveField(a, field);
+  const bv = resolveField(b, field);
+  // A row the field is missing from sorts last whichever way the page sorts.
+  // Comparing it as the string "undefined" put the rows with no figure at the
+  // top of a page sorted by cost, which is the opposite of naming the most
+  // expensive work.
+  const ae = av === undefined || av === null || av === '';
+  const be = bv === undefined || bv === null || bv === '';
+  if (ae || be) {
+    return ae && be ? 0 : ae ? 1 : -1;
+  }
+  const ad = toDate(av);
+  const bd = toDate(bv);
+  let cmp = ad && bd
+    ? ad.getTime() - bd.getTime()
+    : typeof av === 'number' && typeof bv === 'number'
+      ? av - bv
+      : String(av).localeCompare(String(bv));
+  if (cmp === 0) {
+    cmp = String(a.id).localeCompare(String(b.id));
+  }
+  return dir === 'asc' ? cmp : -cmp;
+}
+
+/**
+ * `rows`, newest (or `dir`-most) first by `field` — a new array; the input is
+ * left alone. The one sort every list page and every merged run log goes
+ * through, so a fix to how a Date compares fixes every page sorted by one.
+ * @param rows - The rows to order.
+ * @param field - The `resolveField` accessor to sort on.
+ * @param dir - `asc` or `desc` (default `desc`).
+ */
+export function sortRowsByField(rows: PageRow[], field: string, dir: 'asc' | 'desc' = 'desc'): PageRow[] {
+  return [...rows].sort((a, b) => compareRowsByField(a, b, field, dir));
+}
+
+/** A page's resume point: the sorted field's value on the last row shown, plus that row's `id` as a tiebreaker. */
+export type PageCursorValue = { value: string; id: string };
+
+/**
+ * Encode a row's position (by `field`) as a URL-safe `?cursor=` string. A
+ * Date field encodes by its instant (`getTime()`), not its display string, so
+ * the cursor survives the same weekday-name trap `compareRowsByField` fixes.
+ * @param row - The row a page stopped at.
+ * @param field - The field the page is sorted by.
+ */
+export function encodeRowCursor(row: PageRow, field: string): string {
+  const raw = resolveField(row, field);
+  const d = toDate(raw);
+  const value = d ? String(d.getTime()) : String(raw ?? '');
+  return `${encodeURIComponent(value)}:${encodeURIComponent(String(row.id))}`;
+}
+
+/**
+ * Decode a `?cursor=` string back to its value and id, or `null` for a
+ * missing or malformed one — an unreadable cursor is treated as no cursor
+ * (the first page), never as an error a person sees.
+ * @param raw - The URL's `cursor` param.
+ */
+export function decodeRowCursor(raw: string | undefined | null): PageCursorValue | null {
+  if (!raw) {
+    return null;
+  }
+  const sep = raw.indexOf(':');
+  if (sep < 0) {
+    return null;
+  }
+  const value = decodeURIComponent(raw.slice(0, sep));
+  const id = decodeURIComponent(raw.slice(sep + 1));
+  return id ? { value, id } : null;
+}
+
+/**
+ * One page of `rows` — already sorted newest-first by `field` — starting
+ * right after `cursor`, plus the cursor for the next page (`null` once
+ * nothing is left). This never re-sorts: it slices an order the caller
+ * already produced, keyed by VALUE rather than position, so a run that starts
+ * between two clicks of "Load more" shifts what an offset would have meant
+ * but never lands on both sides of a `field`+`id` boundary — no duplicate,
+ * no gap. A cursor naming a row no longer in `rows` (the set changed between
+ * clicks) serves nothing further rather than risk repeating a row already
+ * seen.
+ * @param rows - The full, already-sorted set for the current view and filters.
+ * @param field - The field `rows` is sorted by (and the cursor is keyed on).
+ * @param cursor - The `?cursor=` param, or undefined for the first page.
+ * @param pageSize - How many rows one page holds.
+ */
+export function paginateRows(rows: PageRow[], field: string, cursor: string | undefined | null, pageSize: number): { page: PageRow[]; nextCursor: string | null } {
+  const decoded = decodeRowCursor(cursor);
+  let start = 0;
+  if (decoded) {
+    const idx = rows.findIndex((r) => {
+      const raw = resolveField(r, field);
+      const d = toDate(raw);
+      const value = d ? String(d.getTime()) : String(raw ?? '');
+      return value === decoded.value && String(r.id) === decoded.id;
+    });
+    start = idx >= 0 ? idx + 1 : rows.length;
+  }
+  const page = rows.slice(start, start + pageSize);
+  const last = page.at(-1);
+  const nextCursor = last && start + pageSize < rows.length ? encodeRowCursor(last, field) : null;
+  return { page, nextCursor };
+}
+
+/**
+ * A page's own URL, with `patch` merged in — `null` removes a key. Every
+ * other param (the view, a query filter, the window) rides along unchanged,
+ * so a "Load more" link never resets a filter someone chose to get here.
+ * @param slug - The page.
+ * @param searchParams - The request's own params.
+ * @param patch - Keys to add, change or (on `null`) drop.
+ */
+export function pageHrefKeeping(slug: string, searchParams: Record<string, string | string[] | undefined>, patch: Record<string, string | null>): string {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(searchParams)) {
+    if (typeof v === 'string') {
+      params.set(k, v);
+    }
+  }
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) {
+      params.delete(k);
+    } else {
+      params.set(k, v);
+    }
+  }
+  const qs = params.toString();
+  return `/dashboard/p/${slug}${qs ? `?${qs}` : ''}`;
 }
 
 /**
@@ -1270,6 +1698,28 @@ export function groupRows(rows: PageRow[], groupBy: string): Array<{ label: stri
   return [...groups].map(([label, rs]) => ({ label, rows: rs }));
 }
 
+/**
+ * Groups in the page's declared order, each under its label and kept to its
+ * limit; groups the order does not name follow in the order they came.
+ * @param groups - From {@link groupRows}, already in the page's sort.
+ * @param order - The page's `groupOrder`.
+ */
+export function orderGroups(
+  groups: Array<{ label: string; rows: PageRow[] }>,
+  order: PageManifest['groupOrder'],
+): Array<{ label: string; rows: PageRow[] }> {
+  if (!order || order.length === 0) {
+    return groups;
+  }
+  const byValue = new Map(groups.map(g => [g.label, g]));
+  const named = order.flatMap((o) => {
+    const g = byValue.get(o.value);
+    return g ? [{ label: o.label ?? g.label, rows: o.limit ? g.rows.slice(0, o.limit) : g.rows }] : [];
+  });
+  const rest = groups.filter(g => !order.some(o => o.value === g.label));
+  return [...named, ...rest];
+}
+
 export type ComputedSeries = {
   label: string;
   buckets: string[];
@@ -1612,4 +2062,25 @@ export function shortUrlLabel(url: string): string {
   const host = parsed.hostname.replace(/^www\./, '');
   const last = parsed.pathname.split('/').filter(Boolean).at(-1);
   return last ? `${host}/${last}` : host;
+}
+
+/**
+ * The subtitle's fields as LINES: a field that declared `breakBefore` starts
+ * a new one. A break whose own field is empty on this row still breaks, so
+ * the next fact does not run on into the line before it.
+ * @param fields - The subtitle fields, in order.
+ * @param row - The row.
+ * @param now - The clock.
+ */
+export function subtitleLines(fields: PageField[], row: PageRow, now: number): PageField[][] {
+  const lines: PageField[][] = [[]];
+  for (const f of fields) {
+    if (f.breakBefore && lines[lines.length - 1]!.length > 0) {
+      lines.push([]);
+    }
+    if (!fieldIsEmptyOn(row, f, now)) {
+      lines[lines.length - 1]!.push(f);
+    }
+  }
+  return lines.filter(l => l.length > 0);
 }

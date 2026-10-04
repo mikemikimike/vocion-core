@@ -1,3 +1,4 @@
+import { setVoice as setAgentVoiceRoute } from './Agents';
 import {
   adoptionAgentDetailRoute,
   adoptionAgentsRoute,
@@ -14,6 +15,7 @@ import {
 } from './AnchoredComments';
 import { createPlatformKeyRoute, createTokenRoute, listPlatformsRoute, listTokensRoute, revealPlatformKeyRoute, revokeTokenRoute } from './ApiTokens';
 import {
+  featureShare as artifactFeatureShareRoute,
   folders as artifactFoldersRoute,
   share as artifactShareRoute,
   exportPage as exportArtifactPageRoute,
@@ -24,6 +26,7 @@ import {
   versions as listArtifactVersionsRoute,
   remove as removeArtifactRoute,
   restore as restoreArtifactVersionRoute,
+  setFeatureShare as setArtifactFeatureShareRoute,
   setFolder as setArtifactFolderRoute,
   setShare as setArtifactShareRoute,
   update as updateArtifactRoute,
@@ -40,8 +43,10 @@ import {
   get as getObject,
   list as listObjects,
   listTypes,
+  history as objectHistory,
   removeLink,
   remove as removeObject,
+  restore as restoreObject,
   update as updateObject,
 } from './BusinessObject';
 import { suggestions as chatSuggestions } from './Chat';
@@ -112,7 +117,7 @@ import {
 import { dismiss as dismissNavPrompt, getPrefs as getNavPrefs, setPins as setNavPins } from './Nav';
 import { get as getPlaybook, list as listPlaybooks } from './Playbooks';
 import { list as listPluginsRoute, set as setPluginRoute } from './Plugins';
-import { getRoute as getPreviewRoute } from './Preview';
+import { getRoute as getPreviewRoute, statusRoute as previewStatusRoute } from './Preview';
 import { changePasswordRoute, getProfileRoute, updateNameRoute } from './Profile';
 import { list as listProjects, setActive as setActiveProject } from './Projects';
 import {
@@ -136,6 +141,7 @@ import {
   unapproveContentRoute,
   undoActionRoute,
 } from './Review';
+import { glanceRoute as runGlanceRoute, logRoute as runLogRoute } from './Runs';
 import { scorecardAgentsRoute } from './Scorecard';
 import { applyConfigRoute as applyTeamReportConfigRoute, planConfigRoute as planTeamReportConfigRoute, lineageRoute as teamReportLineageRoute } from './TeamReport';
 import { list as listTeamsRoute, seedSample as seedSampleTeamsRoute } from './Teams';
@@ -161,6 +167,8 @@ export const router = {
     addLink,
     removeLink,
     generateSummary,
+    history: objectHistory,
+    restore: restoreObject,
   },
   context: {
     readPrimitive,
@@ -183,10 +191,18 @@ export const router = {
   },
   preview: {
     get: getPreviewRoute,
+    status: previewStatusRoute,
+  },
+  runs: {
+    log: runLogRoute,
+    glance: runGlanceRoute,
   },
   playbooks: {
     list: listPlaybooks,
     get: getPlaybook,
+  },
+  agents: {
+    setVoice: setAgentVoiceRoute,
   },
   automations: {
     pause: pauseAutomationRoute,
@@ -280,6 +296,8 @@ export const router = {
     exportPage: exportArtifactPageRoute,
     share: artifactShareRoute,
     setShare: setArtifactShareRoute,
+    featureShare: artifactFeatureShareRoute,
+    setFeatureShare: setArtifactFeatureShareRoute,
   },
   conversations: {
     list: listConvs,

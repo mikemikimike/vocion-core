@@ -1,12 +1,14 @@
 'use client';
 
 import type { ReactNode } from 'react';
+import type { RecordRef } from '@/services/chat/pageContext';
 import { ChevronRight } from 'lucide-react';
 import { useEffect } from 'react';
 import { ConfidenceBars } from '@/components/ui/confidence-indicator';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Link } from '@/libs/I18nNavigation';
 import { cn } from '@/utils/Helpers';
+import { OpenInPreview } from './OpenInPreview';
 
 /**
  * The Detail archetype — one record on its own URL. A breadcrumb with
@@ -207,11 +209,13 @@ const DOT: Record<DotTone, string> = {
  * @param props.tone
  * @param props.label
  * @param props.className
+ * @param props.pulse - Something is running right now: the dot breathes.
+ * Motion only when the person has not asked for less (`motion-safe`).
  */
-export function StatusDot(props: { tone: DotTone; label: ReactNode; className?: string }) {
+export function StatusDot(props: { tone: DotTone; label: ReactNode; className?: string; pulse?: boolean }) {
   return (
-    <span className={cn('inline-flex items-center gap-1.5', props.className)} data-pattern="status-dot">
-      <span className={cn('size-1.5 shrink-0 rounded-full', DOT[props.tone])} aria-hidden />
+    <span className={cn('inline-flex items-center gap-1.5', props.className)} data-pattern="status-dot" data-live={props.pulse ? 'true' : undefined}>
+      <span className={cn('size-1.5 shrink-0 rounded-full', DOT[props.tone], props.pulse && 'motion-safe:animate-pulse')} aria-hidden />
       {props.label}
     </span>
   );
@@ -335,7 +339,19 @@ export function Section(props: {
   );
 }
 
-export type Fact = { label: ReactNode; value: ReactNode; href?: string; key?: string };
+export type Fact = {
+  label: ReactNode;
+  value: ReactNode;
+  href?: string;
+  key?: string;
+  /**
+   * The record the row names, when the preview pane can show it: the row
+   * then carries an "Open in preview" action at its right end
+   * (`OpenInPreview`), revealed on hover, always there on touch. The value's
+   * own link still goes to the full page. A row with no preview has none.
+   */
+  preview?: Pick<RecordRef, 'type' | 'id'> | null;
+};
 
 /**
  * FactList — label/value pairs. `rows`: label left in a fixed column, value
@@ -361,9 +377,12 @@ export function FactList(props: { facts: ReadonlyArray<Maybe<Fact>>; layout?: 'r
     return (
       <dl data-pattern="fact-list" className={cn('flex flex-col gap-2.5', props.className)}>
         {facts.map((f, i) => (
-          <div key={f.key ?? (typeof f.label === 'string' ? f.label : i)}>
+          <div key={f.key ?? (typeof f.label === 'string' ? f.label : i)} className="group/row" data-fact={f.key}>
             <dt className="text-[12px] text-muted-foreground">{f.label}</dt>
-            <dd className="text-sm break-words text-foreground">{value(f)}</dd>
+            <dd className="flex items-start gap-2 text-sm break-words text-foreground">
+              <span className="min-w-0 flex-1">{value(f)}</span>
+              {f.preview && <OpenInPreview recordRef={f.preview} className="-my-0.5" />}
+            </dd>
           </div>
         ))}
       </dl>
@@ -372,9 +391,12 @@ export function FactList(props: { facts: ReadonlyArray<Maybe<Fact>>; layout?: 'r
   return (
     <dl data-pattern="fact-list" className={cn('divide-y divide-rule', props.className)}>
       {facts.map((f, i) => (
-        <div key={f.key ?? (typeof f.label === 'string' ? f.label : i)} className="flex gap-4 py-2 text-sm">
-          <dt className="w-32 shrink-0 text-[12px] leading-5 text-muted-foreground">{f.label}</dt>
-          <dd className="min-w-0 flex-1 break-words text-foreground">{value(f)}</dd>
+        // On a phone the label sits above its value, so the value gets the
+        // whole width instead of wrapping in a narrow column (Chris, 2026-10-02).
+        <div key={f.key ?? (typeof f.label === 'string' ? f.label : i)} className="group/row grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 gap-y-0.5 py-2 text-sm sm:flex sm:gap-4" data-fact={f.key}>
+          <dt className="col-span-2 text-[12px] leading-5 text-muted-foreground sm:w-32 sm:shrink-0">{f.label}</dt>
+          <dd className="min-w-0 break-words text-foreground sm:flex-1">{value(f)}</dd>
+          {f.preview && <OpenInPreview recordRef={f.preview} className="-my-0.5" />}
         </div>
       ))}
     </dl>
@@ -389,8 +411,10 @@ export function FactList(props: { facts: ReadonlyArray<Maybe<Fact>>; layout?: 'r
  */
 export type AccordionItem = {
   id: string;
-  /** The row's leading label — "Day 0", "Send 2". */
-  label: ReactNode;
+  /** The row's leading label — "Day 0", "Send 2". Omit it and the title leads. */
+  label?: ReactNode;
+  /** A state icon before the text — a run step's passed / failed / running mark. */
+  icon?: ReactNode;
   /** The title — a subject line. */
   title: ReactNode;
   /** A short trailing fact — "edited", "3 paragraphs". */
@@ -417,7 +441,7 @@ export function Accordion(props: {
 function AccordionRow(props: { item: AccordionItem; open: boolean; onToggle?: (id: string, open: boolean) => void }) {
   const { item, open } = props;
   return (
-    <div data-pattern="accordion-row" data-state={open ? 'open' : 'closed'}>
+    <div data-pattern="accordion-row" data-item={item.id} data-state={open ? 'open' : 'closed'}>
       <button
         type="button"
         aria-expanded={open}
@@ -425,9 +449,14 @@ function AccordionRow(props: { item: AccordionItem; open: boolean; onToggle?: (i
         className="flex min-h-11 w-full items-center gap-3 rounded-md px-1 py-2 text-left transition hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none"
       >
         <ChevronRight className={cn('size-3.5 shrink-0 text-muted-foreground/60 transition-transform', open && 'rotate-90')} aria-hidden />
+        {item.icon && <span className="flex shrink-0 items-center">{item.icon}</span>}
         <span className="min-w-0 flex-1 truncate text-sm">
-          <span className="text-muted-foreground">{item.label}</span>
-          <span className="text-muted-foreground/60"> · </span>
+          {item.label !== undefined && (
+            <>
+              <span className="text-muted-foreground">{item.label}</span>
+              <span className="text-muted-foreground/60"> · </span>
+            </>
+          )}
           <span className="font-medium text-foreground">{item.title}</span>
         </span>
         {item.meta && <span className="shrink-0 text-[12px] text-muted-foreground">{item.meta}</span>}

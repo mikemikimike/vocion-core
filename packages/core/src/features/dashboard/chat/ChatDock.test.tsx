@@ -8,9 +8,10 @@ import en from '@/locales/en.json';
 vi.mock('@/libs/Orpc', () => ({
   client: {
     chatWidget: { getState: vi.fn(), setState: vi.fn(), setRail: vi.fn(async () => ({ railWidth: null, railOpen: null })) },
-    conversations: { get: vi.fn(), create: vi.fn(), list: vi.fn(), latestForScope: vi.fn(), search: vi.fn(async () => []), tail: vi.fn(async () => []), setAutonomy: vi.fn(), feedback: vi.fn() },
+    conversations: { get: vi.fn(), create: vi.fn(), list: vi.fn(), latestForScope: vi.fn(), search: vi.fn(async () => []), tail: vi.fn(async () => []), setAutonomy: vi.fn(), feedback: vi.fn(), rename: vi.fn(async () => ({})) },
     teams: { list: vi.fn(async () => ({ workspace: null, teams: [] })) },
     missions: { list: vi.fn(async () => []) },
+    preview: { get: vi.fn(async () => ({ type: 'worker_run', id: '148', title: 'send-t148', blocks: [] })), status: vi.fn(async () => ({})) },
   },
 }));
 
@@ -463,10 +464,98 @@ describe('ChatDock', () => {
     expect(vi.mocked(client.conversations.get)).toHaveBeenCalledWith({ id: 41 });
   });
 
+  it('New chat lands the caret in the rail\'s own box (Chris, 2026-09-29)', async () => {
+    localStorage.setItem(COLLAPSE_KEY, '0');
+    await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" />));
+
+    await userEvent.click(page.getByRole('button', { name: 'New chat' }));
+
+    const box = document.querySelector<HTMLTextAreaElement>('[data-testid="agent-rail"] [data-agent-composer]');
+
+    expect(box).not.toBeNull();
+
+    await expect.poll(() => document.activeElement === box).toBe(true);
+  });
+
+  it('a turn\'s Sources chip opens the preview pane beside the thread (Chris, 2026-09-29: "doesn\'t do anything")', async () => {
+    vi.mocked(client.conversations.latestForScope).mockResolvedValue(
+      { id: 41, agentSlug: 'revops-lead', title: 'About Pete' } as never,
+    );
+    vi.mocked(client.conversations.get).mockResolvedValue({
+      id: 41,
+      agentSlug: 'revops-lead',
+      title: 'About Pete',
+      messages: [
+        { role: 'user', content: 'what did the kickoff say?', runsJson: null, documentsJson: null, confidence: null },
+        { id: 9051, role: 'assistant', content: 'The upload fix ships Friday [1].', runsJson: null, documentsJson: [{ document_id: 'd1', semantic_identifier: 'Kestrel kickoff notes', link: 'https://notes.example/k1', source_type: 'web', blurb: 'Ships Friday.', citationIndex: 1 }], confidence: null },
+      ],
+    } as never);
+
+    await render(wrap(<ChatDock agents={AGENTS} scopeRef={SCOPE} scopeLabel="Rowan Pike" defaultCollapsed={false} />));
+
+    await userEvent.click(page.getByTestId('sources-chip'));
+
+    await expect.poll(() => new URLSearchParams(window.location.search).get('preview')).toBe('conversation:41.sources.9051');
+    await expect.element(page.getByTestId('preview-panel')).toBeInTheDocument();
+
+    window.history.replaceState(null, '', window.location.pathname);
+  });
+
+  it('beside a feature page, a turn\'s chips leave the page\'s own record out and keep the run it started (Chris, 2026-09-29)', async () => {
+    vi.mocked(client.conversations.latestForScope).mockResolvedValue({ id: 43, agentSlug: 'revops-lead', title: 'Northwind export' } as never);
+    vi.mocked(client.conversations.get).mockResolvedValue({
+      id: 43,
+      agentSlug: 'revops-lead',
+      title: 'Northwind export',
+      messages: [
+        { role: 'user', content: 'approve it and build', runsJson: null, documentsJson: null, confidence: null },
+        {
+          id: 9061,
+          role: 'assistant',
+          content: 'Approved, and the build is running.',
+          runsJson: [
+            { type: 'tool', name: 'decide_ask', output: 'Decided ask #221 "Stopped: Northwind export": approve (approved). About: request #201. It leaves Needs you now.' },
+            { type: 'tool', name: 'propose_action', input: { action_id: 'factory.dispatch_task' }, output: 'factory.dispatch_task is DONE (run #5301, confidence 0.95) — ran. Result: {"workerRunId":419,"requestId":201}' },
+            { type: 'text', text: 'Approved, and the build is running.' },
+          ],
+          documentsJson: null,
+          confidence: null,
+        },
+      ],
+    } as never);
+
+    await render(wrap(<ChatDock agents={AGENTS} scopeRef={SCOPE} scopeLabel="Northwind export" defaultCollapsed={false} pageContext={{ path: '/w/acme/dashboard/p/feature/201', title: 'Northwind export' }} />));
+
+    await expect.poll(() => document.querySelectorAll('[data-follow-chip]').length).toBe(1);
+    expect(document.querySelector('[data-follow-chip="worker_run:419"]')).not.toBeNull();
+    expect(document.querySelector('[data-follow-chip="object:201"]')).toBeNull();
+    expect(document.querySelector('[data-follow-chip="ask:221"]')).toBeNull();
+  });
+
+  it('on a phone, closing the sheet closes the preview in it, with one close control (2026-09-27)', async () => {
+    await page.viewport(390, 844);
+    window.history.replaceState(null, '', `${window.location.pathname}?preview=worker_run:148`);
+    await render(wrap(<ChatDock agents={AGENTS} scopeRef={SCOPE} scopeLabel="Rowan Pike" defaultCollapsed={false} />));
+
+    const sheet = page.getByRole('dialog');
+
+    await expect.element(sheet).toBeInTheDocument();
+    // The pane's header owns the close; the sheet draws no second X over it.
+    expect(document.querySelectorAll('[data-slot="sheet-close"]:not(.hidden), button.hidden').length).toBeLessThanOrEqual(1);
+
+    await userEvent.keyboard('{Escape}');
+
+    await expect.element(sheet).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('preview')).toBeNull();
+
+    window.history.replaceState(null, '', window.location.pathname);
+    await page.viewport(1280, 800);
+  });
+
   it('collapses to the reopen button and the choice persists', async () => {
     await render(wrap(<ChatDock agents={AGENTS} scopeRef={SCOPE} scopeLabel="Rowan Pike" defaultCollapsed={false} />));
 
-    await userEvent.click(page.getByRole('button', { name: 'Collapse the conversation (⌘J)' }));
+    await userEvent.click(page.getByRole('button', { name: 'Close chat' }));
 
     await expect.element(page.getByRole('button', { name: 'Open the conversation (⌘J)' })).toBeInTheDocument();
     await expect.element(page.getByRole('complementary')).not.toBeInTheDocument();
@@ -504,5 +593,50 @@ describe('ChatDock speaks as the workspace (§9.10)', () => {
     await vi.waitFor(() => expect(page.getByText('Revenue', { exact: true }).elements().length).toBeGreaterThan(0));
 
     expect(page.getByText('RevOps Lead').query()).toBeNull();
+  });
+
+  it('says "Chat" for a new thread and names the thread once there is one — renamed in place', async () => {
+    await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" defaultCollapsed={false} />));
+
+    await expect.element(page.getByTestId('rail-title')).toHaveTextContent('Chat');
+  });
+
+  it('shows a resumed thread\'s title in the header, and a rename writes it', async () => {
+    vi.mocked(client.conversations.get).mockResolvedValue({
+      id: 51,
+      agentSlug: 'revops-lead',
+      title: 'Kestrel pipeline review',
+      titleSource: 'generated',
+      messages: [
+        { role: 'user', content: 'how is the kestrel pipeline?', runsJson: null, documentsJson: null, confidence: null },
+        { role: 'assistant', content: 'Three deals moved to proposal.', runsJson: null, documentsJson: null, confidence: null },
+      ],
+    } as never);
+
+    await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" defaultCollapsed={false} resumeConversationId={51} />));
+
+    const title = page.getByTestId('rail-title');
+
+    await expect.element(title).toHaveTextContent('Kestrel pipeline review');
+
+    await userEvent.click(title);
+    await userEvent.fill(page.getByRole('textbox', { name: 'Conversation title' }), 'Kestrel Q3 pipeline');
+    await userEvent.keyboard('{Enter}');
+
+    await expect.element(page.getByTestId('rail-title')).toHaveTextContent('Kestrel Q3 pipeline');
+    expect(vi.mocked(client.conversations.rename)).toHaveBeenCalledWith({ id: 51, title: 'Kestrel Q3 pipeline' });
+  });
+
+  it('closes with the same X every side pane uses, labelled for ⌘J by a tooltip, not a title attribute', async () => {
+    await render(wrap(<ChatDock agents={AGENTS} scopeLabel="Everything" defaultCollapsed={false} />));
+
+    const close = page.getByTestId('rail-close');
+
+    await expect.element(close).toHaveAttribute('aria-label', 'Close chat');
+    await expect.element(close).not.toHaveAttribute('title');
+
+    await userEvent.hover(close);
+
+    await expect.element(page.getByRole('tooltip').getByText('Close chat (⌘J)')).toBeInTheDocument();
   });
 });

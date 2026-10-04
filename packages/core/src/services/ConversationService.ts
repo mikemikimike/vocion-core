@@ -8,10 +8,12 @@
  *   - `toHistoryTurns` drops tool entries before replaying to the agent.
  */
 
+import type { ConversationTitleSource } from '@/libs/chat/threadTitle';
 import type { HistoryTurn } from '@/services/chat/historyTools';
 import type { PageContext } from '@/services/chat/pageContext';
 import type { TurnStatus } from '@/services/chat/turnStatus';
 import { and, asc, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
+import { DEFAULT_THREAD_TITLE, firstMessageTitle } from '@/libs/chat/threadTitle';
 import { db } from '@/libs/DB';
 import { formatDateTime } from '@/libs/time/zone';
 import { conversationMessageSchema, conversationSchema } from '@/models/Schema';
@@ -19,7 +21,7 @@ import { track } from '@/services/adoption/track';
 import { isDroppedFromHistory, isTurnStatus } from '@/services/chat/turnStatus';
 import { enqueue } from '@/services/FeedbackWorkerService';
 
-const DEFAULT_TITLE = 'New conversation';
+const DEFAULT_TITLE = DEFAULT_THREAD_TITLE;
 
 /**
  * How recommended actions behave in a thread (0094). Neither rung executes
@@ -46,7 +48,7 @@ export type ConversationRun
      * lookup result three times on 2026-09-24 because the card lived only
      * in the browser.
      */
-    | { type: 'card'; id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string; ref?: { type: string; id: number } }
+    | { type: 'card'; id?: string; kind?: string; label: string; actionId: string; input?: Record<string, unknown>; runId?: number; state?: string; reason?: string; ref?: { type: string; id: number } }
     | { type: 'card_decision'; cardId: string; action: string; runId?: number; label?: string };
 
 /** One persisted node of the turn's activity trace (the UI's TraceNode shape). */
@@ -84,6 +86,12 @@ export async function createConversation(opts: {
   scopeRef?: string;
   /** Where the first turn was asked from — persisted once (R4). */
   context?: PageContext | null;
+  /**
+   * Who wrote `initialTitle`. Default `auto`: the generator may replace it
+   * after the first reply. Pass `person` when somebody chose the words (an
+   * email subject, a caller naming the thread) so it is kept.
+   */
+  titleSource?: ConversationTitleSource;
 }) {
   const title = (opts.initialTitle ?? DEFAULT_TITLE).trim() || DEFAULT_TITLE;
   const [row] = await db
@@ -92,6 +100,7 @@ export async function createConversation(opts: {
       orgId: opts.orgId,
       agentSlug: opts.agentSlug,
       title,
+      titleSource: opts.titleSource ?? 'auto',
       createdBy: opts.createdBy ?? null,
       scopeRef: opts.scopeRef ?? null,
       contextJson: opts.context ?? null,
@@ -180,20 +189,58 @@ export async function getConversation(opts: { orgId: string; id: number }) {
   return row ?? null;
 }
 
+/**
+ * The agent a thread is with: whoever wrote its last reply (so a turn another
+ * agent answered — a hand-off — moves the thread), else the agent the thread
+ * was opened with. Null while the thread has no reply yet: its first turn is
+ * the router's to route (`followUpDecision`).
+ * @param opts - The org and the conversation.
+ * @param opts.orgId - The workspace.
+ * @param opts.id - The conversation.
+ */
+export async function threadAgentOf(opts: { orgId: string; id: number }): Promise<string | null> {
+  const conv = await getConversation(opts);
+  if (!conv) {
+    return null;
+  }
+  const [last] = await db
+    .select({ agentSlug: conversationMessageSchema.agentSlug })
+    .from(conversationMessageSchema)
+    .where(and(eq(conversationMessageSchema.conversationId, conv.id), eq(conversationMessageSchema.role, 'assistant')))
+    .orderBy(desc(conversationMessageSchema.id))
+    .limit(1);
+  if (!last) {
+    return null;
+  }
+  return last.agentSlug ?? conv.agentSlug ?? null;
+}
+
 export async function deleteConversation(opts: { orgId: string; id: number }) {
   await db
     .delete(conversationSchema)
     .where(and(eq(conversationSchema.orgId, opts.orgId), eq(conversationSchema.id, opts.id)));
 }
 
+/** The longest title a person can give a thread; longer is cut, not refused. */
+export const MAX_TITLE_LENGTH = 120;
+
+/**
+ * A person names a thread. Marks the title `person`, so the generator never
+ * replaces it afterwards. Org-scoped: another workspace's id updates nothing
+ * and returns null.
+ * @param opts
+ * @param opts.orgId - Tenant; the row must belong to it.
+ * @param opts.id - The conversation.
+ * @param opts.title - The new name; whitespace collapsed, cut to `MAX_TITLE_LENGTH`.
+ */
 export async function renameConversation(opts: { orgId: string; id: number; title: string }) {
-  const title = opts.title.trim();
+  const title = opts.title.split(/\s+/).filter(Boolean).join(' ').slice(0, MAX_TITLE_LENGTH).trim();
   if (!title) {
     throw new Error('title must not be empty');
   }
   const [row] = await db
     .update(conversationSchema)
-    .set({ title })
+    .set({ title, titleSource: 'person' })
     .where(and(eq(conversationSchema.orgId, opts.orgId), eq(conversationSchema.id, opts.id)))
     .returning();
   return row ?? null;
@@ -277,6 +324,12 @@ export async function appendMessage(opts: {
   statusReason?: string | null;
   /** Which agent spoke an assistant turn — the slug the runtime ran, so a reloaded transcript attributes the turn truthfully (backlog 009). */
   agentSlug?: string | null;
+  /**
+   * What an assistant turn's model calls cost (`services/budget/runCost.ts`).
+   * Written on the message and added to the conversation's sum in the same
+   * pass. Absent means not recorded, which is not zero.
+   */
+  cost?: { tokens: number; microCents: number } | null;
 }) {
   const conv = await getConversation({ orgId: opts.orgId, id: opts.conversationId });
   if (!conv) {
@@ -285,8 +338,10 @@ export async function appendMessage(opts: {
   // Auto-title from the first user message if the title is still the default.
   const isFirstUser = conv.messageCount === 0
     && opts.role === 'user'
+    && conv.titleSource === 'auto'
     && (conv.title === DEFAULT_TITLE || conv.title === '');
-  const derivedTitle = isFirstUser ? deriveTitle(opts.content) : conv.title;
+  const derivedTitle = isFirstUser ? firstMessageTitle(opts.content) : conv.title;
+  const cost = opts.role === 'assistant' && opts.cost ? opts.cost : null;
 
   const [msg] = await db
     .insert(conversationMessageSchema)
@@ -301,6 +356,7 @@ export async function appendMessage(opts: {
       status: storableStatus(opts.status, opts.role),
       statusReason: opts.statusReason ?? null,
       agentSlug: opts.role === 'assistant' ? opts.agentSlug ?? null : null,
+      ...(cost ? { tokens: cost.tokens, microCents: cost.microCents } : {}),
     })
     .returning();
 
@@ -309,6 +365,13 @@ export async function appendMessage(opts: {
     .set({
       title: derivedTitle,
       messageCount: sql`${conversationSchema.messageCount} + 1`,
+      // The thread's spend is the sum of its turns', counted with the turn.
+      ...(cost
+        ? {
+            tokens: sql`coalesce(${conversationSchema.tokens}, 0) + ${cost.tokens}`,
+            microCents: sql`coalesce(${conversationSchema.microCents}, 0) + ${cost.microCents}`,
+          }
+        : {}),
       // A thread picked up again is open again; the idle sweep ends it anew.
       endedAt: null,
     })
@@ -383,18 +446,6 @@ export function toHistoryTurns(messages: Array<{
     out.push({ role: m.role, content, ...(m.id ? { id: m.id } : {}), ...(m.role === 'assistant' && m.runsJson ? { runs: m.runsJson } : {}) });
   }
   return out;
-}
-
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
-
-function deriveTitle(content: string, maxLen = 60): string {
-  const s = content.split(/\s+/).filter(Boolean).join(' ');
-  if (s.length <= maxLen) {
-    return s || DEFAULT_TITLE;
-  }
-  return `${s.slice(0, maxLen - 1)}…`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -534,6 +585,8 @@ export type ConversationSearchHit = {
   surface: string;
   /** Turns so far — how a list says "a question" apart from "a working session". */
   messageCount: number;
+  /** What its turns cost, in millionths of a cent; null when none recorded a cost. */
+  microCents: number | null;
   /** The record this thread is about, when it was opened from one. */
   scopeRef: string | null;
   /** The matched message's content around the hit, when the match was in a message. */
@@ -585,6 +638,7 @@ export async function searchConversations(opts: {
         updatedAt: conversationSchema.updatedAt,
         surface: conversationSchema.surface,
         messageCount: conversationSchema.messageCount,
+        microCents: conversationSchema.microCents,
         scopeRef: conversationSchema.scopeRef,
       })
       .from(conversationSchema)
@@ -622,6 +676,7 @@ export async function searchConversations(opts: {
       updatedAt: conversationSchema.updatedAt,
       surface: conversationSchema.surface,
       messageCount: conversationSchema.messageCount,
+      microCents: conversationSchema.microCents,
       scopeRef: conversationSchema.scopeRef,
     })
     .from(conversationSchema)

@@ -14,6 +14,7 @@ function plugin(over: Partial<PluginManifest> & { slug: string }): PluginManifes
     surfaces: [],
     nav: { section: 'Workspace', order: 0 },
     recommend: { when: [], connectors: [] },
+    notifications: [],
     ...over,
   };
 }
@@ -74,6 +75,16 @@ describe('pluginNav', () => {
 
     expect(nav.sections).toEqual([{ label: 'Software factory', items: [{ title: 'Team report', url: '/dashboard/team-report', icon: 'bar-chart-3', plugin: 'software-factory', order: 9 }] }]);
     expect(nav.claimedPages).toEqual(['team-report']);
+  });
+
+  it('a page that declares nav.secondary sits under More in its section (Runs, 2026-09-28)', () => {
+    const nav = pluginNav({
+      plugins: [plugin({ slug: 'software-factory' })],
+      pages: [{ slug: 'runs', title: 'Runs', icon: 'activity', nav: { section: 'Software factory', order: 6, hidden: false, secondary: true }, origin: 'plugin:software-factory' }],
+      routes,
+    });
+
+    expect(nav.sections[0]!.items[0]).toMatchObject({ title: 'Runs', secondary: true });
   });
 
   it('a core route a plugin OFFERS lists last and secondary in its section, and is not claimed — its own group keeps it', () => {

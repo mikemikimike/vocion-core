@@ -28,17 +28,18 @@ import { shouldTriggerFindHotkey } from '@/features/dashboard/nav/workspaceSwitc
 import { openWorkspaceSwitcher } from '@/features/dashboard/nav/WorkspaceSwitcher';
 import { openManageView } from '@/features/dashboard/useNavView';
 import { WorkspacePauseDialog } from '@/features/dashboard/WorkspaceOffSwitch';
+import { NotificationBell } from '@/features/notifications/NotificationBell';
 import { envLabel as readEnvLabel } from '@/libs/envLabel';
 import { Link } from '@/libs/I18nNavigation';
 import { buildInfo, versionLabel } from '@/libs/version';
 import { NavigationProgress } from './NavigationProgress';
-import { ShellBarActionsOutlet } from './ShellBarActions';
+import { ShellBarActionsOutlet, ShellBarTitleOutlet, useShellBarTitleClaimed } from './ShellBarActions';
 
 /**
  * The dashboard top bar (ElevenLabs pattern, Chris 2026-09-15): breadcrumb
  * left, starting with the workspace name; a search-shaped "Search everything
  * ⌘K" field centred (opens the palette; a bare `F` does too); on the right
- * Ask · a reserved notifications bell · the account avatar (Feedback and Docs
+ * Ask · the notifications bell · the account avatar (Feedback and Docs
  * moved off the bar on 2026-09-18 — into this menu and the Manage view),
  * which wears a thin ring showing this workspace's budget used when a budget
  * exists. The avatar menu leads with that spend and the current workspace
@@ -61,6 +62,9 @@ export const AppSidebarHeader = ({ workspace = null, usage = null, canPauseWorks
   const user = session?.user;
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [pauseOpen, setPauseOpen] = useState(false);
+  // A page with a name of its own (the full-page chat, named by its thread)
+  // shows it here instead of the breadcrumb.
+  const titleClaimed = useShellBarTitleClaimed();
   const initials = user?.name
     ?.split(' ')
     .map(p => p[0])
@@ -124,7 +128,8 @@ export const AppSidebarHeader = ({ workspace = null, usage = null, canPauseWorks
             {envLabel}
           </span>
         )}
-        <Breadcrumb workspaceName={workspace?.name ?? null} />
+        {!titleClaimed && <Breadcrumb workspaceName={workspace?.name ?? null} />}
+        <ShellBarTitleOutlet />
       </div>
 
       {/* Centre: the one search field. A bordered field with the ⌘K hint
@@ -154,15 +159,9 @@ export const AppSidebarHeader = ({ workspace = null, usage = null, canPauseWorks
           <AgentSurfaceButton />
         </span>
 
-        {/* Reserved: notifications. No behaviour yet — the slot keeps the layout stable when it arrives. */}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button type="button" aria-label={tl('notifications')} disabled className="hidden size-9 items-center justify-center rounded-full text-muted-foreground/50 sm:flex">
-              <Bell className="size-4" aria-hidden />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{tl('notifications_soon')}</TooltipContent>
-        </Tooltip>
+        {/* Notifications (backlog 048): the unread count and the latest few,
+            on the phone header too — the slot this bell was reserved in. */}
+        <NotificationBell label={tl('notifications')} />
 
         <DropdownMenu>
           <DropdownMenuTrigger
@@ -253,6 +252,12 @@ export const AppSidebarHeader = ({ workspace = null, usage = null, canPauseWorks
               <Link href="/dashboard/profile">
                 <UserIcon className="mr-2 size-4" />
                 Profile
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href="/dashboard/notifications/settings">
+                <Bell className="mr-2 size-4" />
+                Notifications
               </Link>
             </DropdownMenuItem>
             <DropdownMenuItem asChild>

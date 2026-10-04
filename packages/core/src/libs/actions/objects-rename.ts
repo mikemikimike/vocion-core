@@ -122,12 +122,15 @@ export const objectsRenameAction: Action<typeof renameInput> = {
     const objectType = await loadObjectType(ctx.orgId, input.objectType);
     const row = objectType ? await readRow(ctx.orgId, objectType.id, input.id) : null;
     const typeLabel = objectType?.label ?? humanise(input.objectType);
+    // The record itself, where its workspace opens it — not the objects list.
+    const { recordHref } = await import('@/services/objects/recordHref');
+    const href = await recordHref(ctx.orgId, { objectType: input.objectType, id: input.id });
     return {
       title: `Rename ${typeLabel.toLowerCase()} #${input.id}`,
       system: typeLabel,
       summary: input.reason,
       fields: [
-        { label: 'Now', value: row?.title ?? `#${input.id}`, href: '/dashboard/objects' },
+        { label: 'Now', value: row?.title ?? `#${input.id}`, href },
         { label: 'Becomes', value: input.title.trim() },
       ],
       nextAction: 'Approving renames the record everywhere it is listed; the old title stays on this run for Undo.',
@@ -150,8 +153,14 @@ export const objectsRenameAction: Action<typeof renameInput> = {
     if (next === row.title) {
       throw new Error(`That ${objectType.label.toLowerCase()} is already called "${row.title}".`);
     }
+    // A rename is a write to the record, so it is a version of its body
+    // (backlog 035) — the history says who renamed it and why. Never throws.
+    const { bodyAfter, bodyBefore } = await import('./objects-update-meta');
+    await bodyBefore(ctx.orgId, row.id);
     await writeTitle(ctx.orgId, row.id, next);
+    const body = await bodyAfter({ orgId: ctx.orgId, id: row.id, reason: input.reason, written: [], invokedBy: ctx.invokedBy, reviewedBy: ctx.reviewedBy, runId: ctx.runId });
     return {
+      ...(body.status === 'written' && body.version && body.artifactId ? { bodyVersion: body.version, bodyArtifactId: body.artifactId, bodyFrom: body.version - 1 } : {}),
       objectId: row.id,
       objectType: input.objectType,
       title: next,
@@ -174,6 +183,8 @@ export const objectsRenameAction: Action<typeof renameInput> = {
       throw new Error(`No ${objectType?.label.toLowerCase() ?? input.objectType} #${input.id} in this workspace to restore.`);
     }
     await writeTitle(ctx.orgId, row.id, previousTitle);
+    const { bodyAfter } = await import('./objects-update-meta');
+    await bodyAfter({ orgId: ctx.orgId, id: row.id, reason: `Undid run #${ctx.runId ?? '?'}: ${input.reason}`.slice(0, 500), written: [], invokedBy: ctx.reviewedBy ?? ctx.invokedBy, runId: ctx.runId });
     return { restoredTitle: previousTitle, restoredAt: new Date().toISOString() };
   },
 };
